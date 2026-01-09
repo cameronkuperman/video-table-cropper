@@ -26,11 +26,18 @@
                 <div class="drop-zone-content">
                     <div class="icon">📋</div>
                     <p>Drop JSON file(s) here</p>
-                    <span class="formats">JSON with table bounding boxes</span>
+                    <span class="formats">or paste JSON below</span>
                 </div>
                 <input type="file" id="json-input" accept=".json" multiple hidden>
                 <div class="file-list" id="json-list"></div>
             </div>
+        </div>
+
+        <!-- JSON Paste Area -->
+        <div class="paste-section">
+            <label for="json-paste">Or paste JSON here:</label>
+            <textarea id="json-paste" placeholder='{"tables": [{"id": 0, "bbox": {"x1": 100, "y1": 100, "x2": 500, "y2": 400}, "saved": true}]}'></textarea>
+            <button id="add-json-btn" class="btn small">Add Pasted JSON</button>
         </div>
 
         <div class="actions">
@@ -45,7 +52,9 @@
 
         <div id="results" class="results" hidden>
             <h2>Cropped Videos</h2>
+            <p class="download-hint">Click to download (files will appear in your Downloads folder)</p>
             <div id="results-list"></div>
+            <button id="download-all-btn" class="btn primary" style="margin-top: 20px;">Download All as ZIP</button>
         </div>
     </div>
 

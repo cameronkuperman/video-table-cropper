@@ -1,6 +1,8 @@
 // State
 let uploadedVideo = null;
 let uploadedJsons = [];
+let currentJobId = null;
+let currentVideos = [];
 
 // DOM Elements
 const videoZone = document.getElementById('video-zone');
@@ -14,6 +16,9 @@ const clearBtn = document.getElementById('clear-btn');
 const status = document.getElementById('status');
 const results = document.getElementById('results');
 const resultsList = document.getElementById('results-list');
+const jsonPaste = document.getElementById('json-paste');
+const addJsonBtn = document.getElementById('add-json-btn');
+const downloadAllBtn = document.getElementById('download-all-btn');
 
 // Drag and drop handlers
 function setupDropZone(zone, input, type) {
@@ -82,6 +87,59 @@ async function handleFiles(files, type) {
     }
 }
 
+// Handle pasted JSON
+async function handlePastedJson() {
+    const text = jsonPaste.value.trim();
+    if (!text) {
+        showStatus('Please paste JSON first', 'error');
+        return;
+    }
+
+    // Validate JSON
+    try {
+        JSON.parse(text);
+    } catch (e) {
+        showStatus('Invalid JSON format', 'error');
+        return;
+    }
+
+    // Create a blob and upload it
+    const blob = new Blob([text], { type: 'application/json' });
+    const file = new File([blob], 'pasted.json', { type: 'application/json' });
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('type', 'json');
+
+    try {
+        const response = await fetch('/upload', {
+            method: 'POST',
+            body: formData
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            uploadedJsons.push(data.filename);
+            const item = document.createElement('div');
+            item.className = 'file-item';
+            item.innerHTML = `
+                <span class="name">Pasted JSON</span>
+                <span class="tables">${data.tables} tables</span>
+            `;
+            jsonList.appendChild(item);
+            jsonZone.classList.add('has-file');
+            jsonPaste.value = '';
+            showStatus('JSON added successfully!', 'success');
+            updateProcessButton();
+        } else {
+            showStatus(`Error: ${data.error}`, 'error');
+        }
+    } catch (err) {
+        showStatus(`Upload failed: ${err.message}`, 'error');
+    }
+}
+
 // Update process button state
 function updateProcessButton() {
     processBtn.disabled = !(uploadedVideo && uploadedJsons.length > 0);
@@ -97,6 +155,16 @@ function showStatus(message, type = 'processing') {
 // Hide status
 function hideStatus() {
     status.hidden = true;
+}
+
+// Trigger browser download
+function triggerDownload(url, filename) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
 }
 
 // Process videos
@@ -123,6 +191,8 @@ async function processVideos() {
         const data = await response.json();
 
         if (data.success) {
+            currentJobId = data.job_id;
+            currentVideos = data.videos;
             showStatus(`Successfully created ${data.count} cropped videos!`, 'success');
             displayResults(data.videos);
         } else {
@@ -149,12 +219,44 @@ function displayResults(videos) {
                 <span class="result-name">${video.filename}</span>
                 <span class="result-bbox">Table ${video.table_id} • (${video.bbox.x1}, ${video.bbox.y1}) to (${video.bbox.x2}, ${video.bbox.y2})</span>
             </div>
-            <a href="${video.download_url}" class="download-btn">Download</a>
+            <a href="${video.download_url}" download="${video.filename}" class="download-btn">Download</a>
         `;
         resultsList.appendChild(item);
     }
 
     results.hidden = false;
+}
+
+// Download all videos
+async function downloadAll() {
+    if (currentVideos.length === 0) return;
+
+    showStatus('Downloading all videos...', 'processing');
+
+    try {
+        const response = await fetch(`/download-zip/${currentJobId}`);
+        if (response.ok) {
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            triggerDownload(url, `cropped_videos_${currentJobId}.zip`);
+            window.URL.revokeObjectURL(url);
+            showStatus('Download complete!', 'success');
+        } else {
+            // Fallback: download individually
+            for (const video of currentVideos) {
+                triggerDownload(video.download_url, video.filename);
+                await new Promise(r => setTimeout(r, 500)); // Small delay between downloads
+            }
+            showStatus('All downloads started!', 'success');
+        }
+    } catch (err) {
+        // Fallback: download individually
+        for (const video of currentVideos) {
+            triggerDownload(video.download_url, video.filename);
+            await new Promise(r => setTimeout(r, 500));
+        }
+        showStatus('All downloads started!', 'success');
+    }
 }
 
 // Clear all
@@ -167,10 +269,13 @@ async function clearAll() {
 
     uploadedVideo = null;
     uploadedJsons = [];
+    currentJobId = null;
+    currentVideos = [];
 
     videoInfo.textContent = '';
     jsonList.innerHTML = '';
     resultsList.innerHTML = '';
+    jsonPaste.value = '';
 
     videoZone.classList.remove('has-file');
     jsonZone.classList.remove('has-file');
@@ -185,3 +290,5 @@ setupDropZone(videoZone, videoInput, 'video');
 setupDropZone(jsonZone, jsonInput, 'json');
 processBtn.addEventListener('click', processVideos);
 clearBtn.addEventListener('click', clearAll);
+addJsonBtn.addEventListener('click', handlePastedJson);
+downloadAllBtn.addEventListener('click', downloadAll);

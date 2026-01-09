@@ -5,11 +5,13 @@ Video Table Cropper - Flask Web App
 Drag-and-drop interface to crop videos based on JSON bounding boxes.
 """
 
+import io
 import json
 import os
 import shutil
 import subprocess
 import uuid
+import zipfile
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_file
@@ -185,6 +187,29 @@ def download(job_id: str, filename: str):
     if not file_path.exists():
         return jsonify({"error": "File not found"}), 404
     return send_file(file_path, as_attachment=True)
+
+
+@app.route("/download-zip/<job_id>")
+def download_zip(job_id: str):
+    """Download all cropped videos as a ZIP file."""
+    job_folder = OUTPUT_FOLDER / job_id
+    if not job_folder.exists():
+        return jsonify({"error": "Job not found"}), 404
+
+    # Create ZIP in memory
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in job_folder.iterdir():
+            if file_path.is_file():
+                zf.write(file_path, file_path.name)
+
+    zip_buffer.seek(0)
+    return send_file(
+        zip_buffer,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"cropped_videos_{job_id}.zip"
+    )
 
 
 @app.route("/cleanup", methods=["POST"])
