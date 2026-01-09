@@ -47,14 +47,16 @@ def crop_video(input_path: Path, output_path: Path, x1: int, y1: int, x2: int, y
         "ffmpeg",
         "-i", str(input_path),
         "-vf", crop_filter,
-        "-c:a", "copy",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-c:a", "aac",  # Re-encode audio to AAC (compatible with MP4)
         "-y",
         str(output_path)
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        return result.returncode == 0
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        return result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
 
@@ -141,21 +143,18 @@ def process():
         tables = json_data.get("tables", [])
         video_name = json_data.get("video_name", video_path.stem)
 
-        for table in tables:
-            table_id = table.get("id", 0)
+        for idx, table in enumerate(tables):
+            # Use table id if available, otherwise use index
+            table_id = table.get("id", idx)
             bbox = table.get("bbox", {})
-            saved = table.get("saved", True)
-            skip_reason = table.get("skip_reason")
 
-            # Skip tables marked as too small or not saved
-            if not saved or skip_reason == "too_small":
-                continue
-
+            # Get bbox coordinates
             x1 = bbox.get("x1", 0)
             y1 = bbox.get("y1", 0)
             x2 = bbox.get("x2", 0)
             y2 = bbox.get("y2", 0)
 
+            # Only skip if bbox is invalid (zero or negative dimensions)
             if x2 <= x1 or y2 <= y1:
                 continue
 
