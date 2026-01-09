@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Table Cropper</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Video Table Cropper</h1>
+        <p class="subtitle">Drag and drop your video and JSON files to crop tables</p>
+
+        <div class="drop-zones">
+            <div class="drop-zone" id="video-zone">
+                <div class="drop-zone-content">
+                    <div class="icon">🎬</div>
+                    <p>Drop video file here</p>
+                    <span class="formats">MP4, MOV, AVI, MKV, WebM</span>
+                </div>
+                <input type="file" id="video-input" accept=".mp4,.mov,.avi,.mkv,.webm" hidden>
+                <div class="file-info" id="video-info"></div>
+            </div>
+
+            <div class="drop-zone" id="json-zone">
+                <div class="drop-zone-content">
+                    <div class="icon">📋</div>
+                    <p>Drop JSON file(s) here</p>
+                    <span class="formats">JSON with table bounding boxes</span>
+                </div>
+                <input type="file" id="json-input" accept=".json" multiple hidden>
+                <div class="file-list" id="json-list"></div>
+            </div>
+        </div>
+
+        <div class="actions">
+            <button id="process-btn" class="btn primary" disabled>
+                <span class="btn-text">Crop Videos</span>
+                <span class="btn-loading" hidden>Processing...</span>
+            </button>
+            <button id="clear-btn" class="btn secondary">Clear All</button>
+        </div>
+
+        <div id="status" class="status" hidden></div>
+
+        <div id="results" class="results" hidden>
+            <h2>Cropped Videos</h2>
+            <div id="results-list"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
