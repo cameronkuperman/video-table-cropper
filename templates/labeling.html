@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Frame Labeling - Video Table Cropper</title>
-    <link rel="stylesheet" href="/static/style.css?v=4">
+    <link rel="stylesheet" href="/static/style.css?v=5">
     <style>
         .labeling-container {
             max-width: 1800px;
@@ -45,98 +45,155 @@
             border-left: 4px solid #007bff;
         }
 
-        /* Drop zones container */
-        .drop-zones-container {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
-            margin-bottom: 30px;
+        .instructions kbd {
+            background: #eee;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+            border: 1px solid #ccc;
         }
 
-        .drop-zone {
-            min-height: 300px;
-            border: 3px dashed #ccc;
+        /* Label buttons toolbar */
+        .label-toolbar {
+            position: sticky;
+            top: 0;
+            background: white;
+            padding: 15px 20px;
             border-radius: 12px;
-            padding: 15px;
-            transition: all 0.3s;
-            position: relative;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
         }
 
-        .drop-zone-header {
-            font-size: 20px;
-            font-weight: bold;
-            margin-bottom: 15px;
-            text-align: center;
-            padding: 10px;
-            border-radius: 6px;
+        .label-toolbar .selection-info {
+            font-weight: 600;
+            color: #555;
+            min-width: 150px;
         }
 
-        .drop-zone.clean {
-            border-color: #28a745;
-            background: #f0fff4;
+        .label-btn {
+            padding: 12px 24px;
+            font-size: 16px;
+            font-weight: 600;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
         }
 
-        .drop-zone.clean .drop-zone-header {
-            color: #28a745;
-            background: #d4edda;
+        .label-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
         }
 
-        .drop-zone.occupied {
-            border-color: #007bff;
-            background: #f0f8ff;
+        .label-btn.clean {
+            background: #28a745;
+            color: white;
         }
 
-        .drop-zone.occupied .drop-zone-header {
-            color: #007bff;
-            background: #d1ecf1;
+        .label-btn.clean:hover:not(:disabled) {
+            background: #1e7e34;
         }
 
-        .drop-zone.dirty {
-            border-color: #dc3545;
-            background: #fff5f5;
+        .label-btn.occupied {
+            background: #007bff;
+            color: white;
         }
 
-        .drop-zone.dirty .drop-zone-header {
-            color: #dc3545;
-            background: #f8d7da;
+        .label-btn.occupied:hover:not(:disabled) {
+            background: #0056b3;
         }
 
-        .drop-zone.drag-over {
-            border-style: solid;
-            transform: scale(1.02);
-            box-shadow: 0 8px 16px rgba(0,0,0,0.2);
+        .label-btn.dirty {
+            background: #dc3545;
+            color: white;
         }
 
-        .frames-container {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-            gap: 10px;
+        .label-btn.dirty:hover:not(:disabled) {
+            background: #c82333;
         }
 
-        /* Unlabeled frames section */
-        .unlabeled-section {
-            margin-top: 30px;
+        .clear-selection-btn {
+            padding: 12px 20px;
+            font-size: 14px;
+            background: #6c757d;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-left: auto;
+        }
+
+        .clear-selection-btn:hover {
+            background: #5a6268;
+        }
+
+        /* Category sections */
+        .category-section {
+            margin-bottom: 30px;
             padding: 20px;
-            background: #fff;
             border-radius: 12px;
             border: 2px solid #ddd;
         }
 
-        .unlabeled-section h2 {
-            margin-top: 0;
-            color: #555;
+        .category-section.clean {
+            border-color: #28a745;
+            background: #f0fff4;
         }
 
-        .unlabeled-frames {
+        .category-section.occupied {
+            border-color: #007bff;
+            background: #f0f8ff;
+        }
+
+        .category-section.dirty {
+            border-color: #dc3545;
+            background: #fff5f5;
+        }
+
+        .category-section.unlabeled {
+            background: #fff;
+        }
+
+        .category-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .category-header h2 {
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .category-header .count-badge {
+            background: #666;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+        }
+
+        .category-section.clean .count-badge { background: #28a745; }
+        .category-section.occupied .count-badge { background: #007bff; }
+        .category-section.dirty .count-badge { background: #dc3545; }
+
+        .frames-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
             gap: 15px;
-            margin-top: 20px;
         }
 
         /* Frame items */
         .frame-item {
-            cursor: grab;
+            cursor: pointer;
             border: 3px solid #ddd;
             border-radius: 8px;
             overflow: hidden;
@@ -146,13 +203,31 @@
         }
 
         .frame-item:hover {
-            transform: scale(1.03);
-            box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+            transform: scale(1.02);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
         }
 
-        .frame-item.dragging {
-            opacity: 0.4;
-            cursor: grabbing;
+        .frame-item.selected {
+            border-color: #007bff;
+            border-width: 4px;
+            box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.3);
+        }
+
+        .frame-item.selected::after {
+            content: '\2713';
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            background: #007bff;
+            color: white;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 14px;
         }
 
         .frame-item img {
@@ -169,49 +244,21 @@
             border-top: 1px solid #ddd;
         }
 
-        /* Labeled frames get colored borders */
+        /* Labeled frame borders */
         .frame-item.labeled-clean {
             border-color: #28a745;
-            border-width: 4px;
         }
 
         .frame-item.labeled-occupied {
             border-color: #007bff;
-            border-width: 4px;
         }
 
         .frame-item.labeled-dirty {
             border-color: #dc3545;
-            border-width: 4px;
         }
 
-        /* Selected frames */
-        .frame-item.selected {
-            border-color: #007bff;
-            border-width: 4px;
-            box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.3);
-        }
-
-        /* Multi-select indicator */
-        .multi-select-info {
-            position: fixed;
-            bottom: 80px;
-            right: 20px;
-            background: #007bff;
-            color: white;
-            padding: 10px 20px;
-            border-radius: 8px;
-            font-weight: 600;
-            display: none;
-            z-index: 101;
-        }
-
-        .multi-select-info.active {
-            display: block;
-        }
-
-        /* Actions */
-        .actions {
+        /* Download section */
+        .download-section {
             position: sticky;
             bottom: 20px;
             background: white;
@@ -221,6 +268,12 @@
             text-align: center;
             margin-top: 30px;
             z-index: 100;
+        }
+
+        .progress-info {
+            margin-bottom: 15px;
+            font-size: 18px;
+            color: #555;
         }
 
         .btn {
@@ -247,12 +300,6 @@
             cursor: not-allowed;
         }
 
-        .progress-info {
-            margin-bottom: 15px;
-            font-size: 18px;
-            color: #555;
-        }
-
         .loading {
             text-align: center;
             padding: 40px;
@@ -266,6 +313,20 @@
             color: #999;
             font-style: italic;
         }
+
+        /* Select all button for each section */
+        .select-all-btn {
+            padding: 6px 12px;
+            font-size: 12px;
+            background: #e9ecef;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .select-all-btn:hover {
+            background: #dee2e6;
+        }
     </style>
 </head>
 <body>
@@ -278,48 +339,62 @@
         <h1>Label Frames for Training Data</h1>
 
         <div class="instructions">
-            <strong>Instructions:</strong> Drag frames from the bottom section into the appropriate category above (Clean, Occupied, or Dirty).
-            You can move frames between categories. When done, click "Download Labeled Frames" to get your organized training data.
+            <strong>Instructions:</strong> Click frames to select them, then click a label button (Clean, Occupied, or Dirty).
+            Use <kbd>Ctrl</kbd>+click to select multiple, <kbd>Shift</kbd>+click for range.
+            Keyboard: <kbd>1</kbd>=Clean, <kbd>2</kbd>=Occupied, <kbd>3</kbd>=Dirty, <kbd>Esc</kbd>=Clear selection.
+            <br><strong>Download removes labeled frames from view.</strong>
         </div>
 
         <div id="loading" class="loading">Loading frames...</div>
 
         <div id="content" style="display: none;">
-            <!-- Drop zones for labeled frames -->
-            <div class="drop-zones-container">
-                <div class="drop-zone clean" data-label="clean">
-                    <div class="drop-zone-header">
-                        Clean (<span id="clean-count">0</span>)
-                    </div>
-                    <div class="frames-container" id="clean-frames"></div>
-                </div>
-
-                <div class="drop-zone occupied" data-label="occupied">
-                    <div class="drop-zone-header">
-                        Occupied (<span id="occupied-count">0</span>)
-                    </div>
-                    <div class="frames-container" id="occupied-frames"></div>
-                </div>
-
-                <div class="drop-zone dirty" data-label="dirty">
-                    <div class="drop-zone-header">
-                        Dirty (<span id="dirty-count">0</span>)
-                    </div>
-                    <div class="frames-container" id="dirty-frames"></div>
-                </div>
+            <!-- Label toolbar -->
+            <div class="label-toolbar">
+                <span class="selection-info" id="selection-info">0 selected</span>
+                <button class="label-btn clean" id="btn-clean" disabled>Clean (1)</button>
+                <button class="label-btn occupied" id="btn-occupied" disabled>Occupied (2)</button>
+                <button class="label-btn dirty" id="btn-dirty" disabled>Dirty (3)</button>
+                <button class="clear-selection-btn" id="btn-clear-selection">Clear Selection</button>
             </div>
 
             <!-- Unlabeled frames -->
-            <div class="unlabeled-section">
-                <h2>To Label (<span id="unlabeled-count">0</span> frames)</h2>
-                <div class="unlabeled-frames" id="unlabeled-frames"></div>
+            <div class="category-section unlabeled" id="section-unlabeled">
+                <div class="category-header">
+                    <h2>To Label <span class="count-badge" id="unlabeled-count">0</span></h2>
+                    <button class="select-all-btn" onclick="selectAllInSection('unlabeled')">Select All</button>
+                </div>
+                <div class="frames-grid" id="frames-unlabeled"></div>
             </div>
 
-            <!-- Multi-select indicator -->
-            <div id="multi-select-info" class="multi-select-info"></div>
+            <!-- Clean frames -->
+            <div class="category-section clean" id="section-clean">
+                <div class="category-header">
+                    <h2>Clean <span class="count-badge" id="clean-count">0</span></h2>
+                    <button class="select-all-btn" onclick="selectAllInSection('clean')">Select All</button>
+                </div>
+                <div class="frames-grid" id="frames-clean"></div>
+            </div>
 
-            <!-- Actions -->
-            <div class="actions">
+            <!-- Occupied frames -->
+            <div class="category-section occupied" id="section-occupied">
+                <div class="category-header">
+                    <h2>Occupied <span class="count-badge" id="occupied-count">0</span></h2>
+                    <button class="select-all-btn" onclick="selectAllInSection('occupied')">Select All</button>
+                </div>
+                <div class="frames-grid" id="frames-occupied"></div>
+            </div>
+
+            <!-- Dirty frames -->
+            <div class="category-section dirty" id="section-dirty">
+                <div class="category-header">
+                    <h2>Dirty <span class="count-badge" id="dirty-count">0</span></h2>
+                    <button class="select-all-btn" onclick="selectAllInSection('dirty')">Select All</button>
+                </div>
+                <div class="frames-grid" id="frames-dirty"></div>
+            </div>
+
+            <!-- Download section -->
+            <div class="download-section">
                 <div class="progress-info">
                     <span id="labeled-count">0</span> / <span id="total-count">0</span> frames labeled
                 </div>
@@ -356,7 +431,7 @@
 
         // Render all frames
         function renderFrames() {
-            const unlabeledContainer = document.getElementById('unlabeled-frames');
+            const unlabeledContainer = document.getElementById('frames-unlabeled');
             unlabeledContainer.innerHTML = '';
 
             allFrames.forEach(frame => {
@@ -368,66 +443,10 @@
             updateCounters();
         }
 
-        // Multi-select functions
-        function toggleFrameSelection(filename, addToSelection = false) {
-            if (!addToSelection) {
-                // Single selection - clear others
-                selectedFrames.forEach(f => {
-                    const el = frameElements[f];
-                    if (el) el.classList.remove('selected');
-                });
-                selectedFrames.clear();
-            }
-
-            const frameEl = frameElements[filename];
-            if (!frameEl) return;
-
-            if (selectedFrames.has(filename)) {
-                selectedFrames.delete(filename);
-                frameEl.classList.remove('selected');
-            } else {
-                selectedFrames.add(filename);
-                frameEl.classList.add('selected');
-            }
-
-            updateMultiSelectUI();
-        }
-
-        function selectFrameRange(startFilename, endFilename) {
-            const startIdx = allFrames.findIndex(f => f.filename === startFilename);
-            const endIdx = allFrames.findIndex(f => f.filename === endFilename);
-
-            if (startIdx === -1 || endIdx === -1) return;
-
-            const [min, max] = [Math.min(startIdx, endIdx), Math.max(startIdx, endIdx)];
-
-            for (let i = min; i <= max; i++) {
-                const filename = allFrames[i].filename;
-                selectedFrames.add(filename);
-                const el = frameElements[filename];
-                if (el) el.classList.add('selected');
-            }
-
-            updateMultiSelectUI();
-        }
-
-        function updateMultiSelectUI() {
-            const info = document.getElementById('multi-select-info');
-            if (!info) return;
-
-            if (selectedFrames.size > 0) {
-                info.textContent = `${selectedFrames.size} frame${selectedFrames.size > 1 ? 's' : ''} selected`;
-                info.classList.add('active');
-            } else {
-                info.classList.remove('active');
-            }
-        }
-
         // Create frame element
         function createFrameElement(frame) {
             const div = document.createElement('div');
             div.className = 'frame-item';
-            div.draggable = true;
             div.dataset.filename = frame.filename;
 
             const img = document.createElement('img');
@@ -440,10 +459,6 @@
 
             div.appendChild(img);
             div.appendChild(info);
-
-            // Drag events
-            div.addEventListener('dragstart', handleDragStart);
-            div.addEventListener('dragend', handleDragEnd);
 
             // Click for selection
             div.addEventListener('click', (e) => {
@@ -465,100 +480,96 @@
             return div;
         }
 
-        // Drag start
-        function handleDragStart(e) {
-            const frameItem = e.target.closest('.frame-item');
-            if (!frameItem) return;
-
-            const filename = frameItem.dataset.filename;
-
-            // If dragging a non-selected frame, select only that one
-            if (!selectedFrames.has(filename)) {
+        // Toggle frame selection
+        function toggleFrameSelection(filename, addToSelection = false) {
+            if (!addToSelection) {
+                // Single selection - clear others
                 selectedFrames.forEach(f => {
                     const el = frameElements[f];
                     if (el) el.classList.remove('selected');
                 });
                 selectedFrames.clear();
+            }
+
+            const frameEl = frameElements[filename];
+            if (!frameEl) return;
+
+            if (selectedFrames.has(filename)) {
+                selectedFrames.delete(filename);
+                frameEl.classList.remove('selected');
+            } else {
                 selectedFrames.add(filename);
-                frameItem.classList.add('selected');
-                updateMultiSelectUI();
+                frameEl.classList.add('selected');
             }
 
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', JSON.stringify(Array.from(selectedFrames)));
+            updateSelectionUI();
+        }
 
-            // Mark all selected frames as dragging
+        // Select range of frames
+        function selectFrameRange(startFilename, endFilename) {
+            const startIdx = allFrames.findIndex(f => f.filename === startFilename);
+            const endIdx = allFrames.findIndex(f => f.filename === endFilename);
+
+            if (startIdx === -1 || endIdx === -1) return;
+
+            const [min, max] = [Math.min(startIdx, endIdx), Math.max(startIdx, endIdx)];
+
+            for (let i = min; i <= max; i++) {
+                const filename = allFrames[i].filename;
+                // Only select if frame still exists in UI
+                if (frameElements[filename]) {
+                    selectedFrames.add(filename);
+                    frameElements[filename].classList.add('selected');
+                }
+            }
+
+            updateSelectionUI();
+        }
+
+        // Select all frames in a section
+        function selectAllInSection(section) {
+            const containerId = section === 'unlabeled' ? 'frames-unlabeled' : `frames-${section}`;
+            const container = document.getElementById(containerId);
+            const frames = container.querySelectorAll('.frame-item');
+
+            frames.forEach(frame => {
+                const filename = frame.dataset.filename;
+                selectedFrames.add(filename);
+                frame.classList.add('selected');
+            });
+
+            updateSelectionUI();
+        }
+
+        // Clear all selections
+        function clearSelection() {
             selectedFrames.forEach(f => {
                 const el = frameElements[f];
-                if (el) el.classList.add('dragging');
+                if (el) el.classList.remove('selected');
             });
+            selectedFrames.clear();
+            updateSelectionUI();
         }
 
-        // Drag end
-        function handleDragEnd(e) {
-            selectedFrames.forEach(f => {
-                const el = frameElements[f];
-                if (el) el.classList.remove('dragging');
-            });
+        // Update selection UI
+        function updateSelectionUI() {
+            const count = selectedFrames.size;
+            document.getElementById('selection-info').textContent = `${count} selected`;
+
+            const hasSelection = count > 0;
+            document.getElementById('btn-clean').disabled = !hasSelection;
+            document.getElementById('btn-occupied').disabled = !hasSelection;
+            document.getElementById('btn-dirty').disabled = !hasSelection;
         }
 
-        // Setup drop zones
-        document.querySelectorAll('.drop-zone').forEach(zone => {
-            zone.addEventListener('dragover', handleDragOver);
-            zone.addEventListener('dragleave', handleDragLeave);
-            zone.addEventListener('drop', handleDrop);
-        });
+        // Apply label to selected frames
+        function applyLabel(label) {
+            if (selectedFrames.size === 0) return;
 
-        // Also make unlabeled section a drop zone (to unlabel)
-        const unlabeledSection = document.getElementById('unlabeled-frames');
-        unlabeledSection.addEventListener('dragover', handleDragOver);
-        unlabeledSection.addEventListener('dragleave', handleDragLeave);
-        unlabeledSection.addEventListener('drop', handleDropUnlabel);
+            const containerId = `frames-${label}`;
+            const container = document.getElementById(containerId);
 
-        function handleDragOver(e) {
-            e.preventDefault();
-            e.dataTransfer.dropEffect = 'move';
-
-            // Find parent drop zone or unlabeled section
-            const dropTarget = e.target.closest('.drop-zone, .unlabeled-frames');
-            if (dropTarget) {
-                dropTarget.classList.add('drag-over');
-            }
-        }
-
-        function handleDragLeave(e) {
-            const dropTarget = e.target.closest('.drop-zone, .unlabeled-frames');
-            if (!dropTarget) return;
-
-            // Only remove if actually leaving (not just entering child element)
-            const rect = dropTarget.getBoundingClientRect();
-            if (e.clientX < rect.left || e.clientX >= rect.right ||
-                e.clientY < rect.top || e.clientY >= rect.bottom) {
-                dropTarget.classList.remove('drag-over');
-            }
-        }
-
-        function handleDrop(e) {
-            e.preventDefault();
-
-            const dropZone = e.target.closest('.drop-zone');
-            if (!dropZone) return;
-
-            dropZone.classList.remove('drag-over');
-
-            const filenamesJson = e.dataTransfer.getData('text/plain');
-            let filenames;
-            try {
-                filenames = JSON.parse(filenamesJson);
-            } catch {
-                filenames = [filenamesJson]; // Fallback for single filename
-            }
-
-            const label = dropZone.dataset.label;
-            if (!label) return;
-
-            // Process all selected frames
-            filenames.forEach(filename => {
+            selectedFrames.forEach(filename => {
                 const frameEl = frameElements[filename];
                 if (!frameEl) return;
 
@@ -572,50 +583,12 @@
                 frameEl.classList.add(`labeled-${label}`);
 
                 // Move to appropriate container
-                const container = document.getElementById(`${label}-frames`);
                 container.appendChild(frameEl);
-            });
-
-            // Clear selection after drop
-            selectedFrames.clear();
-            updateMultiSelectUI();
-            updateCounters();
-        }
-
-        function handleDropUnlabel(e) {
-            e.preventDefault();
-
-            const unlabeledSection = e.target.closest('.unlabeled-frames');
-            if (!unlabeledSection) return;
-
-            unlabeledSection.classList.remove('drag-over');
-
-            const filenamesJson = e.dataTransfer.getData('text/plain');
-            let filenames;
-            try {
-                filenames = JSON.parse(filenamesJson);
-            } catch {
-                filenames = [filenamesJson];
-            }
-
-            // Process all selected frames
-            filenames.forEach(filename => {
-                const frameEl = frameElements[filename];
-                if (!frameEl) return;
-
-                // Remove label
-                delete frameLabels[filename];
-
-                // Remove label classes
-                frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty', 'selected');
-
-                // Move back to unlabeled section
-                unlabeledSection.appendChild(frameEl);
             });
 
             // Clear selection
             selectedFrames.clear();
-            updateMultiSelectUI();
+            updateSelectionUI();
             updateCounters();
         }
 
@@ -625,7 +598,7 @@
             const occupiedCount = Object.values(frameLabels).filter(l => l === 'occupied').length;
             const dirtyCount = Object.values(frameLabels).filter(l => l === 'dirty').length;
             const labeledCount = cleanCount + occupiedCount + dirtyCount;
-            const totalCount = allFrames.length;
+            const totalCount = Object.keys(frameElements).length; // Only count frames still in UI
             const unlabeledCount = totalCount - labeledCount;
 
             document.getElementById('clean-count').textContent = cleanCount;
@@ -639,7 +612,29 @@
             document.getElementById('download-btn').disabled = labeledCount === 0;
         }
 
-        // Download labeled frames
+        // Button event listeners
+        document.getElementById('btn-clean').addEventListener('click', () => applyLabel('clean'));
+        document.getElementById('btn-occupied').addEventListener('click', () => applyLabel('occupied'));
+        document.getElementById('btn-dirty').addEventListener('click', () => applyLabel('dirty'));
+        document.getElementById('btn-clear-selection').addEventListener('click', clearSelection);
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            // Don't trigger if typing in an input
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+            if (e.key === '1') {
+                applyLabel('clean');
+            } else if (e.key === '2') {
+                applyLabel('occupied');
+            } else if (e.key === '3') {
+                applyLabel('dirty');
+            } else if (e.key === 'Escape') {
+                clearSelection();
+            }
+        });
+
+        // Download labeled frames - REMOVES them from UI after download
         document.getElementById('download-btn').addEventListener('click', async () => {
             const btn = document.getElementById('download-btn');
             btn.disabled = true;
@@ -664,10 +659,33 @@
                     document.body.removeChild(a);
                     window.URL.revokeObjectURL(url);
 
-                    btn.textContent = 'Download Complete!';
+                    // REMOVE downloaded frames from UI
+                    const downloadedFilenames = Object.keys(frameLabels);
+                    downloadedFilenames.forEach(filename => {
+                        const frameEl = frameElements[filename];
+                        if (frameEl) {
+                            frameEl.remove();
+                            delete frameElements[filename];
+                        }
+                        // Also remove from allFrames array
+                        const idx = allFrames.findIndex(f => f.filename === filename);
+                        if (idx !== -1) {
+                            allFrames.splice(idx, 1);
+                        }
+                    });
+
+                    // Clear labels for downloaded frames
+                    frameLabels = {};
+                    selectedFrames.clear();
+
+                    // Update UI
+                    updateCounters();
+                    updateSelectionUI();
+
+                    btn.textContent = 'Download Complete! Frames removed.';
                     setTimeout(() => {
                         btn.textContent = 'Download Labeled Frames';
-                        btn.disabled = false;
+                        btn.disabled = Object.keys(frameLabels).length === 0;
                     }, 2000);
                 } else {
                     alert('Download failed. Please try again.');
@@ -679,52 +697,6 @@
                 btn.textContent = 'Download Labeled Frames';
                 btn.disabled = false;
             }
-        });
-
-        // Keyboard shortcuts for labeling
-        document.addEventListener('keydown', (e) => {
-            if (selectedFrames.size === 0) return;
-
-            let label = null;
-            if (e.key === '1') label = 'clean';
-            else if (e.key === '2') label = 'occupied';
-            else if (e.key === '3') label = 'dirty';
-            else if (e.key === 'Escape') {
-                // Clear selection
-                selectedFrames.forEach(f => {
-                    const el = frameElements[f];
-                    if (el) el.classList.remove('selected');
-                });
-                selectedFrames.clear();
-                updateMultiSelectUI();
-                return;
-            }
-
-            if (!label) return;
-
-            // Apply label to all selected frames
-            selectedFrames.forEach(filename => {
-                const frameEl = frameElements[filename];
-                if (!frameEl) return;
-
-                // Update label
-                frameLabels[filename] = label;
-
-                // Remove old label classes
-                frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty', 'selected');
-
-                // Add new label class
-                frameEl.classList.add(`labeled-${label}`);
-
-                // Move to appropriate container
-                const container = document.getElementById(`${label}-frames`);
-                container.appendChild(frameEl);
-            });
-
-            // Clear selection
-            selectedFrames.clear();
-            updateMultiSelectUI();
-            updateCounters();
         });
 
         // Load frames on page load
