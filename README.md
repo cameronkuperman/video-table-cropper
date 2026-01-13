@@ -49,7 +49,9 @@ Open **http://localhost:8080** in your browser.
 
 ## JSON Format
 
-Your JSON file should have this structure:
+The app supports two JSON formats:
+
+### Format 1: Axis-aligned bounding boxes
 
 ```json
 {
@@ -57,7 +59,6 @@ Your JSON file should have this structure:
   "tables": [
     {
       "id": 0,
-      "confidence": 0.95,
       "bbox": {
         "x1": 100,
         "y1": 200,
@@ -65,14 +66,33 @@ Your JSON file should have this structure:
         "y2": 600
       },
       "saved": true
-    },
+    }
+  ]
+}
+```
+
+### Format 2: Rotated bounding boxes
+
+For tables detected at an angle:
+
+```json
+{
+  "video_name": "my_video",
+  "frame_width": 1280,
+  "frame_height": 720,
+  "tables": [
     {
-      "id": 1,
-      "bbox": {
-        "x1": 50,
-        "y1": 50,
-        "x2": 300,
-        "y2": 250
+      "id": 0,
+      "rotated_bbox": {
+        "center": [500, 300],
+        "size": [200, 150],
+        "angle": -45.0,
+        "corners": [
+          [400, 200],
+          [600, 200],
+          [600, 400],
+          [400, 400]
+        ]
       },
       "saved": true
     }
@@ -80,14 +100,16 @@ Your JSON file should have this structure:
 }
 ```
 
-**Required fields per table:**
-- `bbox.x1`, `bbox.y1` - Top-left corner (pixels)
-- `bbox.x2`, `bbox.y2` - Bottom-right corner (pixels)
+**Rotated bbox fields:**
+- `center` - [x, y] center point of the rotated rectangle
+- `size` - [width, height] of the rectangle (output dimensions)
+- `angle` - Rotation angle in degrees
+- `corners` - Four [x, y] corner points defining the rotated rectangle
 
 **Optional fields:**
 - `id` - Table identifier (used in output filename)
 - `saved` - Set to `false` to skip this table
-- `skip_reason` - Set to `"too_small"` to skip
+- `skip_reason` - Set to skip this table
 
 ## Output
 

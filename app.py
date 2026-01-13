@@ -3,10 +3,12 @@
 Video Table Cropper - Flask Web App
 
 Drag-and-drop interface to crop videos based on JSON bounding boxes.
+Supports both axis-aligned and rotated bounding boxes.
 """
 
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -38,7 +40,7 @@ def allowed_json(filename: str) -> bool:
 
 
 def crop_video(input_path: Path, output_path: Path, x1: int, y1: int, x2: int, y2: int) -> bool:
-    """Crop a video using ffmpeg."""
+    """Crop a video using ffmpeg (axis-aligned bbox)."""
     width = x2 - x1
     height = y2 - y1
     crop_filter = f"crop={width}:{height}:{x1}:{y1}"
@@ -49,7 +51,122 @@ def crop_video(input_path: Path, output_path: Path, x1: int, y1: int, x2: int, y
         "-vf", crop_filter,
         "-c:v", "libx264",
         "-preset", "fast",
-        "-c:a", "aac",  # Re-encode audio to AAC (compatible with MP4)
+        "-c:a", "aac",
+        "-y",
+        str(output_path)
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        return result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def crop_rotated_video(input_path: Path, output_path: Path, rotated_bbox: dict, frame_width: int, frame_height: int) -> bool:
+    """
+    Crop a rotated rectangular region from video.
+
+    Strategy:
+    1. Crop the axis-aligned bounding box containing all corners
+    2. Pad to center the rotation point
+    3. Rotate to straighten the region
+    4. Crop the final rectangle from center
+    """
+    center = rotated_bbox.get("center", [0, 0])
+    size = rotated_bbox.get("size", [100, 100])
+    angle = rotated_bbox.get("angle", 0)
+    corners = rotated_bbox.get("corners", [])
+
+    if not corners or len(corners) < 4:
+        return False
+
+    cx, cy = center
+    final_w, final_h = int(round(size[0])), int(round(size[1]))
+
+    # Make dimensions even for codec compatibility
+    final_w = final_w + (final_w % 2)
+    final_h = final_h + (final_h % 2)
+
+    # Get axis-aligned bounding box of corners
+    xs = [c[0] for c in corners]
+    ys = [c[1] for c in corners]
+
+    margin = 10
+    min_x = max(0, int(min(xs)) - margin)
+    min_y = max(0, int(min(ys)) - margin)
+    max_x = min(frame_width, int(max(xs)) + margin + 1)
+    max_y = min(frame_height, int(max(ys)) + margin + 1)
+
+    # First crop dimensions
+    crop1_w = max_x - min_x
+    crop1_h = max_y - min_y
+    crop1_x = min_x
+    crop1_y = min_y
+
+    # Bbox center in cropped coordinates
+    new_cx = cx - min_x
+    new_cy = cy - min_y
+
+    # Calculate padded size (large enough to center bbox and fit final crop after rotation)
+    S = 2 * int(max(new_cx, new_cy, crop1_w - new_cx, crop1_h - new_cy)) + max(final_w, final_h) + 100
+    S = S + (S % 2)  # Make even
+
+    # Padding to center bbox at (S/2, S/2)
+    pad_left = int(S / 2 - new_cx)
+    pad_top = int(S / 2 - new_cy)
+    pad_right = S - crop1_w - pad_left
+    pad_bottom = S - crop1_h - pad_top
+
+    # Ensure non-negative padding
+    if pad_left < 0:
+        pad_right -= pad_left
+        pad_left = 0
+    if pad_top < 0:
+        pad_bottom -= pad_top
+        pad_top = 0
+    if pad_right < 0:
+        pad_left -= pad_right
+        pad_right = 0
+    if pad_bottom < 0:
+        pad_top -= pad_bottom
+        pad_bottom = 0
+
+    # Recalculate S after adjustments
+    S = crop1_w + pad_left + pad_right
+    S_h = crop1_h + pad_top + pad_bottom
+    if S != S_h:
+        # Make square by adding to the smaller dimension
+        if S > S_h:
+            diff = S - S_h
+            pad_bottom += diff
+        else:
+            diff = S_h - S
+            pad_right += diff
+            S = S_h
+
+    # Rotation angle (negative to un-rotate)
+    angle_rad = -angle * math.pi / 180
+
+    # Final crop position (centered)
+    final_crop_x = int((S - final_w) / 2)
+    final_crop_y = int((S - final_h) / 2)
+
+    # Build ffmpeg filter chain
+    filter_str = (
+        f"crop={crop1_w}:{crop1_h}:{crop1_x}:{crop1_y},"
+        f"pad={S}:{S}:{pad_left}:{pad_top}:black,"
+        f"rotate={angle_rad}:ow={S}:oh={S}:c=black,"
+        f"crop={final_w}:{final_h}:{final_crop_x}:{final_crop_y}"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-i", str(input_path),
+        "-vf", filter_str,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-c:a", "aac",
         "-y",
         str(output_path)
     ]
@@ -110,7 +227,7 @@ def upload():
 
 @app.route("/process", methods=["POST"])
 def process():
-    """Process video with JSON bounding boxes."""
+    """Process video with JSON bounding boxes (supports both axis-aligned and rotated)."""
     data = request.json
     video_filename = data.get("video")
     json_filenames = data.get("jsons", [])
@@ -143,32 +260,56 @@ def process():
         tables = json_data.get("tables", [])
         video_name = json_data.get("video_name", video_path.stem)
 
+        # Get frame dimensions from JSON (for rotated bbox support)
+        frame_width = json_data.get("frame_width", 1920)
+        frame_height = json_data.get("frame_height", 1080)
+
         for idx, table in enumerate(tables):
-            # Use table id if available, otherwise use index
-            table_id = table.get("id", idx)
-            bbox = table.get("bbox", {})
-
-            # Get bbox coordinates
-            x1 = bbox.get("x1", 0)
-            y1 = bbox.get("y1", 0)
-            x2 = bbox.get("x2", 0)
-            y2 = bbox.get("y2", 0)
-
-            # Only skip if bbox is invalid (zero or negative dimensions)
-            if x2 <= x1 or y2 <= y1:
+            # Skip if saved=false or skip_reason is set
+            if not table.get("saved", True):
+                continue
+            if table.get("skip_reason"):
                 continue
 
+            table_id = table.get("id", idx)
             output_name = f"{video_name}_table_{table_id:02d}.mp4"
             output_path = job_output / output_name
 
-            success = crop_video(video_path, output_path, x1, y1, x2, y2)
+            # Check for rotated_bbox (new format) vs bbox (old format)
+            rotated_bbox = table.get("rotated_bbox")
+            bbox = table.get("bbox", {})
+
+            success = False
+
+            if rotated_bbox and rotated_bbox.get("corners"):
+                # New format: rotated bounding box
+                success = crop_rotated_video(
+                    video_path, output_path, rotated_bbox, frame_width, frame_height
+                )
+                bbox_info = {
+                    "center": rotated_bbox.get("center"),
+                    "size": rotated_bbox.get("size"),
+                    "angle": rotated_bbox.get("angle")
+                }
+            elif bbox:
+                # Old format: axis-aligned bounding box
+                x1 = bbox.get("x1", 0)
+                y1 = bbox.get("y1", 0)
+                x2 = bbox.get("x2", 0)
+                y2 = bbox.get("y2", 0)
+
+                if x2 > x1 and y2 > y1:
+                    success = crop_video(video_path, output_path, x1, y1, x2, y2)
+                bbox_info = bbox
+            else:
+                continue
 
             if success:
                 results.append({
                     "table_id": table_id,
                     "filename": output_name,
                     "download_url": f"/download/{job_id}/{output_name}",
-                    "bbox": bbox
+                    "bbox": bbox_info
                 })
 
     return jsonify({
