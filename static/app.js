@@ -1,57 +1,67 @@
 // State
-let uploadedVideo = null;
-let uploadedJsons = [];
+let uploadedVideos = [];  // Array of {filename, original, camera, autoDetected}
+let availableCameras = [];  // Loaded from /cameras API
 let currentJobId = null;
 let currentVideos = [];
 
 // DOM Elements
 const videoZone = document.getElementById('video-zone');
-const jsonZone = document.getElementById('json-zone');
 const videoInput = document.getElementById('video-input');
-const jsonInput = document.getElementById('json-input');
-const videoInfo = document.getElementById('video-info');
-const jsonList = document.getElementById('json-list');
+const videoList = document.getElementById('video-list');
 const processBtn = document.getElementById('process-btn');
 const clearBtn = document.getElementById('clear-btn');
 const status = document.getElementById('status');
 const results = document.getElementById('results');
 const resultsList = document.getElementById('results-list');
-const jsonPaste = document.getElementById('json-paste');
-const addJsonBtn = document.getElementById('add-json-btn');
 const downloadAllBtn = document.getElementById('download-all-btn');
 
-// Drag and drop handlers
-function setupDropZone(zone, input, type) {
-    zone.addEventListener('click', () => input.click());
+// Drag and drop handlers for video zone
+videoZone.addEventListener('click', () => videoInput.click());
 
-    zone.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        zone.classList.add('dragover');
-    });
+videoZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    videoZone.classList.add('dragover');
+});
 
-    zone.addEventListener('dragleave', () => {
-        zone.classList.remove('dragover');
-    });
+videoZone.addEventListener('dragleave', () => {
+    videoZone.classList.remove('dragover');
+});
 
-    zone.addEventListener('drop', (e) => {
-        e.preventDefault();
-        zone.classList.remove('dragover');
-        const files = Array.from(e.dataTransfer.files);
-        handleFiles(files, type);
-    });
+videoZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    videoZone.classList.remove('dragover');
+    const files = Array.from(e.dataTransfer.files);
+    handleVideoUpload(files);
+});
 
-    input.addEventListener('change', (e) => {
-        const files = Array.from(e.target.files);
-        handleFiles(files, type);
-    });
+videoInput.addEventListener('change', (e) => {
+    const files = Array.from(e.target.files);
+    handleVideoUpload(files);
+});
+
+// Load available cameras from API
+async function loadCameras() {
+    if (availableCameras.length > 0) return;  // Already loaded
+
+    try {
+        const response = await fetch('/cameras');
+        const data = await response.json();
+        availableCameras = data.cameras;
+    } catch (error) {
+        console.error('Failed to load cameras:', error);
+        showStatus('Failed to load camera list', 'error');
+    }
 }
 
-// Handle file uploads
-async function handleFiles(files, type) {
+// Handle video file uploads
+async function handleVideoUpload(files) {
+    // Load cameras first if not loaded
+    await loadCameras();
+
     for (const file of files) {
         const formData = new FormData();
         formData.append('file', file);
-        formData.append('type', type);
+        formData.append('type', 'video');
 
         try {
             const response = await fetch('/upload', {
@@ -62,109 +72,105 @@ async function handleFiles(files, type) {
             const data = await response.json();
 
             if (data.success) {
-                if (type === 'video') {
-                    uploadedVideo = data.filename;
-                    videoInfo.textContent = `✓ ${data.original}`;
-                    videoZone.classList.add('has-file');
-                } else {
-                    uploadedJsons.push(data.filename);
-                    const item = document.createElement('div');
-                    item.className = 'file-item';
-                    item.innerHTML = `
-                        <span class="name">${data.original}</span>
-                        <span class="tables">${data.tables} tables</span>
-                    `;
-                    jsonList.appendChild(item);
-                    jsonZone.classList.add('has-file');
-                }
+                // Auto-detect camera from filename
+                const detectedCamera = detectCameraFromFilename(data.original);
+
+                uploadedVideos.push({
+                    filename: data.filename,
+                    original: data.original,
+                    camera: detectedCamera || "",
+                    autoDetected: !!detectedCamera
+                });
+
+                renderVideoList();
                 updateProcessButton();
             } else {
                 showStatus(`Error: ${data.error}`, 'error');
             }
-        } catch (err) {
-            showStatus(`Upload failed: ${err.message}`, 'error');
+        } catch (error) {
+            showStatus(`Upload failed: ${error.message}`, 'error');
         }
     }
 }
 
-// Handle pasted JSON
-async function handlePastedJson() {
-    const text = jsonPaste.value.trim();
-    if (!text) {
-        showStatus('Please paste JSON first', 'error');
+// Detect camera ID from filename
+function detectCameraFromFilename(filename) {
+    const match = filename.match(/IPC(\d+)/i);
+    if (match) {
+        return `IPC${match[1]}`;
+    }
+    return null;
+}
+
+// Render the video list with camera selectors
+function renderVideoList() {
+    videoList.innerHTML = '';
+
+    if (uploadedVideos.length === 0) {
         return;
     }
 
-    // Validate JSON
-    try {
-        JSON.parse(text);
-    } catch (e) {
-        showStatus('Invalid JSON format', 'error');
-        return;
-    }
-
-    // Create a blob and upload it
-    const blob = new Blob([text], { type: 'application/json' });
-    const file = new File([blob], 'pasted.json', { type: 'application/json' });
-
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('type', 'json');
-
-    try {
-        const response = await fetch('/upload', {
-            method: 'POST',
-            body: formData
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            uploadedJsons.push(data.filename);
-            const item = document.createElement('div');
-            item.className = 'file-item';
-            item.innerHTML = `
-                <span class="name">Pasted JSON</span>
-                <span class="tables">${data.tables} tables</span>
-            `;
-            jsonList.appendChild(item);
-            jsonZone.classList.add('has-file');
-            jsonPaste.value = '';
-            showStatus('JSON added successfully!', 'success');
-            updateProcessButton();
-        } else {
-            showStatus(`Error: ${data.error}`, 'error');
+    uploadedVideos.forEach((video, index) => {
+        const item = document.createElement('div');
+        item.className = 'video-item';
+        if (!video.camera) {
+            item.classList.add('missing-camera');
         }
-    } catch (err) {
-        showStatus(`Upload failed: ${err.message}`, 'error');
-    }
+        item.dataset.index = index;
+
+        const cameraOptions = availableCameras.map(cam =>
+            `<option value="${cam.id}" ${video.camera === cam.id ? 'selected' : ''}>
+                ${cam.name} (${cam.tables} tables)
+             </option>`
+        ).join('');
+
+        item.innerHTML = `
+            <div class="video-info">
+                <span class="video-name">${video.original}</span>
+                <button class="remove-btn" onclick="removeVideo(${index})">✕</button>
+            </div>
+            <div class="camera-selector">
+                <label>Camera:</label>
+                <select class="camera-dropdown" onchange="updateVideoCamera(${index}, this.value)">
+                    <option value="">Select camera...</option>
+                    ${cameraOptions}
+                </select>
+                ${video.autoDetected ? '<span class="detection-badge">Auto-detected</span>' : ''}
+            </div>
+        `;
+
+        videoList.appendChild(item);
+    });
+}
+
+// Update camera selection for a video
+function updateVideoCamera(index, cameraId) {
+    uploadedVideos[index].camera = cameraId;
+    uploadedVideos[index].autoDetected = false;
+    renderVideoList();
+    updateProcessButton();
+}
+
+// Remove a video from the list
+function removeVideo(index) {
+    uploadedVideos.splice(index, 1);
+    renderVideoList();
+    updateProcessButton();
 }
 
 // Update process button state
 function updateProcessButton() {
-    processBtn.disabled = !(uploadedVideo && uploadedJsons.length > 0);
-}
+    // Enable if all videos have cameras assigned
+    const allHaveCameras = uploadedVideos.length > 0 &&
+                          uploadedVideos.every(v => v.camera);
 
-// Show status message
-function showStatus(message, type = 'processing') {
-    status.textContent = message;
-    status.className = `status ${type}`;
-    status.hidden = false;
-}
+    processBtn.disabled = !allHaveCameras;
 
-// Hide status
-function hideStatus() {
-    status.hidden = true;
-}
-
-// Trigger browser download
-function triggerDownload(url, filename) {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    if (uploadedVideos.length > 0 && !allHaveCameras) {
+        showStatus('Please select a camera for each video', 'warning');
+    } else if (allHaveCameras) {
+        hideStatus();
+    }
 }
 
 // Process videos
@@ -176,15 +182,18 @@ async function processVideos() {
     btnLoading.hidden = false;
     processBtn.disabled = true;
 
-    showStatus('Processing videos... This may take a while.', 'processing');
+    const cameraCount = new Set(uploadedVideos.map(v => v.camera)).size;
+    showStatus(`Cropping tables from ${uploadedVideos.length} video(s) across ${cameraCount} camera(s)...`, 'processing');
 
     try {
         const response = await fetch('/process', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                video: uploadedVideo,
-                jsons: uploadedJsons
+                videos: uploadedVideos.map(v => ({
+                    filename: v.filename,
+                    camera: v.camera
+                }))
             })
         });
 
@@ -193,102 +202,155 @@ async function processVideos() {
         if (data.success) {
             currentJobId = data.job_id;
             currentVideos = data.videos;
-            showStatus(`Successfully created ${data.count} cropped videos!`, 'success');
-            displayResults(data.videos);
+            showStatus(
+                `Success! Cropped ${data.count} tables from ${data.cameras_processed.length} camera(s). ` +
+                `Extracted ${data.frame_count} frames.`,
+                'success'
+            );
+            displayResults(data.videos, data.labeling_job_id, data.frame_count);
         } else {
             showStatus(`Error: ${data.error}`, 'error');
         }
-    } catch (err) {
-        showStatus(`Processing failed: ${err.message}`, 'error');
+    } catch (error) {
+        showStatus(`Processing failed: ${error.message}`, 'error');
     } finally {
         btnText.hidden = false;
         btnLoading.hidden = true;
-        updateProcessButton();
+        processBtn.disabled = false;
     }
 }
 
 // Display results
-function displayResults(videos) {
+function displayResults(videos, labelingJobId, frameCount) {
     resultsList.innerHTML = '';
 
+    // Group videos by camera for organized display
+    const videosByCamera = {};
     for (const video of videos) {
-        const item = document.createElement('div');
-        item.className = 'result-item';
-        item.innerHTML = `
-            <div class="result-info">
-                <span class="result-name">${video.filename}</span>
-                <span class="result-bbox">Table ${video.table_id} • (${video.bbox.x1}, ${video.bbox.y1}) to (${video.bbox.x2}, ${video.bbox.y2})</span>
-            </div>
-            <a href="${video.download_url}" download="${video.filename}" class="download-btn">Download</a>
+        const camera = video.camera || 'Unknown';
+        if (!videosByCamera[camera]) {
+            videosByCamera[camera] = [];
+        }
+        videosByCamera[camera].push(video);
+    }
+
+    // Display videos grouped by camera
+    for (const [camera, cameraVideos] of Object.entries(videosByCamera)) {
+        const cameraSection = document.createElement('div');
+        cameraSection.style.marginBottom = '20px';
+
+        const cameraHeader = document.createElement('h3');
+        cameraHeader.textContent = `Camera ${camera.replace('IPC', '')} (${cameraVideos.length} tables)`;
+        cameraHeader.style.marginBottom = '10px';
+        cameraHeader.style.color = '#555';
+        cameraSection.appendChild(cameraHeader);
+
+        for (const video of cameraVideos) {
+            const item = document.createElement('div');
+            item.className = 'result-item';
+
+            // Format bbox info
+            let bboxInfo = '';
+            if (video.bbox.center) {
+                bboxInfo = `Table ${video.table_id} • Rotated bbox`;
+            } else if (video.bbox.x1 !== undefined) {
+                bboxInfo = `Table ${video.table_id} • (${video.bbox.x1}, ${video.bbox.y1}) to (${video.bbox.x2}, ${video.bbox.y2})`;
+            } else {
+                bboxInfo = `Table ${video.table_id}`;
+            }
+
+            item.innerHTML = `
+                <div class="result-info">
+                    <span class="result-name">${video.filename}</span>
+                    <span class="result-bbox">${bboxInfo}</span>
+                </div>
+                <a href="${video.download_url}" download="${video.filename}" class="download-btn">Download</a>
+            `;
+            cameraSection.appendChild(item);
+        }
+
+        resultsList.appendChild(cameraSection);
+    }
+
+    // Add "Label Frames" button if frames were extracted
+    if (labelingJobId && frameCount > 0) {
+        const labelSection = document.createElement('div');
+        labelSection.style.marginTop = '30px';
+        labelSection.style.padding = '20px';
+        labelSection.style.background = '#f0f8ff';
+        labelSection.style.borderRadius = '12px';
+        labelSection.style.border = '2px solid #007bff';
+        labelSection.innerHTML = `
+            <h3 style="margin-top: 0; color: #007bff;">Ready for Labeling</h3>
+            <p style="margin: 10px 0;">
+                Extracted <strong>${frameCount} frames</strong> from all cropped videos.
+                Label them as Clean, Occupied, or Dirty to create your training dataset.
+            </p>
+            <button id="label-frames-btn" class="btn primary" style="margin-top: 15px; padding: 15px 30px; font-size: 16px;">
+                Label ${frameCount} Frames →
+            </button>
         `;
-        resultsList.appendChild(item);
+        resultsList.appendChild(labelSection);
+
+        // Add click handler
+        document.getElementById('label-frames-btn').addEventListener('click', () => {
+            window.location.href = `/label/${labelingJobId}`;
+        });
     }
 
     results.hidden = false;
 }
 
-// Download all videos
-async function downloadAll() {
-    if (currentVideos.length === 0) return;
-
-    showStatus('Downloading all videos...', 'processing');
-
-    try {
-        const response = await fetch(`/download-zip/${currentJobId}`);
-        if (response.ok) {
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            triggerDownload(url, `cropped_videos_${currentJobId}.zip`);
-            window.URL.revokeObjectURL(url);
-            showStatus('Download complete!', 'success');
-        } else {
-            // Fallback: download individually
-            for (const video of currentVideos) {
-                triggerDownload(video.download_url, video.filename);
-                await new Promise(r => setTimeout(r, 500)); // Small delay between downloads
-            }
-            showStatus('All downloads started!', 'success');
-        }
-    } catch (err) {
-        // Fallback: download individually
-        for (const video of currentVideos) {
-            triggerDownload(video.download_url, video.filename);
-            await new Promise(r => setTimeout(r, 500));
-        }
-        showStatus('All downloads started!', 'success');
-    }
-}
-
 // Clear all
-async function clearAll() {
-    try {
-        await fetch('/cleanup', { method: 'POST' });
-    } catch (err) {
-        console.error('Cleanup failed:', err);
-    }
-
-    uploadedVideo = null;
-    uploadedJsons = [];
+function clearAll() {
+    uploadedVideos = [];
     currentJobId = null;
     currentVideos = [];
-
-    videoInfo.textContent = '';
-    jsonList.innerHTML = '';
+    videoList.innerHTML = '';
     resultsList.innerHTML = '';
-    jsonPaste.value = '';
-
-    videoZone.classList.remove('has-file');
-    jsonZone.classList.remove('has-file');
-
-    hideStatus();
     results.hidden = true;
+    videoInput.value = '';
     updateProcessButton();
+    hideStatus();
 }
 
-// Initialize
-setupDropZone(videoZone, videoInput, 'video');
-setupDropZone(jsonZone, jsonInput, 'json');
+// Show status message
+function showStatus(message, type) {
+    status.textContent = message;
+    status.className = `status ${type}`;
+    status.hidden = false;
+}
+
+// Hide status
+function hideStatus() {
+    status.hidden = true;
+}
+
+// Download all as ZIP
+async function downloadAllAsZip() {
+    if (!currentJobId) return;
+
+    downloadAllBtn.disabled = true;
+    downloadAllBtn.textContent = 'Preparing ZIP...';
+
+    try {
+        window.location.href = `/download-zip/${currentJobId}`;
+
+        setTimeout(() => {
+            downloadAllBtn.disabled = false;
+            downloadAllBtn.textContent = 'Download All as ZIP';
+        }, 2000);
+    } catch (error) {
+        showStatus(`Download failed: ${error.message}`, 'error');
+        downloadAllBtn.disabled = false;
+        downloadAllBtn.textContent = 'Download All as ZIP';
+    }
+}
+
+// Event listeners
 processBtn.addEventListener('click', processVideos);
 clearBtn.addEventListener('click', clearAll);
-addJsonBtn.addEventListener('click', handlePastedJson);
-downloadAllBtn.addEventListener('click', downloadAll);
+downloadAllBtn.addEventListener('click', downloadAllAsZip);
+
+// Initialize
+loadCameras();

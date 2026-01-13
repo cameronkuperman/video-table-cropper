@@ -1,8 +1,13 @@
 # Video Table Cropper
 
-A simple web app to crop videos based on bounding box coordinates from JSON files.
+A web app with two tools:
+1. **Table Cropper** - Crop videos based on bounding box coordinates from JSON files
+2. **Frame Extraction** - Extract frames from videos for ML training datasets
 
-**Use case:** You have a video and JSON files containing detected table regions (with x1, y1, x2, y2 coordinates). This tool creates separate cropped videos for each table region.
+**Use cases:**
+- Crop videos to isolate detected table regions
+- Generate training data from restaurant CCTV footage
+- Extract frames at regular intervals for classification tasks
 
 ![Demo](https://img.shields.io/badge/status-ready-green)
 
@@ -40,12 +45,120 @@ python3 app.py
 
 Open **http://localhost:8080** in your browser.
 
-### How to use
+---
 
-1. **Drag & drop** your video file (MP4, MOV, AVI, MKV, WebM) onto the left zone
+## Tool 1: Integrated Crop & Label Workflow (RECOMMENDED)
+
+The main workflow combines table cropping with automatic frame extraction and an interactive labeling interface.
+
+### Complete Workflow
+
+1. **Upload** video + JSON (table bounding boxes) on the main page
+2. Click **"Crop Videos"** → System automatically:
+   - Crops each table from the video
+   - Extracts frames every 30 seconds from each cropped video
+3. Click **"Label Frames"** → Opens interactive labeling page
+4. **Drag frames** into categories:
+   - **Clean** - Empty, clean table
+   - **Occupied** - People sitting at table
+   - **Dirty** - Table needs cleaning (dishes, mess)
+5. Click **"Download Labeled Frames"** → Get ZIP with:
+   ```
+   labeled_frames.zip
+   ├── clean/
+   │   ├── frame_0001_00m00s.jpg
+   │   └── ...
+   ├── occupied/
+   │   └── ...
+   ├── dirty/
+   │   └── ...
+   └── labels.json
+   ```
+
+**Perfect for**: Building ML training datasets for restaurant table classification
+
+---
+
+## Tool 2: Table Cropper (Standalone)
+
+If you only need cropped videos without labeling:
+
+1. **Drag & drop** your video file onto the left zone
 2. **Drag & drop** your JSON file(s) onto the right zone
 3. Click **"Crop Videos"**
 4. **Download** each cropped video
+
+---
+
+## Tool 3: Frame Extraction (Standalone CLI)
+
+For batch processing or custom workflows, use the standalone CLI tool to extract frames from videos.
+
+### Web Interface
+
+1. Go to **http://localhost:8080/frames**
+2. **Drag & drop** your video file
+3. Set your **extraction settings**:
+   - **Frame Interval**: How often to extract (default: 30 seconds)
+   - **JPEG Quality**: 1-31, lower is better (default: 2 = high quality)
+4. Click **"Extract Frames"**
+5. **Download** all frames as a ZIP file
+
+**Frame output:**
+- Each frame is named: `frame_0000_00m00s.jpg` (frame number + timestamp)
+- Includes `metadata.json` with video info and frame details
+- Organized in folders by video name
+
+### CLI Tool
+
+For batch processing or automation, use the standalone CLI script:
+
+```bash
+# Extract frames every 30 seconds (default)
+python3 extract_frames.py video.mp4
+
+# Extract frames every 60 seconds
+python3 extract_frames.py video.mp4 -i 60
+
+# Specify output directory
+python3 extract_frames.py video.mp4 -o training_data/
+
+# Batch process all videos in a folder
+python3 extract_frames.py --batch videos/ -o frames/
+
+# Resume interrupted extraction
+python3 extract_frames.py video.mp4 --resume
+
+# Show help
+python3 extract_frames.py --help
+```
+
+**CLI Options:**
+- `-i, --interval` - Frame extraction interval in seconds (default: 30)
+- `-q, --quality` - JPEG quality 1-31, lower is better (default: 2)
+- `-f, --format` - Output format: jpg or png (default: jpg)
+- `-o, --output-dir` - Output directory
+- `--batch` - Process all videos in a directory
+- `--resume` - Skip existing frames and resume
+- `-v, --verbose` - Show ffmpeg output
+
+**Output structure:**
+```
+frames/
+└── video_name_frames/
+    ├── frame_0000_00m00s.jpg
+    ├── frame_0001_00m30s.jpg
+    ├── frame_0002_01m00s.jpg
+    └── metadata.json
+```
+
+**Why 30 seconds?**
+- For restaurant CCTV, tables change state slowly (empty → occupied → food arrives → cleared)
+- 30-second intervals capture state transitions without redundant frames
+- ~120 frames per hour of video
+- Adjust with `-i` based on your needs (faster scenes = shorter interval)
+
+---
 
 ## JSON Format
 

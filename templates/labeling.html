@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Frame Labeling - Video Table Cropper</title>
+    <link rel="stylesheet" href="/static/style.css?v=4">
+    <style>
+        .labeling-container {
+            max-width: 1800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .nav {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 8px;
+        }
+
+        .nav a {
+            color: #007bff;
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+
+        .nav a:hover {
+            background: #e0e0e0;
+        }
+
+        h1 {
+            margin: 20px 0;
+        }
+
+        .instructions {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #007bff;
+        }
+
+        /* Drop zones container */
+        .drop-zones-container {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .drop-zone {
+            min-height: 300px;
+            border: 3px dashed #ccc;
+            border-radius: 12px;
+            padding: 15px;
+            transition: all 0.3s;
+            position: relative;
+        }
+
+        .drop-zone-header {
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 15px;
+            text-align: center;
+            padding: 10px;
+            border-radius: 6px;
+        }
+
+        .drop-zone.clean {
+            border-color: #28a745;
+            background: #f0fff4;
+        }
+
+        .drop-zone.clean .drop-zone-header {
+            color: #28a745;
+            background: #d4edda;
+        }
+
+        .drop-zone.occupied {
+            border-color: #007bff;
+            background: #f0f8ff;
+        }
+
+        .drop-zone.occupied .drop-zone-header {
+            color: #007bff;
+            background: #d1ecf1;
+        }
+
+        .drop-zone.dirty {
+            border-color: #dc3545;
+            background: #fff5f5;
+        }
+
+        .drop-zone.dirty .drop-zone-header {
+            color: #dc3545;
+            background: #f8d7da;
+        }
+
+        .drop-zone.drag-over {
+            border-style: solid;
+            transform: scale(1.02);
+            box-shadow: 0 8px 16px rgba(0,0,0,0.2);
+        }
+
+        .frames-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 10px;
+        }
+
+        /* Unlabeled frames section */
+        .unlabeled-section {
+            margin-top: 30px;
+            padding: 20px;
+            background: #fff;
+            border-radius: 12px;
+            border: 2px solid #ddd;
+        }
+
+        .unlabeled-section h2 {
+            margin-top: 0;
+            color: #555;
+        }
+
+        .unlabeled-frames {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+
+        /* Frame items */
+        .frame-item {
+            cursor: grab;
+            border: 3px solid #ddd;
+            border-radius: 8px;
+            overflow: hidden;
+            transition: all 0.2s;
+            background: white;
+            position: relative;
+        }
+
+        .frame-item:hover {
+            transform: scale(1.03);
+            box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+        }
+
+        .frame-item.dragging {
+            opacity: 0.4;
+            cursor: grabbing;
+        }
+
+        .frame-item img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .frame-info {
+            padding: 8px;
+            font-size: 11px;
+            background: #f8f9fa;
+            color: #666;
+            border-top: 1px solid #ddd;
+        }
+
+        /* Labeled frames get colored borders */
+        .frame-item.labeled-clean {
+            border-color: #28a745;
+            border-width: 4px;
+        }
+
+        .frame-item.labeled-occupied {
+            border-color: #007bff;
+            border-width: 4px;
+        }
+
+        .frame-item.labeled-dirty {
+            border-color: #dc3545;
+            border-width: 4px;
+        }
+
+        /* Actions */
+        .actions {
+            position: sticky;
+            bottom: 20px;
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 -4px 12px rgba(0,0,0,0.1);
+            text-align: center;
+            margin-top: 30px;
+            z-index: 100;
+        }
+
+        .btn {
+            padding: 15px 30px;
+            font-size: 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-weight: 600;
+        }
+
+        .btn.primary {
+            background: #007bff;
+            color: white;
+        }
+
+        .btn.primary:hover:not(:disabled) {
+            background: #0056b3;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .progress-info {
+            margin-bottom: 15px;
+            font-size: 18px;
+            color: #555;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            font-size: 18px;
+            color: #666;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="labeling-container">
+        <div class="nav">
+            <a href="/">Table Cropper</a>
+            <a href="/frames">Frame Extraction</a>
+        </div>
+
+        <h1>Label Frames for Training Data</h1>
+
+        <div class="instructions">
+            <strong>Instructions:</strong> Drag frames from the bottom section into the appropriate category above (Clean, Occupied, or Dirty).
+            You can move frames between categories. When done, click "Download Labeled Frames" to get your organized training data.
+        </div>
+
+        <div id="loading" class="loading">Loading frames...</div>
+
+        <div id="content" style="display: none;">
+            <!-- Drop zones for labeled frames -->
+            <div class="drop-zones-container">
+                <div class="drop-zone clean" data-label="clean">
+                    <div class="drop-zone-header">
+                        Clean (<span id="clean-count">0</span>)
+                    </div>
+                    <div class="frames-container" id="clean-frames"></div>
+                </div>
+
+                <div class="drop-zone occupied" data-label="occupied">
+                    <div class="drop-zone-header">
+                        Occupied (<span id="occupied-count">0</span>)
+                    </div>
+                    <div class="frames-container" id="occupied-frames"></div>
+                </div>
+
+                <div class="drop-zone dirty" data-label="dirty">
+                    <div class="drop-zone-header">
+                        Dirty (<span id="dirty-count">0</span>)
+                    </div>
+                    <div class="frames-container" id="dirty-frames"></div>
+                </div>
+            </div>
+
+            <!-- Unlabeled frames -->
+            <div class="unlabeled-section">
+                <h2>To Label (<span id="unlabeled-count">0</span> frames)</h2>
+                <div class="unlabeled-frames" id="unlabeled-frames"></div>
+            </div>
+
+            <!-- Actions -->
+            <div class="actions">
+                <div class="progress-info">
+                    <span id="labeled-count">0</span> / <span id="total-count">0</span> frames labeled
+                </div>
+                <button id="download-btn" class="btn primary" disabled>Download Labeled Frames</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const jobId = "{{ job_id }}";
+        let allFrames = [];
+        let frameLabels = {}; // {filename: "clean"|"occupied"|"dirty"}
+        let frameElements = {}; // {filename: HTMLElement}
+
+        // Load frames on page load
+        async function loadFrames() {
+            try {
+                const response = await fetch(`/get-frames/${jobId}`);
+                const data = await response.json();
+
+                if (data.success) {
+                    allFrames = data.frames;
+                    renderFrames();
+                    document.getElementById('loading').style.display = 'none';
+                    document.getElementById('content').style.display = 'block';
+                } else {
+                    document.getElementById('loading').textContent = 'Error: ' + (data.error || 'Failed to load frames');
+                }
+            } catch (error) {
+                document.getElementById('loading').textContent = 'Error: ' + error.message;
+            }
+        }
+
+        // Render all frames
+        function renderFrames() {
+            const unlabeledContainer = document.getElementById('unlabeled-frames');
+            unlabeledContainer.innerHTML = '';
+
+            allFrames.forEach(frame => {
+                const frameEl = createFrameElement(frame);
+                frameElements[frame.filename] = frameEl;
+                unlabeledContainer.appendChild(frameEl);
+            });
+
+            updateCounters();
+        }
+
+        // Create frame element
+        function createFrameElement(frame) {
+            const div = document.createElement('div');
+            div.className = 'frame-item';
+            div.draggable = true;
+            div.dataset.filename = frame.filename;
+
+            const img = document.createElement('img');
+            img.src = `/frame-image/${jobId}/${frame.relative_path}`;
+            img.alt = frame.filename;
+
+            const info = document.createElement('div');
+            info.className = 'frame-info';
+            info.textContent = frame.filename;
+
+            div.appendChild(img);
+            div.appendChild(info);
+
+            // Drag events
+            div.addEventListener('dragstart', handleDragStart);
+            div.addEventListener('dragend', handleDragEnd);
+
+            return div;
+        }
+
+        // Drag start
+        function handleDragStart(e) {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', e.target.dataset.filename);
+            e.target.classList.add('dragging');
+        }
+
+        // Drag end
+        function handleDragEnd(e) {
+            e.target.classList.remove('dragging');
+        }
+
+        // Setup drop zones
+        document.querySelectorAll('.drop-zone').forEach(zone => {
+            zone.addEventListener('dragover', handleDragOver);
+            zone.addEventListener('dragleave', handleDragLeave);
+            zone.addEventListener('drop', handleDrop);
+        });
+
+        // Also make unlabeled section a drop zone (to unlabel)
+        const unlabeledSection = document.getElementById('unlabeled-frames');
+        unlabeledSection.addEventListener('dragover', handleDragOver);
+        unlabeledSection.addEventListener('dragleave', handleDragLeave);
+        unlabeledSection.addEventListener('drop', handleDropUnlabel);
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            e.currentTarget.classList.add('drag-over');
+        }
+
+        function handleDragLeave(e) {
+            e.currentTarget.classList.remove('drag-over');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            e.currentTarget.classList.remove('drag-over');
+
+            const filename = e.dataTransfer.getData('text/plain');
+            const label = e.currentTarget.dataset.label;
+            const frameEl = frameElements[filename];
+
+            if (!frameEl || !label) return;
+
+            // Update label
+            frameLabels[filename] = label;
+
+            // Remove old label classes
+            frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty');
+
+            // Add new label class
+            frameEl.classList.add(`labeled-${label}`);
+
+            // Move to appropriate container
+            const container = document.getElementById(`${label}-frames`);
+            container.appendChild(frameEl);
+
+            updateCounters();
+        }
+
+        function handleDropUnlabel(e) {
+            e.preventDefault();
+            e.currentTarget.classList.remove('drag-over');
+
+            const filename = e.dataTransfer.getData('text/plain');
+            const frameEl = frameElements[filename];
+
+            if (!frameEl) return;
+
+            // Remove label
+            delete frameLabels[filename];
+
+            // Remove label classes
+            frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty');
+
+            // Move back to unlabeled section
+            e.currentTarget.appendChild(frameEl);
+
+            updateCounters();
+        }
+
+        // Update counters
+        function updateCounters() {
+            const cleanCount = Object.values(frameLabels).filter(l => l === 'clean').length;
+            const occupiedCount = Object.values(frameLabels).filter(l => l === 'occupied').length;
+            const dirtyCount = Object.values(frameLabels).filter(l => l === 'dirty').length;
+            const labeledCount = cleanCount + occupiedCount + dirtyCount;
+            const totalCount = allFrames.length;
+            const unlabeledCount = totalCount - labeledCount;
+
+            document.getElementById('clean-count').textContent = cleanCount;
+            document.getElementById('occupied-count').textContent = occupiedCount;
+            document.getElementById('dirty-count').textContent = dirtyCount;
+            document.getElementById('labeled-count').textContent = labeledCount;
+            document.getElementById('total-count').textContent = totalCount;
+            document.getElementById('unlabeled-count').textContent = unlabeledCount;
+
+            // Enable download button if at least one frame is labeled
+            document.getElementById('download-btn').disabled = labeledCount === 0;
+        }
+
+        // Download labeled frames
+        document.getElementById('download-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('download-btn');
+            btn.disabled = true;
+            btn.textContent = 'Preparing download...';
+
+            try {
+                const response = await fetch(`/download-labeled/${jobId}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({labels: frameLabels})
+                });
+
+                if (response.ok) {
+                    // Trigger download
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `labeled_frames_${jobId}.zip`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(url);
+
+                    btn.textContent = 'Download Complete!';
+                    setTimeout(() => {
+                        btn.textContent = 'Download Labeled Frames';
+                        btn.disabled = false;
+                    }, 2000);
+                } else {
+                    alert('Download failed. Please try again.');
+                    btn.textContent = 'Download Labeled Frames';
+                    btn.disabled = false;
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+                btn.textContent = 'Download Labeled Frames';
+                btn.disabled = false;
+            }
+        });
+
+        // Load frames on page load
+        loadFrames();
+    </script>
+</body>
+</html>
