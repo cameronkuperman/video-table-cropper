@@ -185,6 +185,31 @@
             border-width: 4px;
         }
 
+        /* Selected frames */
+        .frame-item.selected {
+            border-color: #007bff;
+            border-width: 4px;
+            box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.3);
+        }
+
+        /* Multi-select indicator */
+        .multi-select-info {
+            position: fixed;
+            bottom: 80px;
+            right: 20px;
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-weight: 600;
+            display: none;
+            z-index: 101;
+        }
+
+        .multi-select-info.active {
+            display: block;
+        }
+
         /* Actions */
         .actions {
             position: sticky;
@@ -290,6 +315,9 @@
                 <div class="unlabeled-frames" id="unlabeled-frames"></div>
             </div>
 
+            <!-- Multi-select indicator -->
+            <div id="multi-select-info" class="multi-select-info"></div>
+
             <!-- Actions -->
             <div class="actions">
                 <div class="progress-info">
@@ -305,6 +333,7 @@
         let allFrames = [];
         let frameLabels = {}; // {filename: "clean"|"occupied"|"dirty"}
         let frameElements = {}; // {filename: HTMLElement}
+        let selectedFrames = new Set(); // Set of selected filenames
 
         // Load frames on page load
         async function loadFrames() {
@@ -339,6 +368,61 @@
             updateCounters();
         }
 
+        // Multi-select functions
+        function toggleFrameSelection(filename, addToSelection = false) {
+            if (!addToSelection) {
+                // Single selection - clear others
+                selectedFrames.forEach(f => {
+                    const el = frameElements[f];
+                    if (el) el.classList.remove('selected');
+                });
+                selectedFrames.clear();
+            }
+
+            const frameEl = frameElements[filename];
+            if (!frameEl) return;
+
+            if (selectedFrames.has(filename)) {
+                selectedFrames.delete(filename);
+                frameEl.classList.remove('selected');
+            } else {
+                selectedFrames.add(filename);
+                frameEl.classList.add('selected');
+            }
+
+            updateMultiSelectUI();
+        }
+
+        function selectFrameRange(startFilename, endFilename) {
+            const startIdx = allFrames.findIndex(f => f.filename === startFilename);
+            const endIdx = allFrames.findIndex(f => f.filename === endFilename);
+
+            if (startIdx === -1 || endIdx === -1) return;
+
+            const [min, max] = [Math.min(startIdx, endIdx), Math.max(startIdx, endIdx)];
+
+            for (let i = min; i <= max; i++) {
+                const filename = allFrames[i].filename;
+                selectedFrames.add(filename);
+                const el = frameElements[filename];
+                if (el) el.classList.add('selected');
+            }
+
+            updateMultiSelectUI();
+        }
+
+        function updateMultiSelectUI() {
+            const info = document.getElementById('multi-select-info');
+            if (!info) return;
+
+            if (selectedFrames.size > 0) {
+                info.textContent = `${selectedFrames.size} frame${selectedFrames.size > 1 ? 's' : ''} selected`;
+                info.classList.add('active');
+            } else {
+                info.classList.remove('active');
+            }
+        }
+
         // Create frame element
         function createFrameElement(frame) {
             const div = document.createElement('div');
@@ -361,19 +445,61 @@
             div.addEventListener('dragstart', handleDragStart);
             div.addEventListener('dragend', handleDragEnd);
 
+            // Click for selection
+            div.addEventListener('click', (e) => {
+                e.preventDefault();
+
+                if (e.shiftKey && selectedFrames.size > 0) {
+                    // Range selection
+                    const lastSelected = Array.from(selectedFrames)[selectedFrames.size - 1];
+                    selectFrameRange(lastSelected, frame.filename);
+                } else if (e.ctrlKey || e.metaKey) {
+                    // Add to selection
+                    toggleFrameSelection(frame.filename, true);
+                } else {
+                    // Toggle single selection
+                    toggleFrameSelection(frame.filename, false);
+                }
+            });
+
             return div;
         }
 
         // Drag start
         function handleDragStart(e) {
+            const frameItem = e.target.closest('.frame-item');
+            if (!frameItem) return;
+
+            const filename = frameItem.dataset.filename;
+
+            // If dragging a non-selected frame, select only that one
+            if (!selectedFrames.has(filename)) {
+                selectedFrames.forEach(f => {
+                    const el = frameElements[f];
+                    if (el) el.classList.remove('selected');
+                });
+                selectedFrames.clear();
+                selectedFrames.add(filename);
+                frameItem.classList.add('selected');
+                updateMultiSelectUI();
+            }
+
             e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', e.target.dataset.filename);
-            e.target.classList.add('dragging');
+            e.dataTransfer.setData('text/plain', JSON.stringify(Array.from(selectedFrames)));
+
+            // Mark all selected frames as dragging
+            selectedFrames.forEach(f => {
+                const el = frameElements[f];
+                if (el) el.classList.add('dragging');
+            });
         }
 
         // Drag end
         function handleDragEnd(e) {
-            e.target.classList.remove('dragging');
+            selectedFrames.forEach(f => {
+                const el = frameElements[f];
+                if (el) el.classList.remove('dragging');
+            });
         }
 
         // Setup drop zones
@@ -392,57 +518,104 @@
         function handleDragOver(e) {
             e.preventDefault();
             e.dataTransfer.dropEffect = 'move';
-            e.currentTarget.classList.add('drag-over');
+
+            // Find parent drop zone or unlabeled section
+            const dropTarget = e.target.closest('.drop-zone, .unlabeled-frames');
+            if (dropTarget) {
+                dropTarget.classList.add('drag-over');
+            }
         }
 
         function handleDragLeave(e) {
-            e.currentTarget.classList.remove('drag-over');
+            const dropTarget = e.target.closest('.drop-zone, .unlabeled-frames');
+            if (!dropTarget) return;
+
+            // Only remove if actually leaving (not just entering child element)
+            const rect = dropTarget.getBoundingClientRect();
+            if (e.clientX < rect.left || e.clientX >= rect.right ||
+                e.clientY < rect.top || e.clientY >= rect.bottom) {
+                dropTarget.classList.remove('drag-over');
+            }
         }
 
         function handleDrop(e) {
             e.preventDefault();
-            e.currentTarget.classList.remove('drag-over');
 
-            const filename = e.dataTransfer.getData('text/plain');
-            const label = e.currentTarget.dataset.label;
-            const frameEl = frameElements[filename];
+            const dropZone = e.target.closest('.drop-zone');
+            if (!dropZone) return;
 
-            if (!frameEl || !label) return;
+            dropZone.classList.remove('drag-over');
 
-            // Update label
-            frameLabels[filename] = label;
+            const filenamesJson = e.dataTransfer.getData('text/plain');
+            let filenames;
+            try {
+                filenames = JSON.parse(filenamesJson);
+            } catch {
+                filenames = [filenamesJson]; // Fallback for single filename
+            }
 
-            // Remove old label classes
-            frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty');
+            const label = dropZone.dataset.label;
+            if (!label) return;
 
-            // Add new label class
-            frameEl.classList.add(`labeled-${label}`);
+            // Process all selected frames
+            filenames.forEach(filename => {
+                const frameEl = frameElements[filename];
+                if (!frameEl) return;
 
-            // Move to appropriate container
-            const container = document.getElementById(`${label}-frames`);
-            container.appendChild(frameEl);
+                // Update label
+                frameLabels[filename] = label;
 
+                // Remove old label classes
+                frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty', 'selected');
+
+                // Add new label class
+                frameEl.classList.add(`labeled-${label}`);
+
+                // Move to appropriate container
+                const container = document.getElementById(`${label}-frames`);
+                container.appendChild(frameEl);
+            });
+
+            // Clear selection after drop
+            selectedFrames.clear();
+            updateMultiSelectUI();
             updateCounters();
         }
 
         function handleDropUnlabel(e) {
             e.preventDefault();
-            e.currentTarget.classList.remove('drag-over');
 
-            const filename = e.dataTransfer.getData('text/plain');
-            const frameEl = frameElements[filename];
+            const unlabeledSection = e.target.closest('.unlabeled-frames');
+            if (!unlabeledSection) return;
 
-            if (!frameEl) return;
+            unlabeledSection.classList.remove('drag-over');
 
-            // Remove label
-            delete frameLabels[filename];
+            const filenamesJson = e.dataTransfer.getData('text/plain');
+            let filenames;
+            try {
+                filenames = JSON.parse(filenamesJson);
+            } catch {
+                filenames = [filenamesJson];
+            }
 
-            // Remove label classes
-            frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty');
+            // Process all selected frames
+            filenames.forEach(filename => {
+                const frameEl = frameElements[filename];
+                if (!frameEl) return;
 
-            // Move back to unlabeled section
-            e.currentTarget.appendChild(frameEl);
+                // Remove label
+                delete frameLabels[filename];
 
+                // Remove label classes
+                frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty', 'selected');
+
+                // Move back to unlabeled section
+                unlabeledSection.appendChild(frameEl);
+            });
+
+            // Clear selection
+            selectedFrames.clear();
+            updateMultiSelectUI();
             updateCounters();
         }
 
@@ -506,6 +679,52 @@
                 btn.textContent = 'Download Labeled Frames';
                 btn.disabled = false;
             }
+        });
+
+        // Keyboard shortcuts for labeling
+        document.addEventListener('keydown', (e) => {
+            if (selectedFrames.size === 0) return;
+
+            let label = null;
+            if (e.key === '1') label = 'clean';
+            else if (e.key === '2') label = 'occupied';
+            else if (e.key === '3') label = 'dirty';
+            else if (e.key === 'Escape') {
+                // Clear selection
+                selectedFrames.forEach(f => {
+                    const el = frameElements[f];
+                    if (el) el.classList.remove('selected');
+                });
+                selectedFrames.clear();
+                updateMultiSelectUI();
+                return;
+            }
+
+            if (!label) return;
+
+            // Apply label to all selected frames
+            selectedFrames.forEach(filename => {
+                const frameEl = frameElements[filename];
+                if (!frameEl) return;
+
+                // Update label
+                frameLabels[filename] = label;
+
+                // Remove old label classes
+                frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty', 'selected');
+
+                // Add new label class
+                frameEl.classList.add(`labeled-${label}`);
+
+                // Move to appropriate container
+                const container = document.getElementById(`${label}-frames`);
+                container.appendChild(frameEl);
+            });
+
+            // Clear selection
+            selectedFrames.clear();
+            updateMultiSelectUI();
+            updateCounters();
         });
 
         // Load frames on page load
