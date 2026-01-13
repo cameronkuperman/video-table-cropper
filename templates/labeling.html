@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -60,7 +61,7 @@
             background: white;
             padding: 15px 20px;
             border-radius: 12px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
             margin-bottom: 20px;
             z-index: 100;
             display: flex;
@@ -181,9 +182,17 @@
             font-size: 14px;
         }
 
-        .category-section.clean .count-badge { background: #28a745; }
-        .category-section.occupied .count-badge { background: #007bff; }
-        .category-section.dirty .count-badge { background: #dc3545; }
+        .category-section.clean .count-badge {
+            background: #28a745;
+        }
+
+        .category-section.occupied .count-badge {
+            background: #007bff;
+        }
+
+        .category-section.dirty .count-badge {
+            background: #dc3545;
+        }
 
         .frames-grid {
             display: grid;
@@ -204,13 +213,25 @@
 
         .frame-item:hover {
             transform: scale(1.02);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
         }
 
         .frame-item.selected {
             border-color: #007bff;
-            border-width: 4px;
-            box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.3);
+            box-shadow: 0 0 0 4px rgba(0, 123, 255, 0.4), 0 4px 12px rgba(0, 0, 0, 0.2);
+            transform: scale(1.02);
+        }
+
+        .frame-item.selected::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 123, 255, 0.15);
+            pointer-events: none;
+            z-index: 1;
         }
 
         .frame-item.selected::after {
@@ -220,14 +241,16 @@
             right: 8px;
             background: #007bff;
             color: white;
-            width: 24px;
-            height: 24px;
+            width: 26px;
+            height: 26px;
             border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
             font-weight: bold;
             font-size: 14px;
+            z-index: 2;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
         }
 
         .frame-item img {
@@ -264,7 +287,7 @@
             background: white;
             padding: 20px;
             border-radius: 12px;
-            box-shadow: 0 -4px 12px rgba(0,0,0,0.1);
+            box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.1);
             text-align: center;
             margin-top: 30px;
             z-index: 100;
@@ -329,6 +352,7 @@
         }
     </style>
 </head>
+
 <body>
     <div class="labeling-container">
         <div class="nav">
@@ -339,7 +363,8 @@
         <h1>Label Frames for Training Data</h1>
 
         <div class="instructions">
-            <strong>Instructions:</strong> Click frames to select them, then click a label button (Clean, Occupied, or Dirty).
+            <strong>Instructions:</strong> Click frames to select them, then click a label button (Clean, Occupied, or
+            Dirty).
             Use <kbd>Ctrl</kbd>+click to select multiple, <kbd>Shift</kbd>+click for range.
             Keyboard: <kbd>1</kbd>=Clean, <kbd>2</kbd>=Occupied, <kbd>3</kbd>=Dirty, <kbd>Esc</kbd>=Clear selection.
             <br><strong>Download removes labeled frames from view.</strong>
@@ -409,6 +434,7 @@
         let frameLabels = {}; // {filename: "clean"|"occupied"|"dirty"}
         let frameElements = {}; // {filename: HTMLElement}
         let selectedFrames = new Set(); // Set of selected filenames
+        let lastClickedFilename = null; // Anchor for shift-click range selection
 
         // Load frames on page load
         async function loadFrames() {
@@ -464,16 +490,19 @@
             div.addEventListener('click', (e) => {
                 e.preventDefault();
 
-                if (e.shiftKey && selectedFrames.size > 0) {
-                    // Range selection
-                    const lastSelected = Array.from(selectedFrames)[selectedFrames.size - 1];
-                    selectFrameRange(lastSelected, frame.filename);
+                if (e.shiftKey && lastClickedFilename) {
+                    // Prevent text selection during shift-click
+                    window.getSelection().removeAllRanges();
+                    // Range selection from anchor to current
+                    selectFrameRange(lastClickedFilename, frame.filename);
                 } else if (e.ctrlKey || e.metaKey) {
-                    // Add to selection
+                    // Add/remove from selection (multi-select)
                     toggleFrameSelection(frame.filename, true);
+                    lastClickedFilename = frame.filename; // Update anchor
                 } else {
-                    // Toggle single selection
+                    // Single selection - clear others and select this one
                     toggleFrameSelection(frame.filename, false);
+                    lastClickedFilename = frame.filename; // Set anchor
                 }
             });
 
@@ -548,7 +577,9 @@
                 if (el) el.classList.remove('selected');
             });
             selectedFrames.clear();
+            lastClickedFilename = null; // Reset anchor
             updateSelectionUI();
+
         }
 
         // Update selection UI
@@ -643,8 +674,8 @@
             try {
                 const response = await fetch(`/download-labeled/${jobId}`, {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({labels: frameLabels})
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ labels: frameLabels })
                 });
 
                 if (response.ok) {
@@ -703,4 +734,5 @@
         loadFrames();
     </script>
 </body>
+
 </html>
