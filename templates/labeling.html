@@ -469,7 +469,7 @@
             updateCounters();
         }
 
-        // Create frame element
+        // Create frame element (no click handler - using event delegation)
         function createFrameElement(frame) {
             const div = document.createElement('div');
             div.className = 'frame-item';
@@ -486,38 +486,23 @@
             div.appendChild(img);
             div.appendChild(info);
 
-            // Click for selection - always toggles (adds/removes from selection)
-            div.addEventListener('click', (e) => {
-                e.preventDefault();
-
-                if (e.shiftKey && lastClickedFilename) {
-                    // Prevent text selection during shift-click
-                    window.getSelection().removeAllRanges();
-                    // Range selection from anchor to current
-                    selectFrameRange(lastClickedFilename, frame.filename);
-                } else {
-                    // Toggle selection - add or remove from current selection
-                    toggleFrameSelection(frame.filename);
-                    lastClickedFilename = frame.filename;
-                }
-            });
-
             return div;
         }
 
-        // Toggle frame selection - click to select, click again to deselect
-        function toggleFrameSelection(filename) {
-            const frameEl = frameElements[filename];
+        // Toggle frame selection directly on the DOM element
+        function toggleFrameSelection(frameEl) {
             if (!frameEl) return;
 
-            if (selectedFrames.has(filename)) {
+            const filename = frameEl.dataset.filename;
+
+            if (frameEl.classList.contains('selected')) {
                 // Already selected - deselect it
-                selectedFrames.delete(filename);
                 frameEl.classList.remove('selected');
+                selectedFrames.delete(filename);
             } else {
                 // Not selected - select it
-                selectedFrames.add(filename);
                 frameEl.classList.add('selected');
+                selectedFrames.add(filename);
             }
 
             updateSelectionUI();
@@ -559,16 +544,14 @@
             updateSelectionUI();
         }
 
-        // Clear all selections
+        // Clear all selections - query DOM directly
         function clearSelection() {
-            selectedFrames.forEach(f => {
-                const el = frameElements[f];
-                if (el) el.classList.remove('selected');
+            document.querySelectorAll('.frame-item.selected').forEach(el => {
+                el.classList.remove('selected');
             });
             selectedFrames.clear();
-            lastClickedFilename = null; // Reset anchor
+            lastClickedFilename = null;
             updateSelectionUI();
-
         }
 
         // Update selection UI
@@ -582,49 +565,47 @@
             document.getElementById('btn-dirty').disabled = !hasSelection;
         }
 
-        // Apply label to selected frames
+        // Apply label to selected frames - query DOM directly
         function applyLabel(label) {
-            if (selectedFrames.size === 0) return;
+            const selectedElements = document.querySelectorAll('.frame-item.selected');
+            if (selectedElements.length === 0) return;
 
             const containerId = `frames-${label}`;
             const container = document.getElementById(containerId);
 
-            selectedFrames.forEach(filename => {
-                const frameEl = frameElements[filename];
-                if (!frameEl) return;
+            selectedElements.forEach(frameEl => {
+                const filename = frameEl.dataset.filename;
 
-                // Update label
+                // Update label tracking
                 frameLabels[filename] = label;
 
-                // Remove old label classes
+                // Remove old label classes and selection
                 frameEl.classList.remove('labeled-clean', 'labeled-occupied', 'labeled-dirty', 'selected');
 
                 // Add new label class
                 frameEl.classList.add(`labeled-${label}`);
 
-                // Explicitly remove from current parent first
+                // Remove from current parent and move to new container
                 if (frameEl.parentNode) {
                     frameEl.parentNode.removeChild(frameEl);
                 }
-
-                // Then append to new container
                 container.appendChild(frameEl);
             });
 
-            // Clear selection
+            // Clear selection tracking
             selectedFrames.clear();
             updateSelectionUI();
             updateCounters();
         }
 
-        // Update counters
+        // Update counters - count from DOM directly
         function updateCounters() {
-            const cleanCount = Object.values(frameLabels).filter(l => l === 'clean').length;
-            const occupiedCount = Object.values(frameLabels).filter(l => l === 'occupied').length;
-            const dirtyCount = Object.values(frameLabels).filter(l => l === 'dirty').length;
+            const cleanCount = document.querySelectorAll('#frames-clean .frame-item').length;
+            const occupiedCount = document.querySelectorAll('#frames-occupied .frame-item').length;
+            const dirtyCount = document.querySelectorAll('#frames-dirty .frame-item').length;
+            const unlabeledCount = document.querySelectorAll('#frames-unlabeled .frame-item').length;
             const labeledCount = cleanCount + occupiedCount + dirtyCount;
-            const totalCount = Object.keys(frameElements).length; // Only count frames still in UI
-            const unlabeledCount = totalCount - labeledCount;
+            const totalCount = document.querySelectorAll('.frame-item').length;
 
             document.getElementById('clean-count').textContent = cleanCount;
             document.getElementById('occupied-count').textContent = occupiedCount;
@@ -642,6 +623,19 @@
         document.getElementById('btn-occupied').addEventListener('click', () => applyLabel('occupied'));
         document.getElementById('btn-dirty').addEventListener('click', () => applyLabel('dirty'));
         document.getElementById('btn-clear-selection').addEventListener('click', clearSelection);
+
+        // Event delegation for frame clicks - handles ALL frame clicks from one place
+        document.getElementById('content').addEventListener('click', (e) => {
+            // Find the frame-item that was clicked (or its parent)
+            const frameItem = e.target.closest('.frame-item');
+            if (!frameItem) return; // Click wasn't on a frame
+
+            e.preventDefault();
+
+            // Toggle selection directly on the clicked element
+            toggleFrameSelection(frameItem);
+            lastClickedFilename = frameItem.dataset.filename;
+        });
 
         // Keyboard shortcuts
         document.addEventListener('keydown', (e) => {
@@ -684,18 +678,12 @@
                     document.body.removeChild(a);
                     window.URL.revokeObjectURL(url);
 
-                    // REMOVE downloaded frames from UI
+                    // REMOVE downloaded frames from UI - query by data attribute
                     const downloadedFilenames = Object.keys(frameLabels);
                     downloadedFilenames.forEach(filename => {
-                        const frameEl = frameElements[filename];
+                        const frameEl = document.querySelector(`.frame-item[data-filename="${filename}"]`);
                         if (frameEl) {
                             frameEl.remove();
-                            delete frameElements[filename];
-                        }
-                        // Also remove from allFrames array
-                        const idx = allFrames.findIndex(f => f.filename === filename);
-                        if (idx !== -1) {
-                            allFrames.splice(idx, 1);
                         }
                     });
 
