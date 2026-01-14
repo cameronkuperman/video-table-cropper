@@ -660,10 +660,34 @@
             btn.textContent = 'Preparing download...';
 
             try {
+                // BUILD labels from DOM directly - guaranteed to get ALL labeled frames
+                const labelsToDownload = {};
+
+                // Get all frames in each category section
+                document.querySelectorAll('#frames-clean .frame-item').forEach(el => {
+                    labelsToDownload[el.dataset.filename] = 'clean';
+                });
+                document.querySelectorAll('#frames-occupied .frame-item').forEach(el => {
+                    labelsToDownload[el.dataset.filename] = 'occupied';
+                });
+                document.querySelectorAll('#frames-dirty .frame-item').forEach(el => {
+                    labelsToDownload[el.dataset.filename] = 'dirty';
+                });
+
+                console.log('Downloading labeled frames:', labelsToDownload);
+                console.log('Total count:', Object.keys(labelsToDownload).length);
+
+                if (Object.keys(labelsToDownload).length === 0) {
+                    alert('No labeled frames to download!');
+                    btn.textContent = 'Download Labeled Frames';
+                    btn.disabled = false;
+                    return;
+                }
+
                 const response = await fetch(`/download-labeled/${jobId}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ labels: frameLabels })
+                    body: JSON.stringify({ labels: labelsToDownload })
                 });
 
                 if (response.ok) {
@@ -678,16 +702,15 @@
                     document.body.removeChild(a);
                     window.URL.revokeObjectURL(url);
 
-                    // REMOVE downloaded frames from UI - query by data attribute
-                    const downloadedFilenames = Object.keys(frameLabels);
-                    downloadedFilenames.forEach(filename => {
+                    // REMOVE downloaded frames from UI
+                    Object.keys(labelsToDownload).forEach(filename => {
                         const frameEl = document.querySelector(`.frame-item[data-filename="${filename}"]`);
                         if (frameEl) {
                             frameEl.remove();
                         }
                     });
 
-                    // Clear labels for downloaded frames
+                    // Clear tracking
                     frameLabels = {};
                     selectedFrames.clear();
 
@@ -698,7 +721,7 @@
                     btn.textContent = 'Download Complete! Frames removed.';
                     setTimeout(() => {
                         btn.textContent = 'Download Labeled Frames';
-                        btn.disabled = Object.keys(frameLabels).length === 0;
+                        updateCounters(); // Re-check if more frames to download
                     }, 2000);
                 } else {
                     alert('Download failed. Please try again.');
