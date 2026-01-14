@@ -217,9 +217,9 @@
         }
 
         .frame-item.selected {
-            border-color: #007bff;
-            box-shadow: 0 0 0 4px rgba(0, 123, 255, 0.4), 0 4px 12px rgba(0, 0, 0, 0.2);
-            transform: scale(1.02);
+            border: 5px solid #00ff00 !important;
+            box-shadow: 0 0 0 6px rgba(0, 255, 0, 0.5), 0 4px 20px rgba(0, 255, 0, 0.4);
+            transform: scale(1.05);
         }
 
         .frame-item.selected::before {
@@ -229,7 +229,7 @@
             left: 0;
             right: 0;
             bottom: 0;
-            background: rgba(0, 123, 255, 0.15);
+            background: rgba(0, 255, 0, 0.25);
             pointer-events: none;
             z-index: 1;
         }
@@ -237,20 +237,20 @@
         .frame-item.selected::after {
             content: '\2713';
             position: absolute;
-            top: 8px;
-            right: 8px;
-            background: #007bff;
+            top: 10px;
+            right: 10px;
+            background: #00cc00;
             color: white;
-            width: 26px;
-            height: 26px;
+            width: 32px;
+            height: 32px;
             border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
             font-weight: bold;
-            font-size: 14px;
+            font-size: 18px;
             z-index: 2;
-            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
         }
 
         .frame-item img {
@@ -363,9 +363,9 @@
         <h1>Label Frames for Training Data</h1>
 
         <div class="instructions">
-            <strong>Instructions:</strong> Click frames to select them, then click a label button (Clean, Occupied, or
+            <strong>Instructions:</strong> Click frames to select/deselect them, then click a label button (Clean, Occupied, or
             Dirty).
-            Use <kbd>Ctrl</kbd>+click to select multiple, <kbd>Shift</kbd>+click for range.
+            Use <kbd>Shift</kbd>+click for range selection.
             Keyboard: <kbd>1</kbd>=Clean, <kbd>2</kbd>=Occupied, <kbd>3</kbd>=Dirty, <kbd>Esc</kbd>=Clear selection.
             <br><strong>Frames move to their category when labeled. Download removes labeled frames from view.</strong>
         </div>
@@ -486,7 +486,7 @@
             div.appendChild(img);
             div.appendChild(info);
 
-            // Click for selection
+            // Click for selection - always toggles (adds/removes from selection)
             div.addEventListener('click', (e) => {
                 e.preventDefault();
 
@@ -495,38 +495,27 @@
                     window.getSelection().removeAllRanges();
                     // Range selection from anchor to current
                     selectFrameRange(lastClickedFilename, frame.filename);
-                } else if (e.ctrlKey || e.metaKey) {
-                    // Add/remove from selection (multi-select)
-                    toggleFrameSelection(frame.filename, true);
-                    lastClickedFilename = frame.filename; // Update anchor
                 } else {
-                    // Single selection - clear others and select this one
-                    toggleFrameSelection(frame.filename, false);
-                    lastClickedFilename = frame.filename; // Set anchor
+                    // Toggle selection - add or remove from current selection
+                    toggleFrameSelection(frame.filename);
+                    lastClickedFilename = frame.filename;
                 }
             });
 
             return div;
         }
 
-        // Toggle frame selection
-        function toggleFrameSelection(filename, addToSelection = false) {
-            if (!addToSelection) {
-                // Single selection - clear others
-                selectedFrames.forEach(f => {
-                    const el = frameElements[f];
-                    if (el) el.classList.remove('selected');
-                });
-                selectedFrames.clear();
-            }
-
+        // Toggle frame selection - click to select, click again to deselect
+        function toggleFrameSelection(filename) {
             const frameEl = frameElements[filename];
             if (!frameEl) return;
 
             if (selectedFrames.has(filename)) {
+                // Already selected - deselect it
                 selectedFrames.delete(filename);
                 frameEl.classList.remove('selected');
             } else {
+                // Not selected - select it
                 selectedFrames.add(filename);
                 frameEl.classList.add('selected');
             }
