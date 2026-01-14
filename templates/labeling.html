@@ -367,7 +367,7 @@
             Dirty).
             Use <kbd>Ctrl</kbd>+click to select multiple, <kbd>Shift</kbd>+click for range.
             Keyboard: <kbd>1</kbd>=Clean, <kbd>2</kbd>=Occupied, <kbd>3</kbd>=Dirty, <kbd>Esc</kbd>=Clear selection.
-            <br><strong>Download removes labeled frames from view.</strong>
+            <br><strong>Frames move to their category when labeled. Download removes labeled frames from view.</strong>
         </div>
 
         <div id="loading" class="loading">Loading frames...</div>
@@ -613,7 +613,12 @@
                 // Add new label class
                 frameEl.classList.add(`labeled-${label}`);
 
-                // Move to appropriate container
+                // Explicitly remove from current parent first
+                if (frameEl.parentNode) {
+                    frameEl.parentNode.removeChild(frameEl);
+                }
+
+                // Then append to new container
                 container.appendChild(frameEl);
             });
 
