@@ -831,7 +831,7 @@ def serve_frame(job_id: str, filename: str):
 def download_labeled(job_id: str):
     """Download labeled frames organized by category."""
     data = request.json
-    labels = data.get("labels", {})  # {filename: "clean"|"occupied"|"dirty"}
+    labels = data.get("labels", {})  # {relative_path: "clean"|"occupied"|"dirty"}
 
     job_folder = FRAMES_FOLDER / job_id
     if not job_folder.exists():
@@ -841,17 +841,23 @@ def download_labeled(job_id: str):
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         # Add frames to appropriate folders
-        for filename, label in labels.items():
-            frame_path = None
-            # Find frame in subfolders
-            for f in job_folder.rglob(filename):
-                if f.name == filename:
-                    frame_path = f
-                    break
+        for relative_path, label in labels.items():
+            # relative_path is like "table_00_frames/frame_0001_00m30s.jpg"
+            frame_path = job_folder / relative_path
 
-            if frame_path and frame_path.exists():
+            if frame_path.exists():
+                # Create a unique name: table_name + filename
+                # e.g., "table_00_frame_0001_00m30s.jpg"
+                parts = relative_path.split('/')
+                if len(parts) >= 2:
+                    folder_name = parts[0].replace('_frames', '')
+                    file_name = parts[-1]
+                    unique_name = f"{folder_name}_{file_name}"
+                else:
+                    unique_name = frame_path.name
+
                 # Add to ZIP in category folder
-                zf.write(frame_path, f"{label}/{filename}")
+                zf.write(frame_path, f"{label}/{unique_name}")
 
         # Add metadata
         metadata = {

@@ -462,7 +462,8 @@
 
             allFrames.forEach(frame => {
                 const frameEl = createFrameElement(frame);
-                frameElements[frame.filename] = frameEl;
+                // Use relative_path as unique key (filename alone is NOT unique!)
+                frameElements[frame.relative_path] = frameEl;
                 unlabeledContainer.appendChild(frameEl);
             });
 
@@ -473,7 +474,8 @@
         function createFrameElement(frame) {
             const div = document.createElement('div');
             div.className = 'frame-item';
-            div.dataset.filename = frame.filename;
+            // Use relative_path as unique ID (filename alone is NOT unique across tables!)
+            div.dataset.filename = frame.relative_path;
 
             const img = document.createElement('img');
             img.src = `/frame-image/${jobId}/${frame.relative_path}`;
@@ -481,7 +483,9 @@
 
             const info = document.createElement('div');
             info.className = 'frame-info';
-            info.textContent = frame.filename;
+            // Show just the filename for readability, but include table info
+            const tableName = frame.relative_path.split('/')[0].replace('_frames', '');
+            info.textContent = `${tableName}: ${frame.filename}`;
 
             div.appendChild(img);
             div.appendChild(info);
@@ -509,20 +513,21 @@
         }
 
         // Select range of frames
-        function selectFrameRange(startFilename, endFilename) {
-            const startIdx = allFrames.findIndex(f => f.filename === startFilename);
-            const endIdx = allFrames.findIndex(f => f.filename === endFilename);
+        function selectFrameRange(startPath, endPath) {
+            // Now using relative_path as the unique identifier
+            const startIdx = allFrames.findIndex(f => f.relative_path === startPath);
+            const endIdx = allFrames.findIndex(f => f.relative_path === endPath);
 
             if (startIdx === -1 || endIdx === -1) return;
 
             const [min, max] = [Math.min(startIdx, endIdx), Math.max(startIdx, endIdx)];
 
             for (let i = min; i <= max; i++) {
-                const filename = allFrames[i].filename;
+                const path = allFrames[i].relative_path;
                 // Only select if frame still exists in UI
-                if (frameElements[filename]) {
-                    selectedFrames.add(filename);
-                    frameElements[filename].classList.add('selected');
+                if (frameElements[path]) {
+                    selectedFrames.add(path);
+                    frameElements[path].classList.add('selected');
                 }
             }
 
@@ -573,8 +578,11 @@
             const containerId = `frames-${label}`;
             const container = document.getElementById(containerId);
 
+            console.log(`Labeling ${selectedElements.length} frames as "${label}"`);
+
             selectedElements.forEach(frameEl => {
                 const filename = frameEl.dataset.filename;
+                console.log(`  - ${filename}`);
 
                 // Update label tracking
                 frameLabels[filename] = label;
