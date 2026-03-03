@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drive Labeling Home</title>
+    <link rel="stylesheet" href="/static/style.css?v=6">
+    <style>
+        .home-shell {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        .nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .nav a {
+            text-decoration: none;
+            color: #ddd;
+            background: #1f2a44;
+            padding: 10px 14px;
+            border-radius: 8px;
+        }
+
+        .nav a.active {
+            background: #2d6cdf;
+            color: #fff;
+        }
+
+        .mode-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 16px;
+            margin-top: 20px;
+        }
+
+        .mode-card {
+            background: #152037;
+            border: 1px solid #2f3f62;
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .mode-card h3 {
+            margin: 0 0 8px;
+        }
+
+        .mode-card p {
+            margin: 0 0 16px;
+            color: #a9b2c9;
+            line-height: 1.4;
+        }
+
+        .mode-card a {
+            display: inline-block;
+            text-decoration: none;
+            background: #2d6cdf;
+            color: #fff;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-weight: 600;
+        }
+
+        .hint {
+            margin-top: 18px;
+            color: #a9b2c9;
+            font-size: 14px;
+        }
+
+        code {
+            color: #8bc2ff;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="home-shell">
+        <div class="nav">
+            <a href="/" class="active">Drive Labeling</a>
+            <a href="/video-review">Video Review</a>
+            {% if show_extended_nav %}
+            <a href="/legacy">Legacy Video Workflow</a>
+            <a href="/legacy/frames">Legacy Frame Extraction</a>
+            {% endif %}
+        </div>
+
+        <h1>Drive-First Labeling</h1>
+        <p class="subtitle">Choose a model workflow and start labeling segmented crops from Google Drive.</p>
+
+        <div class="mode-grid">
+            <div class="mode-card">
+                <h3>Video Review</h3>
+                <p>Labels grouped 30-second table samples and exports task-specific training bundles.</p>
+                <a href="/video-review">Open Video Review</a>
+            </div>
+
+            {% if show_extended_nav %}
+            <div class="mode-card">
+                <h3>Binary Model</h3>
+                <p>Labels: <code>dirty</code>, <code>clean</code></p>
+                <a href="/drive/binary">Open Dirty vs Clean</a>
+            </div>
+
+            <div class="mode-card">
+                <h3>Multiclass Model</h3>
+                <p>Labels: <code>dirty</code>, <code>clean</code>, <code>occupied</code></p>
+                <a href="/drive/multiclass">Open Multiclass</a>
+            </div>
+            {% endif %}
+        </div>
+
+        <p class="hint">
+            Default source root from env: <code>{{ default_source_root or 'not set' }}</code>.
+            You can override source folders in each workflow page.
+        </p>
+    </div>
+</body>
+
+</html>

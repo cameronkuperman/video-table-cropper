@@ -356,8 +356,9 @@
 <body>
     <div class="labeling-container">
         <div class="nav">
-            <a href="/">Table Cropper</a>
-            <a href="/frames">Frame Extraction</a>
+            <a href="/">Drive Labeling</a>
+            <a href="/legacy">Table Cropper</a>
+            <a href="/legacy/frames">Frame Extraction</a>
         </div>
 
         <h1>Label Frames for Training Data</h1>
@@ -424,6 +425,9 @@
                     <span id="labeled-count">0</span> / <span id="total-count">0</span> frames labeled
                 </div>
                 <button id="download-btn" class="btn primary" disabled>Download Labeled Frames</button>
+                <button id="export-drive-btn" class="btn" style="margin-left: 10px; background: #28a745; color: white;" disabled>
+                    Export Labeled Frames to Drive
+                </button>
             </div>
         </div>
     </div>
@@ -623,7 +627,9 @@
             document.getElementById('unlabeled-count').textContent = unlabeledCount;
 
             // Enable download button if at least one frame is labeled
-            document.getElementById('download-btn').disabled = labeledCount === 0;
+            const hasLabeledFrames = labeledCount > 0;
+            document.getElementById('download-btn').disabled = !hasLabeledFrames;
+            document.getElementById('export-drive-btn').disabled = !hasLabeledFrames;
         }
 
         // Button event listeners
@@ -661,6 +667,21 @@
             }
         });
 
+        // Build labels directly from current DOM sections
+        function buildLabelsPayload() {
+            const labelsToDownload = {};
+            document.querySelectorAll('#frames-clean .frame-item').forEach(el => {
+                labelsToDownload[el.dataset.filename] = 'clean';
+            });
+            document.querySelectorAll('#frames-occupied .frame-item').forEach(el => {
+                labelsToDownload[el.dataset.filename] = 'occupied';
+            });
+            document.querySelectorAll('#frames-dirty .frame-item').forEach(el => {
+                labelsToDownload[el.dataset.filename] = 'dirty';
+            });
+            return labelsToDownload;
+        }
+
         // Download labeled frames - REMOVES them from UI after download
         document.getElementById('download-btn').addEventListener('click', async () => {
             const btn = document.getElementById('download-btn');
@@ -668,19 +689,7 @@
             btn.textContent = 'Preparing download...';
 
             try {
-                // BUILD labels from DOM directly - guaranteed to get ALL labeled frames
-                const labelsToDownload = {};
-
-                // Get all frames in each category section
-                document.querySelectorAll('#frames-clean .frame-item').forEach(el => {
-                    labelsToDownload[el.dataset.filename] = 'clean';
-                });
-                document.querySelectorAll('#frames-occupied .frame-item').forEach(el => {
-                    labelsToDownload[el.dataset.filename] = 'occupied';
-                });
-                document.querySelectorAll('#frames-dirty .frame-item').forEach(el => {
-                    labelsToDownload[el.dataset.filename] = 'dirty';
-                });
+                const labelsToDownload = buildLabelsPayload();
 
                 console.log('Downloading labeled frames:', labelsToDownload);
                 console.log('Total count:', Object.keys(labelsToDownload).length);
@@ -739,6 +748,52 @@
             } catch (error) {
                 alert('Error: ' + error.message);
                 btn.textContent = 'Download Labeled Frames';
+                btn.disabled = false;
+            }
+        });
+
+        // Export labeled frames to Drive (keeps frames in UI; does not remove locally)
+        document.getElementById('export-drive-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('export-drive-btn');
+            btn.disabled = true;
+            btn.textContent = 'Exporting to Drive...';
+
+            try {
+                const labelsToExport = buildLabelsPayload();
+                if (Object.keys(labelsToExport).length === 0) {
+                    alert('No labeled frames to export.');
+                    btn.textContent = 'Export Labeled Frames to Drive';
+                    btn.disabled = false;
+                    return;
+                }
+
+                const response = await fetch(`/legacy/api/export-labeled-to-drive/${jobId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ labels: labelsToExport })
+                });
+
+                const result = await response.json();
+                if (!response.ok || !result.success) {
+                    alert(result.error || 'Drive export failed');
+                    btn.textContent = 'Export Labeled Frames to Drive';
+                    btn.disabled = false;
+                    return;
+                }
+
+                const errorSummary = result.errors && result.errors.length
+                    ? `\\nWarnings: ${result.errors.join(' | ')}`
+                    : '';
+                alert(`Drive export complete. Uploaded ${result.uploaded_count}/${result.requested_count}.${errorSummary}`);
+
+                btn.textContent = 'Export Complete';
+                setTimeout(() => {
+                    btn.textContent = 'Export Labeled Frames to Drive';
+                    updateCounters();
+                }, 2000);
+            } catch (error) {
+                alert('Error: ' + error.message);
+                btn.textContent = 'Export Labeled Frames to Drive';
                 btn.disabled = false;
             }
         });

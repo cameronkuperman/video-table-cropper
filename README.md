@@ -1,243 +1,251 @@
-# Video Table Cropper
+# video-table-cropper
 
-A web app with two tools:
-1. **Table Cropper** - Crop videos based on bounding box coordinates from JSON files
-2. **Frame Extraction** - Extract frames from videos for ML training datasets
+Flask review UI plus an offline Drive worker for grouped video review.
 
-**Use cases:**
-- Crop videos to isolate detected table regions
-- Generate training data from restaurant CCTV footage
-- Extract frames at regular intervals for classification tasks
+The current launch path is:
+- `web`: Flask app on Railway
+- `db`: Postgres on Railway
+- `worker`: GPU worker on Runpod
+- `storage`: Google Drive for raw inputs, review bundles, and exported artifacts
 
-![Demo](https://img.shields.io/badge/status-ready-green)
+For this phase, `/video-review` is the production workflow. Legacy Drive/image labeling and legacy local video tools remain in the repo for local use, but they are hidden automatically when `APP_ENV=production` and `ENABLE_LEGACY_ROUTES=false`.
 
-## Installation
+## What Changed
 
-### 1. Install ffmpeg (required for video processing)
+Production state is no longer expected to live in local SQLite/files only.
 
-**macOS:**
+The app now supports:
+- Postgres-backed shared review queue state via `DATABASE_URL`
+- Postgres-backed worker heartbeat and processed-video markers
+- SSE worker-status streaming at `/api/video-review/worker-status/stream`
+- ephemeral preview caching under `/tmp/drive_cache` in production
+- static per-camera table metadata loaded from `approved_table_rectangles.json` when present, otherwise `approved_tables.json`
+- service-account credentials from:
+  - `DRIVE_SERVICE_ACCOUNT_JSON`
+  - `DRIVE_SERVICE_ACCOUNT_JSON_B64`
+  - `DRIVE_SERVICE_ACCOUNT_JSON_PATH`
+
+The worker now uses `approved_table_rectangles.json` for tables when it exists, otherwise it falls back to `approved_tables.json`. SAM is only used for people. It still uploads review bundles to Drive, but it also upserts queue rows into Postgres so the UI does not need to rescan Drive for every session.
+
+## Local Dev
+
+### Prereqs
+
+- Python 3.12 recommended
+- `ffmpeg`
+- Drive service account with access to the Shared Drive/project folders
+
+### Install `ffmpeg`
+
+macOS:
+
 ```bash
 brew install ffmpeg
 ```
 
-**Ubuntu/Debian:**
+Ubuntu/Debian:
+
 ```bash
 sudo apt install ffmpeg
 ```
 
-**Windows:**
-Download from https://ffmpeg.org/download.html
-
-### 2. Install Python dependencies
+### Run the web app
 
 ```bash
-pip3 install flask
+bash run_local_app.sh
 ```
 
-## Usage
-
-### Start the server
+### Run the worker
 
 ```bash
-cd video-table-cropper
-python3 app.py
+bash run_worker.sh
 ```
 
-Open **http://localhost:8080** in your browser.
+The runner scripts reuse the existing virtualenv unless dependencies changed. Set `BOOTSTRAP_DEPS=1` to force a reinstall.
 
----
+## Core Environment Variables
 
-## Tool 1: Integrated Crop & Label Workflow (RECOMMENDED)
-
-The main workflow combines table cropping with automatic frame extraction and an interactive labeling interface.
-
-### Complete Workflow
-
-1. **Upload** video + JSON (table bounding boxes) on the main page
-2. Click **"Crop Videos"** → System automatically:
-   - Crops each table from the video
-   - Extracts frames every 30 seconds from each cropped video
-3. Click **"Label Frames"** → Opens interactive labeling page
-4. **Drag frames** into categories:
-   - **Clean** - Empty, clean table
-   - **Occupied** - People sitting at table
-   - **Dirty** - Table needs cleaning (dishes, mess)
-5. Click **"Download Labeled Frames"** → Get ZIP with:
-   ```
-   labeled_frames.zip
-   ├── clean/
-   │   ├── frame_0001_00m00s.jpg
-   │   └── ...
-   ├── occupied/
-   │   └── ...
-   ├── dirty/
-   │   └── ...
-   └── labels.json
-   ```
-
-**Perfect for**: Building ML training datasets for restaurant table classification
-
----
-
-## Tool 2: Table Cropper (Standalone)
-
-If you only need cropped videos without labeling:
-
-1. **Drag & drop** your video file onto the left zone
-2. **Drag & drop** your JSON file(s) onto the right zone
-3. Click **"Crop Videos"**
-4. **Download** each cropped video
-
----
-
-## Tool 3: Frame Extraction (Standalone CLI)
-
-For batch processing or custom workflows, use the standalone CLI tool to extract frames from videos.
-
-### Web Interface
-
-1. Go to **http://localhost:8080/frames**
-2. **Drag & drop** your video file
-3. Set your **extraction settings**:
-   - **Frame Interval**: How often to extract (default: 30 seconds)
-   - **JPEG Quality**: 1-31, lower is better (default: 2 = high quality)
-4. Click **"Extract Frames"**
-5. **Download** all frames as a ZIP file
-
-**Frame output:**
-- Each frame is named: `frame_0000_00m00s.jpg` (frame number + timestamp)
-- Includes `metadata.json` with video info and frame details
-- Organized in folders by video name
-
-### CLI Tool
-
-For batch processing or automation, use the standalone CLI script:
+### Shared
 
 ```bash
-# Extract frames every 30 seconds (default)
-python3 extract_frames.py video.mp4
-
-# Extract frames every 60 seconds
-python3 extract_frames.py video.mp4 -i 60
-
-# Specify output directory
-python3 extract_frames.py video.mp4 -o training_data/
-
-# Batch process all videos in a folder
-python3 extract_frames.py --batch videos/ -o frames/
-
-# Resume interrupted extraction
-python3 extract_frames.py video.mp4 --resume
-
-# Show help
-python3 extract_frames.py --help
+export DRIVE_PROJECT_ROOT_FOLDER_ID=...
+export DRIVE_VIDEO_SOURCE_ROOT_ID=...
+export DRIVE_REVIEW_QUEUE_ROOT_ID=...
+export DRIVE_OUTPUT_TEMPORAL_STATE_ROOT_ID=...
+export DRIVE_OUTPUT_DIRTY_CLEAN_SURFACE_ROOT_ID=...
+export DRIVE_OUTPUT_OCCUPANCY_MLP_ROOT_ID=...
+export DRIVE_OUTPUT_SAM_AUDIT_ROOT_ID=...
 ```
 
-**CLI Options:**
-- `-i, --interval` - Frame extraction interval in seconds (default: 30)
-- `-q, --quality` - JPEG quality 1-31, lower is better (default: 2)
-- `-f, --format` - Output format: jpg or png (default: jpg)
-- `-o, --output-dir` - Output directory
-- `--batch` - Process all videos in a directory
-- `--resume` - Skip existing frames and resume
-- `-v, --verbose` - Show ffmpeg output
+Static table metadata defaults to [`approved_table_rectangles.json`](approved_table_rectangles.json) when present in the repo root, otherwise [`approved_tables.json`](approved_tables.json). Override it with:
 
-**Output structure:**
-```
-frames/
-└── video_name_frames/
-    ├── frame_0000_00m00s.jpg
-    ├── frame_0001_00m30s.jpg
-    ├── frame_0002_01m00s.jpg
-    └── metadata.json
+```bash
+export APPROVED_TABLES_JSON_PATH=/absolute/path/to/approved_tables.json
 ```
 
-**Why 30 seconds?**
-- For restaurant CCTV, tables change state slowly (empty → occupied → food arrives → cleared)
-- 30-second intervals capture state transitions without redundant frames
-- ~120 frames per hour of video
-- Adjust with `-i` based on your needs (faster scenes = shorter interval)
+The downstream geometry handoff for `tight_rect` and `zone_rect` is documented in [`STATIC_TABLE_GEOMETRY_CONTRACT.md`](STATIC_TABLE_GEOMETRY_CONTRACT.md).
 
----
+### Drive credentials
 
-## JSON Format
+Use one of these, in this priority order:
 
-The app supports two JSON formats:
-
-### Format 1: Axis-aligned bounding boxes
-
-```json
-{
-  "video_name": "my_video",
-  "tables": [
-    {
-      "id": 0,
-      "bbox": {
-        "x1": 100,
-        "y1": 200,
-        "x2": 500,
-        "y2": 600
-      },
-      "saved": true
-    }
-  ]
-}
+```bash
+export DRIVE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
 ```
 
-### Format 2: Rotated bounding boxes
+or
 
-For tables detected at an angle:
-
-```json
-{
-  "video_name": "my_video",
-  "frame_width": 1280,
-  "frame_height": 720,
-  "tables": [
-    {
-      "id": 0,
-      "rotated_bbox": {
-        "center": [500, 300],
-        "size": [200, 150],
-        "angle": -45.0,
-        "corners": [
-          [400, 200],
-          [600, 200],
-          [600, 400],
-          [400, 400]
-        ]
-      },
-      "saved": true
-    }
-  ]
-}
+```bash
+export DRIVE_SERVICE_ACCOUNT_JSON_B64=...
 ```
 
-**Rotated bbox fields:**
-- `center` - [x, y] center point of the rotated rectangle
-- `size` - [width, height] of the rectangle (output dimensions)
-- `angle` - Rotation angle in degrees
-- `corners` - Four [x, y] corner points defining the rotated rectangle
+or
 
-**Optional fields:**
-- `id` - Table identifier (used in output filename)
-- `saved` - Set to `false` to skip this table
-- `skip_reason` - Set to skip this table
+```bash
+export DRIVE_SERVICE_ACCOUNT_JSON_PATH=/absolute/path/to/service-account.json
+```
 
-## Output
+### Web
 
-Cropped videos are named: `{video_name}_table_{id}.mp4`
+```bash
+export APP_ENV=production
+export ENABLE_LEGACY_ROUTES=false
+export VIDEO_REVIEW_BATCH_LIMIT_DEFAULT=60
+export X_ROBOTS_TAG="noindex, nofollow"
+export DATABASE_URL=postgresql://...
+```
 
-Example: `my_video_table_00.mp4`, `my_video_table_01.mp4`, etc.
+### Worker
 
-## Troubleshooting
+```bash
+export DATABASE_URL=postgresql://...
+export PROCESSOR_CONTINUOUS=true
+export PROCESSOR_POLL_SECONDS=30
+export PROCESSOR_MAX_PENDING_SAMPLES=500
+export PROCESSOR_RESUME_PENDING_SAMPLES=250
+export PROCESSOR_TRASH_SOURCE_VIDEOS=true
+export PROCESSOR_CLEANUP_FRAMES=true
+export PROCESSOR_CLEANUP_REVIEW_CACHE=true
+export PROCESSOR_CLEANUP_LOCAL_VIDEO_WHEN_SOURCE_TRASHED=true
+export PROCESSOR_FRAME_INTERVAL=10
+export SAM3_CHECKPOINT_PATH=...
+export SAM3_CONFIG_NAME=...
+```
 
-**"Access to localhost was denied" (port 5000)**
-- macOS uses port 5000 for AirPlay. This app uses port 8080 instead.
+## Postgres Migration
 
-**"ffmpeg not found"**
-- Make sure ffmpeg is installed: `brew install ffmpeg`
+Apply [`migrations/001_video_review_pg.sql`](migrations/001_video_review_pg.sql) once to the production database before starting the app/worker with `DATABASE_URL`.
 
-**Video processing fails**
-- Check that your video file isn't corrupted
-- Ensure bounding box coordinates are within the video dimensions
+Example:
+
+```bash
+psql "$DATABASE_URL" -f migrations/001_video_review_pg.sql
+```
+
+Tables created:
+- `video_review_sessions`
+- `video_review_items`
+- `video_review_actions`
+- `worker_status`
+- `processed_videos`
+
+## Production Behavior
+
+### Web
+
+- `/video-review` auto-starts a review session if a review root is configured
+- batch retrieval comes from Postgres when `DATABASE_URL` is set
+- preview/sample files are fetched from Drive on demand and cached locally
+- `/healthz` returns `200` only when:
+  - the app can respond
+  - database healthcheck passes when enabled
+  - Drive credentials are configured
+  - a review root is configured
+
+### Worker
+
+- scans Drive source folders
+- skips processed videos using `processed_videos`
+- loads static tables from `approved_tables.json`
+- runs SAM only for `person`
+- uploads review bundles to `review_queue/pending/...`
+- upserts shared queue rows into `video_review_items`
+- writes heartbeat/status into `worker_status`
+- cleans transient local `frames/` and `review/` folders after processing
+- keeps or removes the downloaded local source video based on whether the Drive source was trashed and `PROCESSOR_CLEANUP_LOCAL_VIDEO_WHEN_SOURCE_TRASHED`
+
+## Containers
+
+### Web image
+
+[`Dockerfile.web`](Dockerfile.web)
+
+- base: `python:3.12-slim`
+- installs `ffmpeg`
+- installs `requirements.web.txt`
+- runs `gunicorn app:app`
+
+### Worker image
+
+[`Dockerfile.worker`](Dockerfile.worker)
+
+- base: `pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime`
+- installs `ffmpeg`
+- installs `requirements.worker.txt`
+- runs the worker in continuous mode
+
+## Railway + Runpod Deployment
+
+### Railway
+
+1. Create a Railway project.
+2. Add PostgreSQL.
+3. Deploy the web service with [`Dockerfile.web`](Dockerfile.web).
+4. Set `/healthz` as the healthcheck path.
+5. Set env vars:
+   - `DATABASE_URL`
+   - Drive credentials env
+   - Drive root IDs
+   - `APP_ENV=production`
+   - `ENABLE_LEGACY_ROUTES=false`
+   - `VIDEO_REVIEW_BATCH_LIMIT_DEFAULT=60`
+   - `X_ROBOTS_TAG=noindex, nofollow`
+6. Do not attach a volume.
+7. Run the SQL migration once.
+
+### Runpod
+
+1. Create one always-on GPU pod.
+2. Use [`Dockerfile.worker`](Dockerfile.worker).
+3. Set the same `DATABASE_URL`, Drive credentials, and Drive root env vars.
+4. Set the SAM checkpoint/config env vars.
+5. Keep the pod warm.
+
+Recommended starting GPU tier:
+- RTX 4090 24 GB
+- RTX A5000 24 GB
+- RTX A6000 48 GB
+
+## Verification
+
+Basic checks:
+
+```bash
+python3 -m py_compile app.py video_dataset_worker.py db.py video_review_store_pg.py worker_state_store_pg.py
+bash -n run_local_app.sh
+bash -n run_worker.sh
+python3 -m unittest discover -s tests
+```
+
+Deployment smoke tests:
+- `GET /healthz`
+- `GET /api/video-review/worker-status`
+- worker heartbeat row appears in `worker_status`
+- processing one video inserts `pending` rows into `video_review_items`
+- `/video-review` loads cards without manual Drive reindex
+
+## Current Limitations
+
+- Drive is still the artifact store for this phase; GCS/object storage is a later optimization.
+- There is no auth layer in this launch configuration.
+- Legacy pages still exist in the repo, but production is intentionally centered on `/video-review`.

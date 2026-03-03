@@ -1,0 +1,6 @@
+-r requirements.base.txt
+psycopg[binary]
+psycopg_pool
+torch
+torchvision
+transformers

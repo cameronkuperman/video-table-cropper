@@ -10,152 +10,136 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
+import time
 import uuid
 import zipfile
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Response, Flask, abort, g, jsonify, redirect, render_template, request, send_file, stream_with_context, url_for
+
+from camera_table_metadata import (
+    detect_camera_from_filename as detect_camera_from_metadata,
+    get_legacy_camera_config as get_camera_config_from_metadata,
+    iter_camera_configs,
+)
+from db import database_enabled, db_healthcheck
+from drive_client import DriveClient, DriveClientError
+from env_loader import load_local_env
+from dataset_schema import HUMAN_LABELS, PREVIEW_FILE_BY_KIND
+from drive_roots import resolve_video_pipeline_roots
+from drive_queue_store import DriveQueueStore
+from sample_builder import load_sample_payload
+from segment_cropper import SegmentCropError, crop_segment_from_path
+from segment_parser import SegmentParserError, parse_segment_json
+from video_review_service import (
+    archive_sample,
+    describe_sample_exports,
+    ensure_cached_sample,
+    ensure_review_roots,
+    export_sample,
+    index_review_samples,
+    recycle_sample,
+    undo_export_manifests,
+)
+from export_worker import DriveExportWorker
+from video_review_store import VideoReviewStore
+from video_review_store_pg import VideoReviewStorePG
+from worker_state_store_pg import WorkerStateStorePG
+from worker_runtime import load_worker_runtime_state, resolve_processor_cache_dir, worker_runtime_status_path
 
 app = Flask(__name__)
+load_local_env()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 # Configuration
+BASE_DIR = Path(__file__).parent
+APP_ENV = str(os.environ.get("APP_ENV", "development")).strip().lower()
+LEGACY_ROUTES_ENABLED = _env_bool("ENABLE_LEGACY_ROUTES", default=APP_ENV != "production")
+DEFAULT_DRIVE_CACHE_DIR = os.environ.get(
+    "DRIVE_CACHE_DIR",
+    "/tmp/drive_cache" if APP_ENV == "production" else str(BASE_DIR / "drive_cache"),
+)
+VIDEO_REVIEW_BATCH_LIMIT_DEFAULT = int(
+    os.environ.get(
+        "VIDEO_REVIEW_BATCH_LIMIT_DEFAULT",
+        "60" if APP_ENV == "production" else os.environ.get("DRIVE_BATCH_LIMIT_DEFAULT", "200"),
+    )
+)
+X_ROBOTS_TAG = os.environ.get("X_ROBOTS_TAG", "noindex, nofollow" if APP_ENV == "production" else "").strip()
 UPLOAD_FOLDER = Path(__file__).parent / "uploads"
 OUTPUT_FOLDER = Path(__file__).parent / "output"
 FRAMES_FOLDER = Path(__file__).parent / "frames"
+DRIVE_CACHE_FOLDER = Path(DEFAULT_DRIVE_CACHE_DIR)
+DRIVE_IMAGE_CACHE_FOLDER = DRIVE_CACHE_FOLDER / "images"
+DRIVE_PREVIEW_CACHE_FOLDER = DRIVE_CACHE_FOLDER / "previews"
+DRIVE_VIDEO_REVIEW_CACHE_FOLDER = DRIVE_CACHE_FOLDER / "video_review"
+PROCESSOR_CACHE_DIR = resolve_processor_cache_dir(base_dir=BASE_DIR)
+WORKER_RUNTIME_STATUS_PATH = worker_runtime_status_path(PROCESSOR_CACHE_DIR)
+DRIVE_QUEUE_DB = BASE_DIR / "drive_queue.db"
+DRIVE_VIDEO_REVIEW_DB = BASE_DIR / "video_review_queue.db"
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 ALLOWED_JSON_EXTENSIONS = {".json"}
+MODE_LABELS = {
+    "dirty_clean": {"dirty", "clean"},
+    "dirty_clean_occupied": {"dirty", "clean", "occupied"},
+}
+DRIVE_BATCH_LIMIT_DEFAULT = int(os.environ.get("DRIVE_BATCH_LIMIT_DEFAULT", "200"))
+DRIVE_BATCH_LIMIT_MAX = int(os.environ.get("DRIVE_BATCH_LIMIT_MAX", "500"))
+DRIVE_PREVIEW_CACHE_TTL_SECONDS = int(os.environ.get("DRIVE_PREVIEW_CACHE_TTL_SECONDS", "86400"))
+DRIVE_OUTPUT_BINARY_ROOT_ID = os.environ.get("DRIVE_OUTPUT_ROOT_BINARY_FOLDER_ID")
+DRIVE_OUTPUT_MULTICLASS_ROOT_ID = os.environ.get("DRIVE_OUTPUT_ROOT_MULTICLASS_FOLDER_ID")
+DRIVE_SOURCE_ROOT_FOLDER_ID = os.environ.get("DRIVE_SOURCE_ROOT_FOLDER_ID")
+LEGACY_DRIVE_EXPORT_ROOT_ID = os.environ.get("DRIVE_OUTPUT_ROOT_MULTICLASS_FOLDER_ID")
+DRIVE_PROJECT_ROOT_FOLDER_ID = os.environ.get("DRIVE_PROJECT_ROOT_FOLDER_ID")
+DRIVE_REVIEW_QUEUE_ROOT_ID = os.environ.get("DRIVE_REVIEW_QUEUE_ROOT_ID")
+DRIVE_OUTPUT_TEMPORAL_STATE_ROOT_ID = os.environ.get("DRIVE_OUTPUT_TEMPORAL_STATE_ROOT_ID")
+DRIVE_OUTPUT_DIRTY_CLEAN_SURFACE_ROOT_ID = os.environ.get("DRIVE_OUTPUT_DIRTY_CLEAN_SURFACE_ROOT_ID")
+DRIVE_OUTPUT_OCCUPANCY_MLP_ROOT_ID = os.environ.get("DRIVE_OUTPUT_OCCUPANCY_MLP_ROOT_ID")
+DRIVE_OUTPUT_SAM_AUDIT_ROOT_ID = os.environ.get("DRIVE_OUTPUT_SAM_AUDIT_ROOT_ID")
 
 # Ensure folders exist
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 OUTPUT_FOLDER.mkdir(exist_ok=True)
 FRAMES_FOLDER.mkdir(exist_ok=True)
+DRIVE_IMAGE_CACHE_FOLDER.mkdir(parents=True, exist_ok=True)
+DRIVE_PREVIEW_CACHE_FOLDER.mkdir(parents=True, exist_ok=True)
+DRIVE_VIDEO_REVIEW_CACHE_FOLDER.mkdir(parents=True, exist_ok=True)
+
+queue_store = DriveQueueStore(DRIVE_QUEUE_DB)
+video_review_store = VideoReviewStorePG() if database_enabled() else VideoReviewStore(DRIVE_VIDEO_REVIEW_DB)
+worker_state_store = WorkerStateStorePG() if database_enabled() else None
 
 
-# Camera JSON configurations (IPC3 through IPC11)
-CAMERA_CONFIGS = {
-    "IPC3": {
-        "video_name": "3_1_Mimosas_IPC3_20251227103309",
-        "frame_width": 1280,
-        "frame_height": 720,
-        "tables": [
-            {"id": 0, "rotated_bbox": {"center": [822.78662109375, 332.6180419921875], "size": [321.945618340476, 526.1953508124054], "angle": -67.11446052236897, "corners": [[1002.5732421875, 583.236083984375], [517.798095703125, 378.60321044921875], [643.0, 82.0], [1127.775146484375, 286.63287353515625]]}, "saved": True},
-            {"id": 1, "rotated_bbox": {"center": [282.5, 314.5], "size": [178.8627565551128, 206.3446493551661], "angle": 47.52611691161956, "corners": [[146.0126953125, 318.20428466796875], [298.20947265625, 178.86920166015625], [418.9873046875, 310.79571533203125], [266.79052734375, 450.13079833984375]]}, "saved": True},
-            {"id": 2, "rotated_bbox": {"center": [563.73388671875, 609.4105224609375], "size": [477.8999734397775, 298.649962841451], "angle": 31.06887599786191, "corners": [[282.0, 614.0], [436.123779296875, 358.192138671875], [845.4677734375, 604.821044921875], [691.343994140625, 860.62890625]]}, "saved": True},
-            {"id": 3, "rotated_bbox": {"center": [338.9871520996094, 105.39764404296875], "size": [142.12557867105397, 180.8465860855565], "angle": 34.84801602923692, "corners": [[229.0, 139.0], [332.33599853515625, -9.415489196777344], [448.97430419921875, 71.7952880859375], [345.6383056640625, 220.21078491210938]]}, "saved": True},
-            {"id": 4, "rotated_bbox": {"center": [144.28004455566406, 237.20889282226562], "size": [122.63448438035192, 169.83926620137368], "angle": 52.96, "corners": [[39.56009292602539, 239.4178009033203], [175.12835693359375, 137.11129760742188], [249.0, 234.99998474121094], [113.43173217773438, 337.3064880371094]]}, "saved": True},
-            {"id": 5, "rotated_bbox": {"center": [952.7930297851562, 161.791015625], "size": [255.25362446914727, 90.62169592974016], "angle": 19.76, "corners": [[817.362548828125, 161.28562927246094], [848.0, 76.00001525878906], [1088.2235107421875, 162.29640197753906], [1057.5860595703125, 247.58201599121094]]}, "saved": True},
-            {"id": 6, "rotated_bbox": {"center": [508.89788818359375, 159.76670837402344], "size": [196.48954465504943, 167.32461181541007], "angle": 21.423695831610086, "corners": [[386.8826904296875, 201.76327514648438], [448.0, 45.999996185302734], [630.9130859375, 117.7701416015625], [569.7957763671875, 273.5334167480469]]}, "saved": True},
-            {"id": 7, "rotated_bbox": {"center": [228.309814453125, 94.77656555175781], "size": [88.27931189306211, 110.59560807619341], "angle": 39.80557109226519, "corners": [[159.0, 108.99998474121094], [229.80157470703125, 24.038097381591797], [297.61962890625, 80.55314636230469], [226.81805419921875, 165.51502990722656]]}, "saved": True},
-            {"id": 8, "rotated_bbox": {"center": [82.22715759277344, 196.13192749023438], "size": [71.23191353350012, 150.0705930656038], "angle": 48.43766499236521, "corners": [[2.4543190002441406, 219.26385498046875], [114.7422866821289, 119.70184326171875], [162.0, 173.0], [49.71202850341797, 272.56201171875]]}, "saved": True},
-            {"id": 9, "rotated_bbox": {"center": [36.64238739013672, 180.69140625], "size": [50.303291239986194, 112.0168003117322], "angle": 51.00900595749453, "corners": [[-22.715225219726562, 196.3828125], [64.34925842285156, 125.90203094482422], [96.0, 165.0], [8.935516357421875, 235.48077392578125]]}, "saved": True},
-            {"id": 10, "rotated_bbox": {"center": [174.4415283203125, 76.7829818725586], "size": [80.17810262375383, 83.17323186369374], "angle": 21.26337159910141, "corners": [[121.99998474121094, 101.0], [152.16322326660156, 23.488929748535156], [226.88307189941406, 52.56596374511719], [196.71983337402344, 130.0770263671875]]}, "saved": True}
-        ]
-    },
-    "IPC4": {
-        "video_name": "4_1_Mimosas_IPC4_20251227103312",
-        "frame_width": 1280,
-        "frame_height": 720,
-        "tables": [
-            {"id": 0, "rotated_bbox": {"center": [580.5, 575.0], "size": [284.0, 413.0], "angle": 90.0, "corners": [[374.0, 433.0], [787.0, 433.0], [787.0, 717.0], [374.0, 717.0]]}, "saved": True},
-            {"id": 1, "rotated_bbox": {"center": [509.28826904296875, 309.04315185546875], "size": [232.43705362085305, 324.5949692069938], "angle": 79.45525328601899, "corners": [[328.4632568359375, 224.48828125], [647.5765380859375, 165.0863037109375], [690.11328125, 393.5980224609375], [371.0, 453.0]]}, "saved": True},
-            {"id": 2, "rotated_bbox": {"center": [1021.257568359375, 182.017822265625], "size": [177.15739315789966, 135.70969158094044], "angle": 22.38, "corners": [[913.51513671875, 211.03564453125], [965.186279296875, 85.5477523803711], [1129.0, 153.0], [1077.328857421875, 278.4878845214844]]}, "saved": True},
-            {"id": 3, "rotated_bbox": {"center": [778.70166015625, 109.91230010986328], "size": [169.22262145461497, 130.1695092119923], "angle": 33.690067525979785, "corners": [[672.1982421875, 117.13217163085938], [744.4033203125, 8.824600219726562], [885.205078125, 102.69242858886719], [813.0, 211.0]]}, "saved": True},
-            {"id": 4, "rotated_bbox": {"center": [193.35546875, 367.37518310546875], "size": [220.78610693586702, 283.46312072196145], "angle": 70.35, "corners": [[22.75546646118164, 311.071533203125], [289.7109375, 215.7503662109375], [363.9554748535156, 423.6788330078125], [97.0, 519.0]]}, "saved": True},
-            {"id": 5, "rotated_bbox": {"center": [427.34100341796875, 187.24942016601562], "size": [113.42567776555816, 191.04182231184123], "angle": 88.83, "corners": [[330.6819763183594, 132.49884033203125], [521.6839599609375, 128.59796142578125], [524.0, 242.0], [332.998046875, 245.90087890625]]}, "saved": True},
-            {"id": 6, "rotated_bbox": {"center": [862.3423461914062, 334.21337890625], "size": [261.51689776363946, 216.42461367169057], "angle": 36.53, "corners": [[692.859375, 343.333740234375], [821.6846923828125, 169.4267578125], [1031.8253173828125, 325.093017578125], [903.0, 499.0]]}, "saved": True}
-        ]
-    },
-    "IPC5": {
-        "video_name": "5_1_Mimosas_IPC5_20251227103314",
-        "frame_width": 1280,
-        "frame_height": 720,
-        "tables": [
-            {"id": 0, "rotated_bbox": {"center": [1078.795654296875, 529.7513427734375], "size": [253.62942923372705, 256.25924722345667], "angle": 34.02, "corners": [[902.0, 565.0000610351562], [1045.37255859375, 352.60150146484375], [1255.59130859375, 494.50262451171875], [1112.21875, 706.9011840820312]]}, "saved": True},
-            {"id": 1, "rotated_bbox": {"center": [157.16436767578125, 355.8930358886719], "size": [195.05875920649686, 215.52394181184565], "angle": 61.78, "corners": [[16.093563079833984, 320.91229248046875], [206.0, 219.0], [298.23516845703125, 390.873779296875], [108.3287353515625, 492.78607177734375]]}, "saved": True},
-            {"id": 2, "rotated_bbox": {"center": [538.77783203125, 185.7633819580078], "size": [150.85503780427098, 280.8961493672101], "angle": 69.54, "corners": [[380.8237609863281, 164.18820190429688], [644.0, 65.99999237060547], [696.73193359375, 207.33856201171875], [433.5556640625, 305.5267639160156]]}, "saved": True},
-            {"id": 3, "rotated_bbox": {"center": [705.08642578125, 317.0765380859375], "size": [225.39132509474166, 577.0084354202078], "angle": 66.88117384157762, "corners": [[395.50250244140625, 326.70928955078125], [926.1728515625, 100.153076171875], [1014.6703491210938, 307.44378662109375], [484.0, 534.0]]}, "saved": True}
-        ]
-    },
-    "IPC6": {
-        "video_name": "6_1_Mimosas_IPC6_20251227103316",
-        "frame_width": 1280,
-        "frame_height": 720,
-        "tables": [
-            {"id": 0, "rotated_bbox": {"center": [522.4129028320312, 498.6118469238281], "size": [417.3054157696059, 359.3356143029141], "angle": 1.59, "corners": [[308.855224609375, 672.4208984375], [318.8258056640625, 313.2237243652344], [735.9705810546875, 324.80279541015625], [726.0, 684.0]]}, "saved": True},
-            {"id": 1, "rotated_bbox": {"center": [1088.203369140625, 175.82452392578125], "size": [89.01743313801416, 115.44641728423342], "angle": 75.96, "corners": [[1021.4067993164062, 146.64903259277344], [1133.4044189453125, 118.64183044433594], [1155.0, 205.00001525878906], [1043.0023193359375, 233.00721740722656]]}, "saved": True},
-            {"id": 2, "rotated_bbox": {"center": [1048.9993896484375, 295.5008850097656], "size": [148.36497910017403, 73.86854117134503], "angle": 38.66, "corners": [[968.0, 278.0], [1014.1455078125, 220.3185272216797], [1129.998779296875, 313.00177001953125], [1083.853271484375, 370.6832275390625]]}, "saved": True},
-            {"id": 3, "rotated_bbox": {"center": [155.53573608398438, 321.8195495605469], "size": [209.64128669457634, 216.4568417538395], "angle": 70.29, "corners": [[18.296466827392578, 259.6412353515625], [222.0714874267578, 186.63909912109375], [292.7749938964844, 383.99786376953125], [88.99998474121094, 457.0]]}, "saved": True},
-            {"id": 4, "rotated_bbox": {"center": [950.0, 155.0], "size": [129.05849282081135, 89.01632114854323], "angle": 32.11, "corners": [[871.6837158203125, 158.3994140625], [919.0, 83.0], [1028.3162841796875, 151.6005859375], [981.0, 227.0]]}, "saved": True},
-            {"id": 5, "rotated_bbox": {"center": [1106.6502685546875, 245.05596923828125], "size": [121.43250399275837, 61.66508206721707], "angle": 18.43, "corners": [[1039.300537109375, 255.1119384765625], [1058.795654296875, 196.609619140625], [1174.0, 235.0], [1154.5048828125, 293.5023193359375]]}, "saved": True},
-            {"id": 6, "rotated_bbox": {"center": [841.7884521484375, 398.2997131347656], "size": [193.89737469280215, 280.46298822926275], "angle": 71.45, "corners": [[678.0000610351562, 351.0], [943.8919067382812, 261.77569580078125], [1005.5768432617188, 445.59942626953125], [739.6849975585938, 534.82373046875]]}, "saved": True},
-            {"id": 7, "rotated_bbox": {"center": [635.0, 186.0], "size": [187.02165892190968, 180.6623898161897], "angle": 44.89054524803136, "corners": [[505.0, 184.0], [632.5032958984375, 56.00859069824219], [765.0, 188.0], [637.4967041015625, 315.99139404296875]]}, "saved": True},
-            {"id": 8, "rotated_bbox": {"center": [820.6773071289062, 159.86863708496094], "size": [189.10743406121054, 123.64285988886165], "angle": 29.05, "corners": [[708.0, 168.0], [768.03759765625, 59.911869049072266], [933.3546142578125, 151.73727416992188], [873.3170166015625, 259.8254089355469]]}, "saved": True},
-            {"id": 9, "rotated_bbox": {"center": [386.4109802246094, 227.96266174316406], "size": [183.14332984146836, 200.3973217727612], "angle": 65.14, "corners": [[257.0, 187.0], [438.82806396484375, 102.75247192382812], [515.8219604492188, 268.9253234863281], [333.993896484375, 353.1728515625]]}, "saved": True}
-        ]
-    },
-    "IPC7": {
-        "video_name": "7_1_Mimosas_IPC7_20251227112204",
-        "frame_width": 1280,
-        "frame_height": 720,
-        "tables": [
-            {"id": 0, "rotated_bbox": {"center": [535.4974975585938, 451.677978515625], "size": [511.7046029142641, 294.49656205365386], "angle": 52.58528303002687, "corners": [[263.09356689453125, 337.93017578125], [496.9999694824219, 159.0], [807.9014282226562, 565.42578125], [573.9949951171875, 744.35595703125]]}, "saved": True},
-            {"id": 1, "rotated_bbox": {"center": [1135.403076171875, 169.1923828125], "size": [195.87468534201227, 71.55471642984267], "angle": 26.57, "corners": [[1031.80615234375, 157.384765625], [1063.81201171875, 93.38705444335938], [1239.0, 181.0], [1206.994140625, 244.99771118164062]]}, "saved": True},
-            {"id": 2, "rotated_bbox": {"center": [135.19793701171875, 549.2426147460938], "size": [438.18117132951545, 334.05306338160386], "angle": 74.05, "corners": [[-85.6041259765625, 384.4852294921875], [235.58851623535156, 292.68798828125], [356.0, 714.0], [34.80735778808594, 805.7972412109375]]}, "saved": True},
-            {"id": 3, "rotated_bbox": {"center": [1071.939697265625, 198.31060791015625], "size": [236.80291594594402, 68.18404942363028], "angle": 29.05, "corners": [[951.87939453125, 170.6212158203125], [984.98779296875, 111.01498413085938], [1192.0, 226.0], [1158.8916015625, 285.6062316894531]]}, "saved": True},
-            {"id": 4, "rotated_bbox": {"center": [819.973388671875, 310.96209716796875], "size": [392.24096577367425, 223.21045643025758], "angle": 29.760559189317814, "corners": [[594.321533203125, 310.497802734375], [705.117919921875, 116.72718811035156], [1045.625244140625, 311.4263916015625], [934.828857421875, 505.197021484375]]}, "saved": True},
-            {"id": 5, "rotated_bbox": {"center": [969.3091430664062, 227.88922119140625], "size": [312.6041263371481, 98.83466386475003], "angle": 26.57, "corners": [[807.410400390625, 202.175048828125], [851.6182861328125, 113.77843475341797], [1131.2078857421875, 253.6033935546875], [1087.0, 342.0]]}, "saved": True},
-            {"id": 6, "rotated_bbox": {"center": [190.27, 704.49], "size": [103.21, 38.42], "angle": 20.06, "corners": [[135.20655822753906, 704.8338623046875], [148.38478088378906, 668.74462890625], [245.3334503173828, 704.1461181640625], [232.1552276611328, 740.2353515625]]}, "saved": True}
-        ]
-    },
-    "IPC8": {
-        "video_name": "8_1_Mimosas_IPC8_20251227103321",
-        "frame_width": 1280,
-        "frame_height": 720,
-        "tables": [
-            {"id": 0, "rotated_bbox": {"center": [424.5, 546.0], "size": [565.4548287426129, 305.086605165914], "angle": 24.421943574652165, "corners": [[104.0, 568.0], [230.1390380859375, 290.2109069824219], [745.0, 524.0], [618.8609619140625, 801.7890625]]}, "saved": True}
-        ]
-    },
-    "IPC9": {
-        "video_name": "9_1_Mimosas_IPC9_20251227103325",
-        "frame_width": 1280,
-        "frame_height": 720,
-        "tables": [
-            {"id": 0, "rotated_bbox": {"center": [654.2850341796875, 204.67372131347656], "size": [153.04692549671307, 455.3847732184601], "angle": 54.89760902044744, "corners": [[424.0000305175781, 273.0], [796.56201171875, 11.135826110839844], [884.570068359375, 136.34744262695312], [512.008056640625, 398.21160888671875]]}, "saved": True}
-        ]
-    },
-    "IPC10": {
-        "video_name": "10_1_Mimosas_IPC10_20251227112207",
-        "frame_width": 1280,
-        "frame_height": 720,
-        "tables": [
-            {"id": 0, "rotated_bbox": {"center": [408.0, 386.5], "size": [255.12070966688265, 610.1658983416446], "angle": 34.844820406223185, "corners": [[129.0, 564.0], [477.621826171875, 63.235313415527344], [687.0, 209.0], [338.378173828125, 709.7647094726562]]}, "saved": True}
-        ]
-    },
-    "IPC11": {
-        "video_name": "11_1_Mimosas_IPC11_20251227103501",
-        "frame_width": 1280,
-        "frame_height": 720,
-        "tables": [
-            {"id": 0, "rotated_bbox": {"center": [539.0, 268.0], "size": [597.2972663831904, 148.0809763986184], "angle": 32.3, "corners": [[247.0, 170.99998474121094], [326.12744140625, 45.832794189453125], [831.0, 365.0], [751.87255859375, 490.1672058105469]]}, "saved": True}
-        ]
-    }
-}
+def _make_export_drive_client() -> DriveClient:
+    """Create a fresh DriveClient for the background export worker (not request-scoped)."""
+    return DriveClient()
 
+
+_export_worker = DriveExportWorker(
+    store=video_review_store,
+    cache_root=DRIVE_VIDEO_REVIEW_CACHE_FOLDER,
+    get_client_fn=_make_export_drive_client,
+    get_output_roots_fn=lambda: get_video_review_output_roots(),
+)
+_export_worker.start()
 
 def detect_camera_from_filename(filename: str) -> str:
     """Extract camera ID from filename (e.g., 'IPC3' from '3_1_Mimosas_IPC3_...')."""
-    import re
-    match = re.search(r'IPC(\d+)', filename, re.IGNORECASE)
-    if match:
-        return f"IPC{match.group(1)}"
-    return None
+    return detect_camera_from_metadata(filename)
 
 
 def get_camera_config(camera_id: str) -> dict:
     """Get stored JSON config for a camera."""
-    return CAMERA_CONFIGS.get(camera_id)
+    return get_camera_config_from_metadata(camera_id)
 
 
 def allowed_video(filename: str) -> bool:
@@ -164,6 +148,168 @@ def allowed_video(filename: str) -> bool:
 
 def allowed_json(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_JSON_EXTENSIONS
+
+
+def get_drive_client() -> DriveClient:
+    """Return a request-scoped Drive client to avoid cross-request transport reuse."""
+    client = getattr(g, "drive_client", None)
+    if client is None:
+        client = DriveClient()
+        g.drive_client = client
+    return client
+
+
+def get_output_root_for_mode(mode: str) -> str | None:
+    if mode == "dirty_clean":
+        return DRIVE_OUTPUT_BINARY_ROOT_ID
+    if mode == "dirty_clean_occupied":
+        return DRIVE_OUTPUT_MULTICLASS_ROOT_ID
+    return None
+
+
+def normalize_batch_limit(raw_value: int | str | None, default: int | None = None) -> int:
+    fallback = DRIVE_BATCH_LIMIT_DEFAULT if default is None else default
+    try:
+        if raw_value is None:
+            return fallback
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(1, min(parsed, DRIVE_BATCH_LIMIT_MAX))
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def require_legacy_routes() -> None:
+    if not LEGACY_ROUTES_ENABLED:
+        abort(404)
+
+
+@app.after_request
+def apply_response_headers(response):
+    if X_ROBOTS_TAG:
+        response.headers["X-Robots-Tag"] = X_ROBOTS_TAG
+    return response
+
+
+def get_video_pipeline_roots(client: DriveClient | None = None) -> dict[str, str | None]:
+    client = client or get_drive_client()
+    return resolve_video_pipeline_roots(
+        client,
+        project_root_id=DRIVE_PROJECT_ROOT_FOLDER_ID,
+        source_root_id=os.environ.get("DRIVE_VIDEO_SOURCE_ROOT_ID"),
+        review_root_id=DRIVE_REVIEW_QUEUE_ROOT_ID,
+        temporal_root_id=DRIVE_OUTPUT_TEMPORAL_STATE_ROOT_ID,
+        surface_root_id=DRIVE_OUTPUT_DIRTY_CLEAN_SURFACE_ROOT_ID,
+        occupancy_root_id=DRIVE_OUTPUT_OCCUPANCY_MLP_ROOT_ID,
+        audit_root_id=DRIVE_OUTPUT_SAM_AUDIT_ROOT_ID,
+    )
+
+
+def get_default_video_review_root() -> str:
+    if DRIVE_REVIEW_QUEUE_ROOT_ID:
+        return DRIVE_REVIEW_QUEUE_ROOT_ID
+    if not DRIVE_PROJECT_ROOT_FOLDER_ID:
+        return ""
+    try:
+        roots = get_video_pipeline_roots()
+    except DriveClientError:
+        return DRIVE_PROJECT_ROOT_FOLDER_ID
+    return str(roots.get("review") or DRIVE_PROJECT_ROOT_FOLDER_ID)
+
+
+def cleanup_preview_cache(session_id: str) -> None:
+    """Best-effort cleanup of stale preview files for a session."""
+    import time
+
+    session_preview_folder = DRIVE_PREVIEW_CACHE_FOLDER / session_id
+    if not session_preview_folder.exists():
+        return
+
+    now = time.time()
+    ttl_seconds = DRIVE_PREVIEW_CACHE_TTL_SECONDS
+    for preview in session_preview_folder.glob("*.jpg"):
+        try:
+            if now - preview.stat().st_mtime > ttl_seconds:
+                preview.unlink()
+        except FileNotFoundError:
+            continue
+
+
+def ensure_drive_item_preview(item: dict) -> Path:
+    """
+    Ensure cached cropped preview exists for queue item and return its path.
+
+    Caches source image downloads and per-item crop previews locally.
+    """
+    session_id = item["session_id"]
+    item_id = item["id"]
+    source_file_id = item["source_file_id"]
+
+    source_cache_path = DRIVE_IMAGE_CACHE_FOLDER / f"{source_file_id}.bin"
+    preview_path = DRIVE_PREVIEW_CACHE_FOLDER / session_id / f"{item_id}.jpg"
+
+    if preview_path.exists():
+        return preview_path
+
+    client = get_drive_client()
+    if not source_cache_path.exists():
+        client.download_file_to_path(source_file_id, source_cache_path)
+
+    segment = item.get("segment")
+    if not segment:
+        segment = json.loads(item["segment_json"])
+
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    crop_segment_from_path(source_cache_path, segment, preview_path)
+    return preview_path
+
+
+def ensure_source_image_processed_if_complete(session_id: str, item: dict) -> None:
+    """Move source image from active folder to _processed when all queue items are resolved."""
+    source_file_id = item["source_file_id"]
+    if not queue_store.is_source_file_complete(session_id, source_file_id):
+        return
+    if item.get("source_file_in_processed"):
+        return
+
+    client = get_drive_client()
+    try:
+        processed_root_id = client.ensure_subfolder(item["source_root_folder_id"], "_processed")
+        processed_group_id = client.ensure_subfolder(
+            processed_root_id,
+            folder_bucket_name(item["source_folder_name"], item["source_folder_id"]),
+        )
+        client.move_file(
+            source_file_id,
+            new_parent_id=processed_group_id,
+            remove_parent_id=item["source_folder_id"],
+        )
+        queue_store.mark_source_file_processed(session_id, source_file_id, True)
+    except DriveClientError:
+        # Keep label/skip action successful even if source archival move fails.
+        return
+
+
+def maybe_restore_source_image_to_active(session_id: str, item: dict) -> None:
+    """Restore source image from _processed to active source folder when undo re-opens pending work."""
+    if not item.get("source_file_in_processed"):
+        return
+
+    client = get_drive_client()
+    try:
+        client.move_file(
+            item["source_file_id"],
+            new_parent_id=item["source_folder_id"],
+        )
+        queue_store.mark_source_file_processed(session_id, item["source_file_id"], False)
+    except DriveClientError:
+        return
 
 
 def crop_video(input_path: Path, output_path: Path, x1: int, y1: int, x2: int, y2: int) -> bool:
@@ -435,13 +581,1139 @@ def extract_frames_from_video(video_path: Path, output_dir: Path, interval: int 
 
 
 @app.route("/")
+def drive_home():
+    """Default landing page for Drive-first workflow."""
+    if not LEGACY_ROUTES_ENABLED:
+        return redirect(url_for("video_review_page"))
+    return render_template(
+        "drive_home.html",
+        default_source_root=DRIVE_SOURCE_ROOT_FOLDER_ID or "",
+        show_extended_nav=LEGACY_ROUTES_ENABLED,
+    )
+
+
+@app.route("/drive/binary")
+def drive_binary_page():
+    """Drive labeling page for dirty/clean model."""
+    require_legacy_routes()
+    return render_template(
+        "drive_labeling.html",
+        mode="dirty_clean",
+        labels=["dirty", "clean"],
+        mode_title="Dirty vs Clean",
+        default_source_root=DRIVE_SOURCE_ROOT_FOLDER_ID or "",
+        default_batch_limit=DRIVE_BATCH_LIMIT_DEFAULT,
+        show_extended_nav=LEGACY_ROUTES_ENABLED,
+    )
+
+
+@app.route("/drive/multiclass")
+def drive_multiclass_page():
+    """Drive labeling page for dirty/clean/occupied model."""
+    require_legacy_routes()
+    return render_template(
+        "drive_labeling.html",
+        mode="dirty_clean_occupied",
+        labels=["dirty", "clean", "occupied"],
+        mode_title="Dirty vs Clean vs Occupied",
+        default_source_root=DRIVE_SOURCE_ROOT_FOLDER_ID or "",
+        default_batch_limit=DRIVE_BATCH_LIMIT_DEFAULT,
+        show_extended_nav=LEGACY_ROUTES_ENABLED,
+    )
+
+
+@app.route("/video-review")
+def video_review_page():
+    default_review_root = get_default_video_review_root()
+    worker_status_payload = current_worker_status_payload()
+    return render_template(
+        "video_review.html",
+        default_review_root=default_review_root,
+        default_batch_limit=VIDEO_REVIEW_BATCH_LIMIT_DEFAULT,
+        initial_worker_status=worker_status_payload["status"],
+        worker_status_path=worker_status_payload["status_path"],
+        show_extended_nav=LEGACY_ROUTES_ENABLED,
+    )
+
+
+@app.route("/legacy")
 def index():
+    require_legacy_routes()
     return render_template("index.html")
 
 
+@app.route("/legacy/frames")
 @app.route("/frames")
 def frames_page():
+    require_legacy_routes()
     return render_template("frames.html")
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    db_status = db_healthcheck()
+    drive_configured = bool(
+        os.environ.get("DRIVE_SERVICE_ACCOUNT_JSON")
+        or os.environ.get("DRIVE_SERVICE_ACCOUNT_JSON_B64")
+        or os.environ.get("DRIVE_SERVICE_ACCOUNT_JSON_PATH")
+    )
+    review_root_configured = bool(DRIVE_REVIEW_QUEUE_ROOT_ID or DRIVE_PROJECT_ROOT_FOLDER_ID)
+    healthy = db_status["healthy"] and drive_configured and review_root_configured
+    status_code = 200 if healthy else 503
+    return (
+        jsonify(
+            {
+                "success": healthy,
+                "app_env": APP_ENV,
+                "database": db_status,
+                "drive_configured": drive_configured,
+                "review_root_configured": review_root_configured,
+                "legacy_routes_enabled": LEGACY_ROUTES_ENABLED,
+            }
+        ),
+        status_code,
+    )
+
+
+def parse_source_folder_ids(raw_value) -> list[str]:
+    """Normalize optional source folder ID input into a list."""
+    if not raw_value:
+        return []
+    if isinstance(raw_value, list):
+        values = raw_value
+    elif isinstance(raw_value, str):
+        values = raw_value.replace(",", "\n").splitlines()
+    else:
+        return []
+    normalized = [str(v).strip() for v in values if str(v).strip()]
+    # Preserve order while deduplicating.
+    return list(dict.fromkeys(normalized))
+
+
+def slugify_folder_name(value: str) -> str:
+    """Convert Drive folder names into safe, consistent bucket names."""
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", (value or "").strip().lower()).strip("_")
+    return slug or "folder"
+
+
+def folder_bucket_name(folder_name: str, folder_id: str) -> str:
+    """Stable normalized folder key used in output/recycle/processed trees."""
+    return f"{slugify_folder_name(folder_name)}__{folder_id[:8]}"
+
+
+def ensure_drive_mode_destination_folder(
+    client: DriveClient,
+    mode: str,
+    label: str,
+    source_folder_id: str,
+    source_folder_name: str,
+    segment_id: str,
+) -> str:
+    """Create destination path in Drive output tree and return folder ID."""
+    output_root_id = get_output_root_for_mode(mode)
+    if not output_root_id:
+        raise DriveClientError(
+            f"Missing output root for mode '{mode}'. "
+            "Set DRIVE_OUTPUT_ROOT_BINARY_FOLDER_ID / DRIVE_OUTPUT_ROOT_MULTICLASS_FOLDER_ID."
+        )
+
+    label_folder_id = client.ensure_subfolder(output_root_id, label)
+    source_folder_bucket_id = client.ensure_subfolder(
+        label_folder_id,
+        folder_bucket_name(source_folder_name, source_folder_id),
+    )
+    segment_bucket_id = client.ensure_subfolder(source_folder_bucket_id, f"segment_{segment_id}")
+    return segment_bucket_id
+
+
+def ensure_recycle_folder(
+    client: DriveClient,
+    source_root_folder_id: str,
+    session_id: str,
+    source_folder_id: str,
+    source_folder_name: str,
+) -> str:
+    recycle_root_id = client.ensure_subfolder(source_root_folder_id, "_recycle")
+    session_recycle_id = client.ensure_subfolder(recycle_root_id, session_id)
+    return client.ensure_subfolder(
+        session_recycle_id,
+        folder_bucket_name(source_folder_name, source_folder_id),
+    )
+
+
+def get_video_review_output_roots() -> dict[str, str | None]:
+    roots = get_video_pipeline_roots()
+    return {
+        "temporal": roots.get("temporal"),
+        "surface": roots.get("surface"),
+        "occupancy": roots.get("occupancy"),
+        "audit": roots.get("audit"),
+    }
+
+
+def ensure_video_review_cached_sample(item: dict) -> Path:
+    client = get_drive_client()
+    return ensure_cached_sample(client, item, DRIVE_VIDEO_REVIEW_CACHE_FOLDER)
+
+
+def video_review_preview_path(item: dict, kind: str) -> Path:
+    if kind not in PREVIEW_FILE_BY_KIND:
+        raise ValueError(f"Unsupported preview kind '{kind}'")
+    sample_dir = ensure_video_review_cached_sample(item)
+    preview_path = sample_dir / PREVIEW_FILE_BY_KIND[kind]
+    if not preview_path.exists():
+        raise FileNotFoundError(preview_path)
+    return preview_path
+
+
+def current_worker_status_payload() -> dict:
+    if worker_state_store is not None:
+        try:
+            return {
+                "status": worker_state_store.get_status(),
+                "status_path": "postgres://worker_status/video-dataset-worker",
+            }
+        except Exception as exc:  # pragma: no cover - depends on live database state
+            app.logger.warning("Falling back to empty worker status payload: %s", exc)
+            fallback = load_worker_runtime_state(WORKER_RUNTIME_STATUS_PATH)
+            fallback["last_error"] = str(exc)
+            fallback["message"] = "Worker status is unavailable until database migrations are applied."
+            return {
+                "status": fallback,
+                "status_path": "postgres://worker_status/video-dataset-worker",
+            }
+    return {
+        "status": load_worker_runtime_state(WORKER_RUNTIME_STATUS_PATH),
+        "status_path": str(WORKER_RUNTIME_STATUS_PATH),
+    }
+
+
+@app.route("/api/video-review/worker-status", methods=["GET"])
+def video_review_worker_status():
+    return jsonify({"success": True, **current_worker_status_payload()})
+
+
+@app.route("/api/video-review/worker-status/stream", methods=["GET"])
+def video_review_worker_status_stream():
+    def generate():
+        last_event_seq = None
+        keepalive_ticks = 0
+        while True:
+            payload = current_worker_status_payload()
+            event_seq = payload["status"].get("event_seq")
+            if event_seq != last_event_seq:
+                yield f"data: {json.dumps(payload)}\n\n"
+                last_event_seq = event_seq
+                keepalive_ticks = 0
+            else:
+                keepalive_ticks += 1
+                if keepalive_ticks >= 5:
+                    yield ": keepalive\n\n"
+                    keepalive_ticks = 0
+            time.sleep(2)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.route("/api/drive/session/start", methods=["POST"])
+def drive_start_session():
+    """Initialize a Drive labeling session by indexing source folders into queue items."""
+    payload = request.get_json(silent=True) or {}
+    mode = payload.get("mode")
+    if mode not in MODE_LABELS:
+        return jsonify({"error": "mode must be one of: dirty_clean, dirty_clean_occupied"}), 400
+
+    source_parent_folder_id = payload.get("source_parent_folder_id") or DRIVE_SOURCE_ROOT_FOLDER_ID
+    source_folder_ids = parse_source_folder_ids(payload.get("source_folder_ids"))
+    batch_limit = normalize_batch_limit(payload.get("batch_limit"))
+
+    if not source_parent_folder_id and not source_folder_ids:
+        return jsonify(
+            {
+                "error": (
+                    "Provide source_parent_folder_id and/or source_folder_ids. "
+                    "You can also set DRIVE_SOURCE_ROOT_FOLDER_ID."
+                )
+            }
+        ), 400
+
+    try:
+        client = get_drive_client()
+    except DriveClientError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    source_folders: dict[str, dict] = {}
+    indexing_errors: list[str] = []
+
+    if source_parent_folder_id:
+        try:
+            parent_folders = client.list_folders_recursive(source_parent_folder_id, include_root=False)
+            for folder in parent_folders:
+                folder["source_root_folder_id"] = source_parent_folder_id
+                source_folders[folder["id"]] = folder
+        except DriveClientError as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    for folder_id in source_folder_ids:
+        try:
+            folder_meta = client.get_file(folder_id)
+        except DriveClientError as exc:
+            indexing_errors.append(f"Failed to read folder {folder_id}: {exc}")
+            continue
+
+        if folder_meta.get("mimeType") != "application/vnd.google-apps.folder":
+            indexing_errors.append(f"{folder_id} is not a Drive folder")
+            continue
+
+        parents = folder_meta.get("parents", [])
+        if source_parent_folder_id and source_parent_folder_id in parents:
+            folder_meta["source_root_folder_id"] = source_parent_folder_id
+        else:
+            folder_meta["source_root_folder_id"] = parents[0] if parents else (source_parent_folder_id or folder_id)
+        source_folders[folder_meta["id"]] = folder_meta
+
+    if not source_folders:
+        return jsonify({"error": "No source folders found", "details": indexing_errors}), 400
+
+    session_id = str(uuid.uuid4())[:12]
+    queue_store.create_session(
+        session_id=session_id,
+        mode=mode,
+        source_parent_folder_id=source_parent_folder_id,
+        source_folder_ids=list(source_folders.keys()),
+        batch_limit=batch_limit,
+    )
+
+    queue_items: list[dict] = []
+    folder_errors: list[str] = []
+    folder_stats: list[dict] = []
+
+    for folder in source_folders.values():
+        folder_id = folder["id"]
+        folder_name = folder.get("name", folder_id)
+        source_root_folder_id = folder.get("source_root_folder_id") or folder_id
+
+        segment_file = client.find_file_by_name(folder_id, "segment.json")
+        segments = None
+        segment_source = "segment.json"
+        camera_id = detect_camera_from_filename(folder_name)
+
+        if segment_file:
+            try:
+                segment_bytes = client.download_file_content(segment_file["id"])
+                segments = parse_segment_json(segment_bytes)
+            except (DriveClientError, SegmentParserError) as exc:
+                folder_errors.append(f"{folder_name}: segment.json parse failed ({exc})")
+
+        # Fallback: infer segmentation from camera ID in folder name (e.g. IPC6)
+        if segments is None and camera_id:
+            camera_config = get_camera_config(camera_id)
+            if camera_config:
+                try:
+                    segments = parse_segment_json({"tables": camera_config.get("tables", [])})
+                    segment_source = f"camera_config:{camera_id}"
+                except SegmentParserError as exc:
+                    folder_errors.append(f"{folder_name}: camera config parse failed ({exc})")
+
+        if segments is None:
+            missing_msg = (
+                "missing segment.json and no matching camera config in folder name"
+                if not segment_file
+                else "unable to parse segment config from JSON or camera fallback"
+            )
+            folder_errors.append(f"{folder_name}: {missing_msg}")
+            continue
+
+        try:
+            image_files = client.list_image_files(folder_id)
+        except DriveClientError as exc:
+            folder_errors.append(f"{folder_name}: failed to list images ({exc})")
+            continue
+
+        for image_file in image_files:
+            for segment in segments:
+                queue_items.append(
+                    {
+                        "session_id": session_id,
+                        "source_root_folder_id": source_root_folder_id,
+                        "source_folder_id": folder_id,
+                        "source_folder_name": folder_name,
+                        "source_file_id": image_file["id"],
+                        "source_file_name": image_file.get("name", image_file["id"]),
+                        "source_file_mime_type": image_file.get("mimeType"),
+                        "segment_id": segment["segment_id"],
+                        "segment": segment,
+                    }
+                )
+
+        folder_stats.append(
+            {
+                "folder_id": folder_id,
+                "folder_name": folder_name,
+                "images_found": len(image_files),
+                "segments_found": len(segments),
+                "queue_items_generated": len(image_files) * len(segments),
+                "camera_id": camera_id,
+                "segment_source": segment_source,
+            }
+        )
+
+    inserted_count = queue_store.add_queue_items(queue_items)
+    stats = queue_store.get_stats(session_id)
+
+    return jsonify(
+        {
+            "success": True,
+            "session_id": session_id,
+            "mode": mode,
+            "source_folder_count": len(source_folders),
+            "queue_items_created": inserted_count,
+            "batch_limit": batch_limit,
+            "folder_stats": folder_stats,
+            "errors": indexing_errors + folder_errors,
+            "stats": stats,
+        }
+    )
+
+
+@app.route("/api/drive/session/<session_id>/batch", methods=["GET"])
+def drive_get_batch(session_id: str):
+    """Return next page of pending queue items and ensure preview images are available."""
+    session = queue_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    limit = normalize_batch_limit(request.args.get("limit") or session.get("batch_limit"))
+    try:
+        cursor = int(request.args.get("cursor", 0))
+    except ValueError:
+        cursor = 0
+
+    cleanup_preview_cache(session_id)
+    items = queue_store.get_pending_batch(session_id, limit, cursor)
+
+    batch_items: list[dict] = []
+    preview_errors: list[str] = []
+    for item in items:
+        try:
+            ensure_drive_item_preview(item)
+        except (DriveClientError, SegmentCropError, OSError, ValueError) as exc:
+            preview_errors.append(f"Item {item['id']}: {exc}")
+            continue
+
+        batch_items.append(
+            {
+                "id": item["id"],
+                "source_file_id": item["source_file_id"],
+                "source_file_name": item["source_file_name"],
+                "source_folder_id": item["source_folder_id"],
+                "source_folder_name": item["source_folder_name"],
+                "segment_id": item["segment_id"],
+                "image_url": f"/api/drive/session/{session_id}/image/{item['id']}",
+            }
+        )
+
+    next_cursor = batch_items[-1]["id"] if batch_items else cursor
+    has_more = queue_store.has_pending_after(session_id, next_cursor)
+
+    return jsonify(
+        {
+            "success": True,
+            "session_id": session_id,
+            "mode": session["mode"],
+            "items": batch_items,
+            "count": len(batch_items),
+            "limit": limit,
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "errors": preview_errors,
+            "stats": queue_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/drive/session/<session_id>/image/<int:item_id>", methods=["GET"])
+def drive_get_item_image(session_id: str, item_id: int):
+    """Serve cropped segment preview for queue item."""
+    item = queue_store.get_item(session_id, item_id)
+    if not item:
+        return jsonify({"error": "Queue item not found"}), 404
+
+    try:
+        preview_path = ensure_drive_item_preview(item)
+    except (DriveClientError, SegmentCropError, OSError, ValueError) as exc:
+        return jsonify({"error": f"Could not generate preview: {exc}"}), 500
+
+    return send_file(preview_path, mimetype="image/jpeg")
+
+
+@app.route("/api/drive/session/<session_id>/label", methods=["POST"])
+def drive_label_items(session_id: str):
+    """Apply a label to selected pending items and move outputs into Drive label folders."""
+    session = queue_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    label = str(payload.get("label", "")).strip().lower()
+    allowed_labels = MODE_LABELS[session["mode"]]
+    if label not in allowed_labels:
+        return jsonify({"error": f"Invalid label '{label}' for mode {session['mode']}"}), 400
+
+    try:
+        item_ids = [int(item_id) for item_id in payload.get("item_ids", [])]
+    except (TypeError, ValueError):
+        return jsonify({"error": "item_ids must be an array of integers"}), 400
+
+    if not item_ids:
+        return jsonify({"error": "No item_ids provided"}), 400
+
+    try:
+        client = get_drive_client()
+    except DriveClientError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    items = queue_store.get_items(session_id, item_ids, status="pending")
+    if not items:
+        return jsonify({"error": "No pending items found for supplied item_ids"}), 400
+
+    labeled_ids: list[int] = []
+    action_errors: list[str] = []
+    for item in items:
+        try:
+            preview_path = ensure_drive_item_preview(item)
+            destination_folder_id = ensure_drive_mode_destination_folder(
+                client=client,
+                mode=session["mode"],
+                label=label,
+                source_folder_id=item["source_folder_id"],
+                source_folder_name=item["source_folder_name"],
+                segment_id=item["segment_id"],
+            )
+            destination_name = (
+                f"{Path(item['source_file_name']).stem}_segment_{item['segment_id']}.jpg"
+            )
+            uploaded = client.upload_file(
+                preview_path,
+                destination_folder_id,
+                file_name=destination_name,
+                mime_type="image/jpeg",
+            )
+            queue_store.update_item_after_label(
+                session_id=session_id,
+                item_id=item["id"],
+                label=label,
+                output_file_id=uploaded["id"],
+            )
+            queue_store.log_action(
+                session_id=session_id,
+                queue_item_id=item["id"],
+                action_type="label",
+                prev_status=item["status"],
+                new_status="labeled",
+                prev_label=item.get("label"),
+                new_label=label,
+                moved_file_id=uploaded["id"],
+            )
+            labeled_ids.append(item["id"])
+            ensure_source_image_processed_if_complete(session_id, item)
+        except (DriveClientError, SegmentCropError, OSError, ValueError) as exc:
+            action_errors.append(f"Item {item['id']}: {exc}")
+
+    return jsonify(
+        {
+            "success": True,
+            "labeled_item_ids": labeled_ids,
+            "requested_count": len(item_ids),
+            "processed_count": len(labeled_ids),
+            "errors": action_errors,
+            "stats": queue_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/drive/session/<session_id>/skip", methods=["POST"])
+def drive_skip_items(session_id: str):
+    """Skip pending items by moving crops to recycle folder and marking them skipped."""
+    session = queue_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        item_ids = [int(item_id) for item_id in payload.get("item_ids", [])]
+    except (TypeError, ValueError):
+        return jsonify({"error": "item_ids must be an array of integers"}), 400
+
+    if not item_ids:
+        return jsonify({"error": "No item_ids provided"}), 400
+
+    try:
+        client = get_drive_client()
+    except DriveClientError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    items = queue_store.get_items(session_id, item_ids, status="pending")
+    if not items:
+        return jsonify({"error": "No pending items found for supplied item_ids"}), 400
+
+    skipped_ids: list[int] = []
+    action_errors: list[str] = []
+    for item in items:
+        try:
+            preview_path = ensure_drive_item_preview(item)
+            recycle_folder_id = ensure_recycle_folder(
+                client=client,
+                source_root_folder_id=item["source_root_folder_id"],
+                session_id=session_id,
+                source_folder_id=item["source_folder_id"],
+                source_folder_name=item["source_folder_name"],
+            )
+            recycle_name = (
+                f"{Path(item['source_file_name']).stem}_segment_{item['segment_id']}_skipped.jpg"
+            )
+            recycled = client.upload_file(
+                preview_path,
+                recycle_folder_id,
+                file_name=recycle_name,
+                mime_type="image/jpeg",
+            )
+            queue_store.update_item_after_skip(
+                session_id=session_id,
+                item_id=item["id"],
+                recycle_file_id=recycled["id"],
+            )
+            queue_store.log_action(
+                session_id=session_id,
+                queue_item_id=item["id"],
+                action_type="skip",
+                prev_status=item["status"],
+                new_status="skipped",
+                prev_label=item.get("label"),
+                new_label=None,
+                moved_file_id=recycled["id"],
+            )
+            skipped_ids.append(item["id"])
+            ensure_source_image_processed_if_complete(session_id, item)
+        except (DriveClientError, SegmentCropError, OSError, ValueError) as exc:
+            action_errors.append(f"Item {item['id']}: {exc}")
+
+    return jsonify(
+        {
+            "success": True,
+            "skipped_item_ids": skipped_ids,
+            "requested_count": len(item_ids),
+            "processed_count": len(skipped_ids),
+            "errors": action_errors,
+            "stats": queue_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/drive/session/<session_id>/undo", methods=["POST"])
+def drive_undo_last_action(session_id: str):
+    """Undo the most recent non-undone label/skip action in a session."""
+    session = queue_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    action = queue_store.get_last_action(session_id)
+    if not action:
+        return jsonify({"error": "No action available to undo"}), 400
+
+    item = queue_store.get_item(session_id, int(action["queue_item_id"]))
+    if not item:
+        queue_store.mark_action_undone(int(action["id"]))
+        return jsonify({"error": "Original queue item not found for undo"}), 400
+
+    try:
+        client = get_drive_client()
+        if action.get("moved_file_id"):
+            # Reverting an action removes the uploaded artifact for that action.
+            try:
+                client.delete_file(action["moved_file_id"])
+            except DriveClientError:
+                # File may already be removed manually; keep undo idempotent.
+                pass
+
+        queue_store.restore_item(
+            session_id=session_id,
+            item_id=item["id"],
+            status=action.get("prev_status") or "pending",
+            label=action.get("prev_label"),
+        )
+        queue_store.mark_action_undone(int(action["id"]))
+
+        if (action.get("prev_status") or "pending") == "pending":
+            maybe_restore_source_image_to_active(session_id, item)
+    except DriveClientError as exc:
+        return jsonify({"error": f"Undo failed: {exc}"}), 500
+
+    return jsonify(
+        {
+            "success": True,
+            "undone_action_id": action["id"],
+            "item_id": item["id"],
+            "stats": queue_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/drive/session/<session_id>/stats", methods=["GET"])
+def drive_session_stats(session_id: str):
+    session = queue_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    return jsonify(
+        {
+            "success": True,
+            "session_id": session_id,
+            "mode": session["mode"],
+            "stats": queue_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/video-review/session/start", methods=["POST"])
+def video_review_start_session():
+    payload = request.get_json(silent=True) or {}
+    batch_limit = normalize_batch_limit(payload.get("batch_limit"), default=VIDEO_REVIEW_BATCH_LIMIT_DEFAULT)
+
+    try:
+        client = get_drive_client()
+    except DriveClientError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    supplied_folder_id = payload.get("review_root_folder_id") or DRIVE_REVIEW_QUEUE_ROOT_ID or DRIVE_PROJECT_ROOT_FOLDER_ID
+    if not supplied_folder_id:
+        return jsonify({"error": "review_root_folder_id or DRIVE_PROJECT_ROOT_FOLDER_ID is required"}), 400
+
+    try:
+        supplied_meta = client.get_file(supplied_folder_id)
+        supplied_name = str(supplied_meta.get("name", "")).strip().lower()
+    except DriveClientError as exc:
+        return jsonify({"error": f"Could not read supplied folder: {exc}"}), 500
+
+    try:
+        if supplied_name == "review_queue":
+            review_root_folder_id = supplied_folder_id
+        else:
+            review_root_folder_id = client.ensure_subfolder(supplied_folder_id, "review_queue")
+
+        session_id = str(uuid.uuid4())[:12]
+        roots = ensure_review_roots(client, review_root_folder_id)
+        video_review_store.create_session(
+            session_id=session_id,
+            review_root_folder_id=review_root_folder_id,
+            pending_root_folder_id=roots["pending"],
+            batch_limit=batch_limit,
+        )
+        inserted = 0
+        errors: list[str] = []
+        if not database_enabled():
+            inserted, errors, _ = index_review_samples(client, video_review_store, session_id, review_root_folder_id)
+        else:
+            inserted = int(video_review_store.get_stats(session_id)["status_counts"]["pending"])
+        return jsonify(
+            {
+                "success": True,
+                "session_id": session_id,
+                "review_root_folder_id": review_root_folder_id,
+                "pending_root_folder_id": roots["pending"],
+                "queue_items_created": inserted,
+                "batch_limit": batch_limit,
+                "errors": errors,
+                "stats": video_review_store.get_stats(session_id),
+            }
+        )
+    except DriveClientError as exc:
+        return jsonify({"error": f"Drive setup failed: {exc}"}), 500
+    except Exception as exc:
+        app.logger.exception("Video review session start failed")
+        return jsonify({"error": f"Video review session start failed: {exc}"}), 500
+
+
+@app.route("/api/video-review/session/<session_id>/batch", methods=["GET"])
+def video_review_get_batch(session_id: str):
+    session = video_review_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    index_errors: list[str] = []
+    if not database_enabled():
+        try:
+            client = get_drive_client()
+            _, index_errors, _ = index_review_samples(
+                client,
+                video_review_store,
+                session_id,
+                session["review_root_folder_id"],
+            )
+        except DriveClientError as exc:
+            return jsonify({"error": f"Could not refresh review queue: {exc}"}), 500
+
+    limit = normalize_batch_limit(
+        request.args.get("limit"),
+        default=int(session.get("batch_limit") or VIDEO_REVIEW_BATCH_LIMIT_DEFAULT),
+    )
+    try:
+        cursor = int(request.args.get("cursor", 0))
+    except ValueError:
+        cursor = 0
+
+    items = video_review_store.get_pending_batch(session_id, limit, cursor)
+    batch_items = []
+    errors: list[str] = []
+    for item in items:
+        try:
+            ensure_video_review_cached_sample(item)
+        except (DriveClientError, OSError, ValueError) as exc:
+            errors.append(f"Item {item['id']}: {exc}")
+            continue
+
+        sample = item["sample"]
+        batch_items.append(
+            {
+                "id": item["id"],
+                "sample_id": sample["sample_id"],
+                "camera_id": sample["source_video"]["camera_id"],
+                "video_name": sample["source_video"]["video_name"],
+                "table_track_id": sample["table"]["table_track_id"],
+                "anchor_time_seconds": sample["timing"]["anchor_time_seconds"],
+                "associated_people_count": len(sample.get("people", [])),
+                "preview_urls": {
+                    kind: f"/api/video-review/session/{session_id}/preview/{item['id']}/{kind}"
+                    for kind in ("anchor", "t_minus_10", "t_minus_20")
+                },
+            }
+        )
+
+    next_cursor = batch_items[-1]["id"] if batch_items else cursor
+    has_more = video_review_store.has_pending_after(session_id, next_cursor)
+    return jsonify(
+        {
+            "success": True,
+            "items": batch_items,
+            "count": len(batch_items),
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "errors": index_errors + errors,
+            "stats": video_review_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/video-review/session/<session_id>/preview/<int:item_id>/<kind>", methods=["GET"])
+def video_review_preview(session_id: str, item_id: int, kind: str):
+    item = video_review_store.get_item(session_id, item_id)
+    if not item:
+        return jsonify({"error": "Queue item not found"}), 404
+
+    try:
+        preview_path = video_review_preview_path(item, kind)
+    except (DriveClientError, OSError, ValueError) as exc:
+        return jsonify({"error": f"Could not load preview: {exc}"}), 500
+
+    return send_file(preview_path, mimetype="image/jpeg")
+
+
+@app.route("/api/video-review/session/<session_id>/debug/<int:item_id>", methods=["GET"])
+def video_review_debug_item(session_id: str, item_id: int):
+    session = video_review_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    item = video_review_store.get_item(session_id, item_id)
+    if not item:
+        return jsonify({"error": "Queue item not found"}), 404
+
+    try:
+        sample_dir = ensure_video_review_cached_sample(item)
+        sample_payload = load_sample_payload(sample_dir)
+        debug_payload = describe_sample_exports(sample_dir, sample_payload, get_video_review_output_roots())
+    except (DriveClientError, OSError, ValueError) as exc:
+        return jsonify({"error": f"Could not build debug preview: {exc}"}), 500
+
+    return jsonify(
+        {
+            "success": True,
+            "item_id": item_id,
+            "sample": debug_payload,
+        }
+    )
+
+
+@app.route("/api/video-review/session/<session_id>/label", methods=["POST"])
+def video_review_label_items(session_id: str):
+    session = video_review_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    label = str(payload.get("label", "")).strip().lower()
+    if label not in HUMAN_LABELS:
+        return jsonify({"error": f"Invalid label '{label}'"}), 400
+
+    try:
+        item_ids = [int(item_id) for item_id in payload.get("item_ids", [])]
+    except (TypeError, ValueError):
+        return jsonify({"error": "item_ids must be an array of integers"}), 400
+
+    if not item_ids:
+        return jsonify({"error": "No item_ids provided"}), 400
+
+    items = video_review_store.get_items(session_id, item_ids, status="pending")
+    if not items:
+        return jsonify({"error": "No pending items found for supplied item_ids"}), 400
+
+    processed_ids: list[int] = []
+    action_errors: list[str] = []
+    for item in items:
+        try:
+            video_review_store.label_item_optimistic(
+                session_id=session_id,
+                item_id=item["id"],
+                label=label,
+            )
+            video_review_store.log_action(
+                session_id=session_id,
+                queue_item_id=item["id"],
+                action_type="label",
+                prev_status=item["status"],
+                new_status="labeled",
+                prev_label=item.get("label"),
+                new_label=label,
+                exported_folder_ids=[],
+                moved_folder_id=item["sample_folder_id"],
+                archive_parent_folder_id=None,
+            )
+            processed_ids.append(item["id"])
+        except Exception as exc:
+            action_errors.append(f"Item {item['id']}: {exc}")
+
+    return jsonify(
+        {
+            "success": True,
+            "labeled_item_ids": processed_ids,
+            "requested_count": len(item_ids),
+            "processed_count": len(processed_ids),
+            "errors": action_errors,
+            "stats": video_review_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/video-review/session/<session_id>/skip", methods=["POST"])
+def video_review_skip_items(session_id: str):
+    session = video_review_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        item_ids = [int(item_id) for item_id in payload.get("item_ids", [])]
+    except (TypeError, ValueError):
+        return jsonify({"error": "item_ids must be an array of integers"}), 400
+
+    if not item_ids:
+        return jsonify({"error": "No item_ids provided"}), 400
+
+    try:
+        client = get_drive_client()
+    except DriveClientError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    items = video_review_store.get_items(session_id, item_ids, status="pending")
+    if not items:
+        return jsonify({"error": "No pending items found for supplied item_ids"}), 400
+
+    roots = ensure_review_roots(client, session["review_root_folder_id"])
+    skipped_ids: list[int] = []
+    action_errors: list[str] = []
+    for item in items:
+        try:
+            sample_dir = ensure_video_review_cached_sample(item)
+            sample_payload = load_sample_payload(sample_dir)
+            recycle_parent_folder_id = recycle_sample(
+                client,
+                roots,
+                sample_payload,
+                item["sample_folder_id"],
+                item["source_parent_folder_id"],
+                session_id,
+            )
+            video_review_store.update_item_after_skip(
+                session_id=session_id,
+                item_id=item["id"],
+                archived_parent_folder_id=recycle_parent_folder_id,
+            )
+            video_review_store.log_action(
+                session_id=session_id,
+                queue_item_id=item["id"],
+                action_type="skip",
+                prev_status=item["status"],
+                new_status="skipped",
+                prev_label=item.get("label"),
+                new_label=None,
+                exported_folder_ids=[],
+                moved_folder_id=item["sample_folder_id"],
+                archive_parent_folder_id=recycle_parent_folder_id,
+            )
+            skipped_ids.append(item["id"])
+        except (DriveClientError, OSError, ValueError) as exc:
+            action_errors.append(f"Item {item['id']}: {exc}")
+
+    return jsonify(
+        {
+            "success": True,
+            "skipped_item_ids": skipped_ids,
+            "requested_count": len(item_ids),
+            "processed_count": len(skipped_ids),
+            "errors": action_errors,
+            "stats": video_review_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/video-review/session/<session_id>/trash", methods=["POST"])
+def video_review_trash_items(session_id: str):
+    session = video_review_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        item_ids = [int(item_id) for item_id in payload.get("item_ids", [])]
+    except (TypeError, ValueError):
+        return jsonify({"error": "item_ids must be an array of integers"}), 400
+
+    if not item_ids:
+        return jsonify({"error": "No item_ids provided"}), 400
+
+    try:
+        client = get_drive_client()
+    except DriveClientError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    items = video_review_store.get_items(session_id, item_ids, status="pending")
+    if not items:
+        return jsonify({"error": "No pending items found for supplied item_ids"}), 400
+
+    trashed_ids: list[int] = []
+    action_errors: list[str] = []
+    for item in items:
+        try:
+            client.trash_file(item["sample_folder_id"])
+            video_review_store.update_item_after_trash(session_id=session_id, item_id=item["id"])
+            video_review_store.log_action(
+                session_id=session_id,
+                queue_item_id=item["id"],
+                action_type="trash",
+                prev_status=item["status"],
+                new_status="trashed",
+                prev_label=item.get("label"),
+                new_label=None,
+                exported_folder_ids=[],
+                moved_folder_id=item["sample_folder_id"],
+                archive_parent_folder_id=None,
+            )
+            trashed_ids.append(item["id"])
+        except DriveClientError as exc:
+            action_errors.append(f"Item {item['id']}: {exc}")
+
+    return jsonify(
+        {
+            "success": True,
+            "trashed_item_ids": trashed_ids,
+            "requested_count": len(item_ids),
+            "processed_count": len(trashed_ids),
+            "errors": action_errors,
+            "stats": video_review_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/video-review/session/<session_id>/undo", methods=["POST"])
+def video_review_undo_last_action(session_id: str):
+    session = video_review_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    action = video_review_store.get_last_action(session_id)
+    if not action:
+        return jsonify({"error": "No action available to undo"}), 400
+
+    item = video_review_store.get_item(session_id, int(action["queue_item_id"]))
+    if not item:
+        video_review_store.mark_action_undone(int(action["id"]))
+        return jsonify({"error": "Original queue item not found for undo"}), 400
+
+    try:
+        client = get_drive_client()
+        for folder_id in action.get("exported_folder_ids", []):
+            try:
+                client.delete_file(folder_id)
+            except DriveClientError:
+                continue
+
+        if action.get("new_label"):
+            sample_dir = ensure_video_review_cached_sample(item)
+            sample_payload = load_sample_payload(sample_dir)
+            undo_export_manifests(client, sample_payload, action["new_label"], get_video_review_output_roots())
+
+        if action.get("action_type") == "trash" and action.get("moved_folder_id"):
+            client.untrash_file(action["moved_folder_id"])
+        elif action.get("moved_folder_id") and action.get("archive_parent_folder_id"):
+            client.move_file(
+                action["moved_folder_id"],
+                new_parent_id=item["source_parent_folder_id"],
+                remove_parent_id=action["archive_parent_folder_id"],
+            )
+
+        video_review_store.restore_item(
+            session_id=session_id,
+            item_id=item["id"],
+            status=action.get("prev_status") or "pending",
+            label=action.get("prev_label"),
+        )
+        video_review_store.mark_action_undone(int(action["id"]))
+    except DriveClientError as exc:
+        return jsonify({"error": f"Undo failed: {exc}"}), 500
+
+    return jsonify(
+        {
+            "success": True,
+            "undone_action_id": action["id"],
+            "item_id": item["id"],
+            "stats": video_review_store.get_stats(session_id),
+        }
+    )
+
+
+@app.route("/api/video-review/session/<session_id>/stats", methods=["GET"])
+def video_review_session_stats(session_id: str):
+    session = video_review_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    return jsonify(
+        {
+            "success": True,
+            "session_id": session_id,
+            "stats": video_review_store.get_stats(session_id),
+        }
+    )
 
 
 @app.route("/upload", methods=["POST"])
@@ -490,7 +1762,7 @@ def upload():
 def get_cameras():
     """Return list of available cameras."""
     cameras = []
-    for camera_id, config in CAMERA_CONFIGS.items():
+    for camera_id, config in iter_camera_configs():
         cameras.append({
             "id": camera_id,
             "name": f"Camera {camera_id.replace('IPC', '')}",
@@ -780,6 +2052,7 @@ def download_frames(job_id: str):
     )
 
 
+@app.route("/legacy/label/<job_id>")
 @app.route("/label/<job_id>")
 def label_page(job_id: str):
     """Serve labeling interface for a frame extraction job."""
@@ -880,13 +2153,119 @@ def download_labeled(job_id: str):
     )
 
 
+@app.route("/legacy/api/export-labeled-to-drive/<job_id>", methods=["POST"])
+def export_labeled_to_drive(job_id: str):
+    """
+    Export final legacy labeled frames to Drive.
+
+    Upload scope intentionally excludes intermediate artifacts.
+    """
+    data = request.get_json(silent=True) or {}
+    labels = data.get("labels", {})
+    if not isinstance(labels, dict) or not labels:
+        return jsonify({"error": "labels payload is required"}), 400
+
+    if not LEGACY_DRIVE_EXPORT_ROOT_ID:
+        return jsonify(
+            {
+                "error": (
+                    "DRIVE_OUTPUT_ROOT_MULTICLASS_FOLDER_ID is not configured. "
+                    "Set it before using legacy Drive export."
+                )
+            }
+        ), 500
+
+    job_folder = FRAMES_FOLDER / job_id
+    if not job_folder.exists():
+        return jsonify({"error": "Job not found"}), 404
+
+    try:
+        client = get_drive_client()
+    except DriveClientError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    try:
+        exports_root_id = client.ensure_subfolder(LEGACY_DRIVE_EXPORT_ROOT_ID, "legacy_exports")
+        job_export_folder_id = client.ensure_subfolder(exports_root_id, f"job_{job_id}")
+    except DriveClientError as exc:
+        return jsonify({"error": f"Failed to create export folders: {exc}"}), 500
+
+    uploaded_count = 0
+    upload_errors: list[str] = []
+    counts = {"clean": 0, "occupied": 0, "dirty": 0}
+
+    for relative_path, label in labels.items():
+        if label not in counts:
+            upload_errors.append(f"Unsupported label '{label}' for {relative_path}")
+            continue
+
+        frame_path = job_folder / relative_path
+        if not frame_path.exists():
+            upload_errors.append(f"Missing frame file: {relative_path}")
+            continue
+
+        parts = relative_path.split("/")
+        if len(parts) >= 2:
+            folder_name = parts[0].replace("_frames", "")
+            file_name = parts[-1]
+            upload_name = f"{folder_name}_{file_name}"
+        else:
+            upload_name = frame_path.name
+
+        try:
+            label_folder_id = client.ensure_subfolder(job_export_folder_id, label)
+            client.upload_file(
+                frame_path,
+                label_folder_id,
+                file_name=upload_name,
+                mime_type="image/jpeg",
+            )
+            uploaded_count += 1
+            counts[label] += 1
+        except DriveClientError as exc:
+            upload_errors.append(f"{relative_path}: {exc}")
+
+    metadata = {
+        "job_id": job_id,
+        "labels": labels,
+        "counts": counts,
+        "uploaded_count": uploaded_count,
+        "requested_count": len(labels),
+        "errors": upload_errors,
+    }
+
+    try:
+        client.upload_bytes(
+            json.dumps(metadata, indent=2).encode("utf-8"),
+            parent_id=job_export_folder_id,
+            file_name=f"labels_{job_id}.json",
+            mime_type="application/json",
+        )
+    except DriveClientError as exc:
+        upload_errors.append(f"Failed to upload labels metadata JSON: {exc}")
+
+    return jsonify(
+        {
+            "success": True,
+            "job_id": job_id,
+            "uploaded_count": uploaded_count,
+            "requested_count": len(labels),
+            "counts": counts,
+            "errors": upload_errors,
+        }
+    )
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("Video Table Cropper")
     print("=" * 50)
     print(f"Upload folder: {UPLOAD_FOLDER}")
+    port = int(os.environ.get("PORT", 8080))
+    debug = env_flag("FLASK_DEBUG", default=False)
+    use_reloader = env_flag("FLASK_USE_RELOADER", default=False)
     print(f"Output folder: {OUTPUT_FOLDER}")
     print()
-    print("Open http://localhost:8080 in your browser")
+    print(f"Open http://localhost:{port} in your browser")
     print("=" * 50)
-    app.run(debug=True, port=8080)
+    app.run(debug=debug, host="0.0.0.0", port=port, use_reloader=use_reloader)

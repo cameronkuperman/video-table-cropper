@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ mode_title }} - Drive Labeling</title>
+    <link rel="stylesheet" href="/static/style.css?v=6">
+    <style>
+        .page {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .nav a {
+            text-decoration: none;
+            color: #ddd;
+            background: #1f2a44;
+            padding: 10px 14px;
+            border-radius: 8px;
+        }
+
+        .nav a.active {
+            background: #2d6cdf;
+            color: #fff;
+        }
+
+        .panel {
+            background: #152037;
+            border: 1px solid #2f3f62;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .panel h3 {
+            margin: 0 0 12px;
+        }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .form-grid .full {
+            grid-column: 1 / -1;
+        }
+
+        label {
+            display: block;
+            font-size: 13px;
+            color: #b7c3de;
+            margin-bottom: 6px;
+        }
+
+        input,
+        textarea {
+            width: 100%;
+            background: #0f1729;
+            color: #fff;
+            border: 1px solid #38486e;
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 14px;
+        }
+
+        textarea {
+            min-height: 80px;
+            resize: vertical;
+        }
+
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .btn {
+            border: none;
+            border-radius: 8px;
+            padding: 10px 14px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        .btn.primary {
+            background: #2d6cdf;
+            color: #fff;
+        }
+
+        .btn.secondary {
+            background: #2f3f62;
+            color: #fff;
+        }
+
+        .btn.warn {
+            background: #9e4a25;
+            color: #fff;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            font-size: 14px;
+            color: #b7c3de;
+        }
+
+        .badge {
+            background: #1f2a44;
+            border-radius: 999px;
+            padding: 6px 10px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .item {
+            background: #0f1729;
+            border: 2px solid #27375c;
+            border-radius: 10px;
+            overflow: hidden;
+            cursor: pointer;
+        }
+
+        .item.selected {
+            border-color: #44d37e;
+            box-shadow: 0 0 0 2px rgba(68, 211, 126, 0.25);
+        }
+
+        .item img {
+            width: 100%;
+            display: block;
+            aspect-ratio: 4 / 3;
+            object-fit: cover;
+            background: #101625;
+        }
+
+        .item .meta {
+            padding: 8px;
+            font-size: 12px;
+            color: #c5d1e7;
+            line-height: 1.4;
+        }
+
+        .status-line {
+            margin-top: 8px;
+            font-size: 13px;
+            color: #9fb0d0;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="page">
+        <div class="nav">
+            <a href="/">Drive Home</a>
+            <a href="/drive/binary" class="{{ 'active' if mode == 'dirty_clean' else '' }}">Dirty/Clean</a>
+            <a href="/drive/multiclass" class="{{ 'active' if mode == 'dirty_clean_occupied' else '' }}">Multiclass</a>
+            {% if show_extended_nav %}
+            <a href="/legacy">Legacy Video</a>
+            {% endif %}
+        </div>
+
+        <h1>{{ mode_title }}</h1>
+        <p class="subtitle">Source folders + <code>segment.json</code> are indexed into a 200-item queue.</p>
+
+        <div class="panel">
+            <h3>Session Setup</h3>
+            <div class="form-grid">
+                <div>
+                    <label for="source-parent">Source Parent Folder ID (optional)</label>
+                    <input id="source-parent" value="{{ default_source_root }}" placeholder="Drive folder ID">
+                </div>
+                <div>
+                    <label for="batch-limit">Batch Limit</label>
+                    <input id="batch-limit" type="number" min="1" max="500" value="{{ default_batch_limit }}">
+                </div>
+                <div class="full">
+                    <label for="source-folder-ids">Additional Source Folder IDs (newline or comma separated)</label>
+                    <textarea id="source-folder-ids" placeholder="folder_id_1\nfolder_id_2"></textarea>
+                </div>
+            </div>
+            <div class="actions">
+                <button id="start-session" class="btn primary">Start Session</button>
+                <span id="session-id" class="badge">No active session</span>
+            </div>
+            <div id="setup-status" class="status-line"></div>
+        </div>
+
+        <div class="panel">
+            <h3>Labeling</h3>
+            <div class="actions" id="label-actions"></div>
+            <div class="actions">
+                <button id="skip-selected" class="btn warn" disabled>Skip Selected</button>
+                <button id="undo-action" class="btn secondary" disabled>Undo Last Action</button>
+                <button id="load-more" class="btn secondary" disabled>Load More</button>
+                <span id="selected-count" class="badge">0 selected</span>
+            </div>
+            <div class="stats" id="stats"></div>
+            <div id="batch-status" class="status-line"></div>
+            <div id="items-grid" class="grid"></div>
+        </div>
+    </div>
+
+    <script>
+        const mode = {{ mode | tojson }};
+        const labels = {{ labels | tojson }};
+        const defaultSourceRoot = {{ default_source_root | tojson }};
+
+        let sessionId = null;
+        let cursor = 0;
+        let hasMore = false;
+        let currentBatchLimit = parseInt(document.getElementById('batch-limit').value || '200', 10);
+        const selected = new Set();
+
+        const startBtn = document.getElementById('start-session');
+        const sessionIdEl = document.getElementById('session-id');
+        const setupStatus = document.getElementById('setup-status');
+        const batchStatus = document.getElementById('batch-status');
+        const grid = document.getElementById('items-grid');
+        const selectedCountEl = document.getElementById('selected-count');
+        const statsEl = document.getElementById('stats');
+        const loadMoreBtn = document.getElementById('load-more');
+        const skipBtn = document.getElementById('skip-selected');
+        const undoBtn = document.getElementById('undo-action');
+
+        const labelActions = document.getElementById('label-actions');
+        labels.forEach((label) => {
+            const button = document.createElement('button');
+            button.className = 'btn primary';
+            button.textContent = `Label as ${label}`;
+            button.disabled = true;
+            button.dataset.label = label;
+            button.addEventListener('click', () => applyLabel(label));
+            labelActions.appendChild(button);
+        });
+
+        function setStatus(el, message) {
+            el.textContent = message || '';
+        }
+
+        function parseFolderIds(raw) {
+            if (!raw) return [];
+            return raw
+                .replaceAll(',', '\n')
+                .split('\n')
+                .map((v) => v.trim())
+                .filter(Boolean);
+        }
+
+        function updateActionButtons() {
+            const hasSelection = selected.size > 0;
+            selectedCountEl.textContent = `${selected.size} selected`;
+            document.querySelectorAll('#label-actions button').forEach((btn) => {
+                btn.disabled = !hasSelection || !sessionId;
+            });
+            skipBtn.disabled = !hasSelection || !sessionId;
+            undoBtn.disabled = !sessionId;
+            loadMoreBtn.disabled = !sessionId || !hasMore;
+        }
+
+        function renderStats(statsPayload) {
+            if (!statsPayload || !statsPayload.status_counts) {
+                statsEl.innerHTML = '';
+                return;
+            }
+            const status = statsPayload.status_counts;
+            const labelCounts = statsPayload.label_counts || {};
+            const labelParts = Object.keys(labelCounts)
+                .sort()
+                .map((key) => `${key}: ${labelCounts[key]}`)
+                .join(' | ');
+
+            statsEl.innerHTML = `
+                <span class="badge">Total: ${statsPayload.total}</span>
+                <span class="badge">Pending: ${status.pending || 0}</span>
+                <span class="badge">Labeled: ${status.labeled || 0}</span>
+                <span class="badge">Skipped: ${status.skipped || 0}</span>
+                <span class="badge">Label Counts: ${labelParts || 'none'}</span>
+            `;
+        }
+
+        function appendItems(items) {
+            items.forEach((item) => {
+                const card = document.createElement('div');
+                card.className = 'item';
+                card.dataset.id = String(item.id);
+                card.innerHTML = `
+                    <img src="${item.image_url}" alt="Segment ${item.segment_id}">
+                    <div class="meta">
+                        <div><strong>File:</strong> ${item.source_file_name}</div>
+                        <div><strong>Folder:</strong> ${item.source_folder_name}</div>
+                        <div><strong>Segment:</strong> ${item.segment_id}</div>
+                    </div>
+                `;
+
+                card.addEventListener('click', () => {
+                    const id = parseInt(card.dataset.id, 10);
+                    if (selected.has(id)) {
+                        selected.delete(id);
+                        card.classList.remove('selected');
+                    } else {
+                        selected.add(id);
+                        card.classList.add('selected');
+                    }
+                    updateActionButtons();
+                });
+
+                grid.appendChild(card);
+            });
+        }
+
+        function removeCards(itemIds) {
+            itemIds.forEach((itemId) => {
+                const card = grid.querySelector(`.item[data-id="${itemId}"]`);
+                if (card) card.remove();
+                selected.delete(itemId);
+            });
+            updateActionButtons();
+        }
+
+        async function fetchStats() {
+            if (!sessionId) return;
+            const response = await fetch(`/api/drive/session/${sessionId}/stats`);
+            const payload = await response.json();
+            if (payload.success) renderStats(payload.stats);
+        }
+
+        async function loadBatch(reset = false) {
+            if (!sessionId) return;
+            if (reset) {
+                cursor = 0;
+                grid.innerHTML = '';
+                selected.clear();
+                updateActionButtons();
+            }
+
+            setStatus(batchStatus, 'Loading batch...');
+            const response = await fetch(`/api/drive/session/${sessionId}/batch?cursor=${cursor}&limit=${currentBatchLimit}`);
+            const payload = await response.json();
+
+            if (!payload.success) {
+                setStatus(batchStatus, payload.error || 'Failed to load batch');
+                return;
+            }
+
+            appendItems(payload.items || []);
+            cursor = payload.next_cursor || cursor;
+            hasMore = !!payload.has_more;
+            updateActionButtons();
+            renderStats(payload.stats);
+
+            const errorsText = (payload.errors || []).join(' | ');
+            const line = [`Loaded ${payload.count} item(s).`, hasMore ? 'More available.' : 'No more pending items.'];
+            if (errorsText) line.push(`Preview issues: ${errorsText}`);
+            setStatus(batchStatus, line.join(' '));
+        }
+
+        async function startSession({ auto = false } = {}) {
+            const sourceParent = document.getElementById('source-parent').value.trim();
+            const sourceFolderIds = parseFolderIds(document.getElementById('source-folder-ids').value);
+            currentBatchLimit = parseInt(document.getElementById('batch-limit').value || '200', 10);
+
+            setStatus(setupStatus, auto ? 'Auto-discovering folders and creating session...' : 'Creating session...');
+            startBtn.disabled = true;
+
+            try {
+                const response = await fetch('/api/drive/session/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        mode,
+                        source_parent_folder_id: sourceParent || null,
+                        source_folder_ids: sourceFolderIds,
+                        batch_limit: currentBatchLimit,
+                    }),
+                });
+                const payload = await response.json();
+
+                if (!payload.success) {
+                    setStatus(setupStatus, payload.error || 'Failed to create session');
+                    return;
+                }
+
+                sessionId = payload.session_id;
+                sessionIdEl.textContent = `Session: ${sessionId}`;
+                renderStats(payload.stats);
+
+                const errorsText = (payload.errors || []).join(' | ');
+                const statusLine = `Session ready. Queue items: ${payload.queue_items_created}.` +
+                    (errorsText ? ` Warnings: ${errorsText}` : '');
+                setStatus(setupStatus, statusLine);
+
+                await loadBatch(true);
+                updateActionButtons();
+            } catch (error) {
+                setStatus(setupStatus, `Error: ${error.message}`);
+            } finally {
+                startBtn.disabled = false;
+            }
+        }
+
+        async function applyLabel(label) {
+            if (!sessionId || selected.size === 0) return;
+            const itemIds = Array.from(selected);
+            setStatus(batchStatus, `Applying label '${label}' to ${itemIds.length} item(s)...`);
+
+            const response = await fetch(`/api/drive/session/${sessionId}/label`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ label, item_ids: itemIds }),
+            });
+            const payload = await response.json();
+
+            if (!payload.success) {
+                setStatus(batchStatus, payload.error || 'Label request failed');
+                return;
+            }
+
+            removeCards(payload.labeled_item_ids || []);
+            renderStats(payload.stats);
+
+            const errorsText = (payload.errors || []).join(' | ');
+            const msg = `Labeled ${payload.processed_count}/${payload.requested_count}.` +
+                (errorsText ? ` Errors: ${errorsText}` : '');
+            setStatus(batchStatus, msg);
+        }
+
+        async function skipSelected() {
+            if (!sessionId || selected.size === 0) return;
+            const itemIds = Array.from(selected);
+            setStatus(batchStatus, `Skipping ${itemIds.length} item(s)...`);
+
+            const response = await fetch(`/api/drive/session/${sessionId}/skip`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ item_ids: itemIds }),
+            });
+            const payload = await response.json();
+
+            if (!payload.success) {
+                setStatus(batchStatus, payload.error || 'Skip request failed');
+                return;
+            }
+
+            removeCards(payload.skipped_item_ids || []);
+            renderStats(payload.stats);
+
+            const errorsText = (payload.errors || []).join(' | ');
+            const msg = `Skipped ${payload.processed_count}/${payload.requested_count}.` +
+                (errorsText ? ` Errors: ${errorsText}` : '');
+            setStatus(batchStatus, msg);
+        }
+
+        async function undoLastAction() {
+            if (!sessionId) return;
+            setStatus(batchStatus, 'Undoing last action...');
+
+            const response = await fetch(`/api/drive/session/${sessionId}/undo`, {
+                method: 'POST',
+            });
+            const payload = await response.json();
+
+            if (!payload.success) {
+                setStatus(batchStatus, payload.error || 'Undo failed');
+                return;
+            }
+
+            renderStats(payload.stats);
+            setStatus(batchStatus, `Undid action ${payload.undone_action_id}. Reloading batch...`);
+            await loadBatch(true);
+        }
+
+        startBtn.addEventListener('click', () => startSession());
+        loadMoreBtn.addEventListener('click', () => loadBatch(false));
+        skipBtn.addEventListener('click', skipSelected);
+        undoBtn.addEventListener('click', undoLastAction);
+
+        updateActionButtons();
+
+        // Auto-start for maximum automation when a default source root is configured.
+        if (defaultSourceRoot) {
+            startSession({ auto: true });
+        }
+    </script>
+</body>
+
+</html>

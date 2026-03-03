@@ -1,0 +1,17 @@
+.git/
+__pycache__/
+*.py[cod]
+venv/
+.env
+uploads/
+output/
+frames/
+worker_cache/
+drive_cache/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+.vscode/
+.idea/
+.claude/

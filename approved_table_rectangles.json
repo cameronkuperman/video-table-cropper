@@ -1,0 +1,2490 @@
+{
+  "exported_at": "2026-03-03T07:02:15.953966+00:00",
+  "export_type": "rectangles_only",
+  "cameras": [
+    {
+      "camera_id": "mock-1",
+      "camera_name": "Mimosas IPC3",
+      "camera_number": 3,
+      "source_image": "Mimosas IPC3",
+      "image_width": 1280,
+      "image_height": 720,
+      "expansion_strength": 4.5,
+      "tables": [
+        {
+          "mask_id": 0,
+          "label": "table top_1",
+          "color": "#ff3b30",
+          "score": 0.9697,
+          "bbox": [
+            330,
+            459,
+            493,
+            260
+          ],
+          "tight_rect": {
+            "center_x": 575.2,
+            "center_y": 618.4,
+            "width_px": 451.4,
+            "height_px": 186.3,
+            "angle_deg": -149.9,
+            "polygon": [
+              [
+                724,
+                812
+              ],
+              [
+                333,
+                586
+              ],
+              [
+                427,
+                425
+              ],
+              [
+                817,
+                651
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 579.1,
+            "center_y": 620.6,
+            "width_px": 609.0,
+            "height_px": 458.1,
+            "angle_deg": -149.9,
+            "polygon": [
+              [
+                728,
+                972
+              ],
+              [
+                201,
+                666
+              ],
+              [
+                431,
+                270
+              ],
+              [
+                957,
+                575
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 1,
+          "label": "table top_2",
+          "color": "#34c759",
+          "score": 0.9512,
+          "bbox": [
+            178,
+            259,
+            216,
+            155
+          ],
+          "tight_rect": {
+            "center_x": 285.3,
+            "center_y": 329.4,
+            "width_px": 206.5,
+            "height_px": 79.8,
+            "angle_deg": -38.3,
+            "polygon": [
+              [
+                180,
+                362
+              ],
+              [
+                342,
+                234
+              ],
+              [
+                391,
+                297
+              ],
+              [
+                229,
+                425
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 285.3,
+            "center_y": 329.4,
+            "width_px": 282.7,
+            "height_px": 204.0,
+            "angle_deg": -38.3,
+            "polygon": [
+              [
+                111,
+                337
+              ],
+              [
+                333,
+                162
+              ],
+              [
+                459,
+                322
+              ],
+              [
+                238,
+                497
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 2,
+          "label": "table top_3",
+          "color": "#007aff",
+          "score": 0.9252,
+          "bbox": [
+            655,
+            251,
+            371,
+            190
+          ],
+          "tight_rect": {
+            "center_x": 846.0,
+            "center_y": 336.8,
+            "width_px": 348.2,
+            "height_px": 108.0,
+            "angle_deg": 21.5,
+            "polygon": [
+              [
+                704,
+                223
+              ],
+              [
+                1028,
+                350
+              ],
+              [
+                988,
+                451
+              ],
+              [
+                664,
+                323
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 846.0,
+            "center_y": 336.8,
+            "width_px": 419.7,
+            "height_px": 224.5,
+            "angle_deg": 21.5,
+            "polygon": [
+              [
+                692,
+                156
+              ],
+              [
+                1082,
+                309
+              ],
+              [
+                1000,
+                518
+              ],
+              [
+                610,
+                364
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 3,
+          "label": "table top_4",
+          "color": "#ff9500",
+          "score": 0.9499,
+          "bbox": [
+            814,
+            127,
+            253,
+            119
+          ],
+          "tight_rect": {
+            "center_x": 943.6,
+            "center_y": 182.0,
+            "width_px": 248.9,
+            "height_px": 54.9,
+            "angle_deg": 19.9,
+            "polygon": [
+              [
+                836,
+                114
+              ],
+              [
+                1070,
+                198
+              ],
+              [
+                1051,
+                250
+              ],
+              [
+                817,
+                166
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 943.6,
+            "center_y": 182.0,
+            "width_px": 317.8,
+            "height_px": 167.2,
+            "angle_deg": 19.9,
+            "polygon": [
+              [
+                823,
+                49
+              ],
+              [
+                1121,
+                157
+              ],
+              [
+                1065,
+                315
+              ],
+              [
+                766,
+                207
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 4,
+          "label": "table top_5",
+          "color": "#af52de",
+          "score": 0.9455,
+          "bbox": [
+            399,
+            119,
+            215,
+            74
+          ],
+          "tight_rect": {
+            "center_x": 504.3,
+            "center_y": 153.1,
+            "width_px": 202.0,
+            "height_px": 61.6,
+            "angle_deg": 12.0,
+            "polygon": [
+              [
+                412,
+                102
+              ],
+              [
+                610,
+                144
+              ],
+              [
+                597,
+                204
+              ],
+              [
+                399,
+                162
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 508.4,
+            "center_y": 154.0,
+            "width_px": 253.7,
+            "height_px": 159.5,
+            "angle_deg": 12.0,
+            "polygon": [
+              [
+                401,
+                50
+              ],
+              [
+                649,
+                102
+              ],
+              [
+                616,
+                258
+              ],
+              [
+                368,
+                206
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 5,
+          "label": "table top_6",
+          "color": "#5ac8fa",
+          "score": 0.9383,
+          "bbox": [
+            77,
+            211,
+            149,
+            110
+          ],
+          "tight_rect": {
+            "center_x": 151.6,
+            "center_y": 261.6,
+            "width_px": 152.8,
+            "height_px": 45.6,
+            "angle_deg": -36.8,
+            "polygon": [
+              [
+                77,
+                289
+              ],
+              [
+                199,
+                198
+              ],
+              [
+                226,
+                234
+              ],
+              [
+                104,
+                326
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 151.6,
+            "center_y": 261.6,
+            "width_px": 200.4,
+            "height_px": 123.3,
+            "angle_deg": -36.8,
+            "polygon": [
+              [
+                34,
+                272
+              ],
+              [
+                195,
+                152
+              ],
+              [
+                269,
+                251
+              ],
+              [
+                108,
+                371
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 7,
+          "label": "table top_8",
+          "color": "#ff2d55",
+          "score": 0.8812,
+          "bbox": [
+            273,
+            96,
+            152,
+            58
+          ],
+          "tight_rect": {
+            "center_x": 340.9,
+            "center_y": 121.9,
+            "width_px": 126.9,
+            "height_px": 55.6,
+            "angle_deg": 11.4,
+            "polygon": [
+              [
+                284,
+                82
+              ],
+              [
+                409,
+                107
+              ],
+              [
+                398,
+                162
+              ],
+              [
+                273,
+                137
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 340.4,
+            "center_y": 121.7,
+            "width_px": 159.5,
+            "height_px": 132.1,
+            "angle_deg": 11.4,
+            "polygon": [
+              [
+                275,
+                41
+              ],
+              [
+                432,
+                73
+              ],
+              [
+                406,
+                202
+              ],
+              [
+                249,
+                171
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 8,
+          "label": "table top_9",
+          "color": "#5856d6",
+          "score": 0.9071,
+          "bbox": [
+            24,
+            175,
+            109,
+            80
+          ],
+          "tight_rect": {
+            "center_x": 78.6,
+            "center_y": 213.4,
+            "width_px": 115.7,
+            "height_px": 33.0,
+            "angle_deg": -35.6,
+            "polygon": [
+              [
+                22,
+                234
+              ],
+              [
+                116,
+                166
+              ],
+              [
+                135,
+                193
+              ],
+              [
+                41,
+                260
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 80.9,
+            "center_y": 216.7,
+            "width_px": 151.4,
+            "height_px": 83.2,
+            "angle_deg": -35.6,
+            "polygon": [
+              [
+                -5,
+                227
+              ],
+              [
+                118,
+                139
+              ],
+              [
+                167,
+                206
+              ],
+              [
+                44,
+                295
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 9,
+          "label": "table top_10",
+          "color": "#00c7be",
+          "score": 0.8811,
+          "bbox": [
+            189,
+            87,
+            107,
+            43
+          ],
+          "tight_rect": {
+            "center_x": 236.0,
+            "center_y": 107.9,
+            "width_px": 85.9,
+            "height_px": 52.6,
+            "angle_deg": -32.7,
+            "polygon": [
+              [
+                186,
+                109
+              ],
+              [
+                258,
+                63
+              ],
+              [
+                286,
+                107
+              ],
+              [
+                214,
+                153
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 235.8,
+            "center_y": 108.0,
+            "width_px": 102.9,
+            "height_px": 104.6,
+            "angle_deg": -32.7,
+            "polygon": [
+              [
+                164,
+                92
+              ],
+              [
+                251,
+                36
+              ],
+              [
+                307,
+                124
+              ],
+              [
+                221,
+                180
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "camera_id": "mock-2",
+      "camera_name": "Mimosas IPC4",
+      "camera_number": 4,
+      "source_image": "Mimosas IPC4",
+      "image_width": 1280,
+      "image_height": 720,
+      "expansion_strength": 4.5,
+      "tables": [
+        {
+          "mask_id": 0,
+          "label": "table top_1",
+          "color": "#ff3b30",
+          "score": 0.9766,
+          "bbox": [
+            435,
+            492,
+            270,
+            202
+          ],
+          "tight_rect": {
+            "center_x": 570.3,
+            "center_y": 592.6,
+            "width_px": 260.1,
+            "height_px": 193.7,
+            "angle_deg": -1.2,
+            "polygon": [
+              [
+                438,
+                499
+              ],
+              [
+                698,
+                493
+              ],
+              [
+                702,
+                687
+              ],
+              [
+                442,
+                692
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 570.4,
+            "center_y": 595.5,
+            "width_px": 399.3,
+            "height_px": 417.7,
+            "angle_deg": -1.2,
+            "polygon": [
+              [
+                366,
+                391
+              ],
+              [
+                765,
+                382
+              ],
+              [
+                775,
+                800
+              ],
+              [
+                375,
+                809
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 2,
+          "label": "table top_3",
+          "color": "#007aff",
+          "score": 0.9545,
+          "bbox": [
+            414,
+            262,
+            191,
+            108
+          ],
+          "tight_rect": {
+            "center_x": 510.1,
+            "center_y": 315.8,
+            "width_px": 178.4,
+            "height_px": 113.1,
+            "angle_deg": -25.8,
+            "polygon": [
+              [
+                405,
+                304
+              ],
+              [
+                566,
+                226
+              ],
+              [
+                615,
+                328
+              ],
+              [
+                454,
+                406
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 511.8,
+            "center_y": 319.4,
+            "width_px": 259.6,
+            "height_px": 239.0,
+            "angle_deg": -25.8,
+            "polygon": [
+              [
+                343,
+                268
+              ],
+              [
+                577,
+                155
+              ],
+              [
+                681,
+                371
+              ],
+              [
+                447,
+                483
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 3,
+          "label": "table top_4",
+          "color": "#ff9500",
+          "score": 0.9594,
+          "bbox": [
+            782,
+            263,
+            178,
+            111
+          ],
+          "tight_rect": {
+            "center_x": 871.8,
+            "center_y": 321.0,
+            "width_px": 156.1,
+            "height_px": 123.9,
+            "angle_deg": -21.5,
+            "polygon": [
+              [
+                776,
+                292
+              ],
+              [
+                922,
+                235
+              ],
+              [
+                967,
+                350
+              ],
+              [
+                822,
+                407
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 871.8,
+            "center_y": 321.0,
+            "width_px": 238.7,
+            "height_px": 260.2,
+            "angle_deg": -21.5,
+            "polygon": [
+              [
+                713,
+                244
+              ],
+              [
+                935,
+                156
+              ],
+              [
+                1031,
+                398
+              ],
+              [
+                809,
+                486
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 4,
+          "label": "table top_5",
+          "color": "#af52de",
+          "score": 0.9596,
+          "bbox": [
+            123,
+            309,
+            147,
+            104
+          ],
+          "tight_rect": {
+            "center_x": 196.4,
+            "center_y": 360.5,
+            "width_px": 146.2,
+            "height_px": 84.8,
+            "angle_deg": -22.0,
+            "polygon": [
+              [
+                113,
+                349
+              ],
+              [
+                248,
+                294
+              ],
+              [
+                280,
+                372
+              ],
+              [
+                144,
+                427
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 196.4,
+            "center_y": 360.5,
+            "width_px": 215.3,
+            "height_px": 198.8,
+            "angle_deg": -22.0,
+            "polygon": [
+              [
+                59,
+                309
+              ],
+              [
+                259,
+                228
+              ],
+              [
+                333,
+                412
+              ],
+              [
+                134,
+                493
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 5,
+          "label": "table top_6",
+          "color": "#5ac8fa",
+          "score": 0.9422,
+          "bbox": [
+            347,
+            166,
+            146,
+            68
+          ],
+          "tight_rect": {
+            "center_x": 419.8,
+            "center_y": 200.5,
+            "width_px": 141.0,
+            "height_px": 58.7,
+            "angle_deg": -11.2,
+            "polygon": [
+              [
+                345,
+                185
+              ],
+              [
+                483,
+                158
+              ],
+              [
+                495,
+                216
+              ],
+              [
+                356,
+                243
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 419.5,
+            "center_y": 198.8,
+            "width_px": 195.2,
+            "height_px": 143.4,
+            "angle_deg": -11.2,
+            "polygon": [
+              [
+                310,
+                147
+              ],
+              [
+                501,
+                110
+              ],
+              [
+                529,
+                250
+              ],
+              [
+                338,
+                288
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 6,
+          "label": "table top_7",
+          "color": "#ffcc00",
+          "score": 0.9138,
+          "bbox": [
+            703,
+            99,
+            152,
+            59
+          ],
+          "tight_rect": {
+            "center_x": 781.5,
+            "center_y": 125.4,
+            "width_px": 139.2,
+            "height_px": 63.1,
+            "angle_deg": -27.7,
+            "polygon": [
+              [
+                705,
+                130
+              ],
+              [
+                829,
+                65
+              ],
+              [
+                858,
+                121
+              ],
+              [
+                735,
+                186
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 779.7,
+            "center_y": 126.4,
+            "width_px": 179.4,
+            "height_px": 135.5,
+            "angle_deg": -27.7,
+            "polygon": [
+              [
+                669,
+                108
+              ],
+              [
+                828,
+                25
+              ],
+              [
+                891,
+                145
+              ],
+              [
+                732,
+                228
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 7,
+          "label": "table top_8",
+          "color": "#ff2d55",
+          "score": 0.9081,
+          "bbox": [
+            955,
+            159,
+            139,
+            73
+          ],
+          "tight_rect": {
+            "center_x": 1025.2,
+            "center_y": 193.1,
+            "width_px": 136.7,
+            "height_px": 37.2,
+            "angle_deg": 21.1,
+            "polygon": [
+              [
+                968,
+                151
+              ],
+              [
+                1096,
+                200
+              ],
+              [
+                1082,
+                235
+              ],
+              [
+                955,
+                186
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 1024.5,
+            "center_y": 194.8,
+            "width_px": 178.6,
+            "height_px": 101.9,
+            "angle_deg": 21.1,
+            "polygon": [
+              [
+                960,
+                115
+              ],
+              [
+                1126,
+                179
+              ],
+              [
+                1089,
+                275
+              ],
+              [
+                923,
+                210
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "camera_id": "mock-3",
+      "camera_name": "Mimosas IPC5",
+      "camera_number": 5,
+      "source_image": "Mimosas IPC5",
+      "image_width": 1280,
+      "image_height": 720,
+      "expansion_strength": 4.5,
+      "tables": [
+        {
+          "mask_id": 0,
+          "label": "table top_1",
+          "color": "#ff3b30",
+          "score": 0.9519,
+          "bbox": [
+            176,
+            512,
+            308,
+            207
+          ],
+          "tight_rect": {
+            "center_x": 333.1,
+            "center_y": 617.2,
+            "width_px": 252.5,
+            "height_px": 147.0,
+            "angle_deg": 152.4,
+            "polygon": [
+              [
+                479,
+                624
+              ],
+              [
+                255,
+                741
+              ],
+              [
+                187,
+                610
+              ],
+              [
+                411,
+                494
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 333.1,
+            "center_y": 617.2,
+            "width_px": 377.2,
+            "height_px": 352.8,
+            "angle_deg": 152.4,
+            "polygon": [
+              [
+                582,
+                686
+              ],
+              [
+                247,
+                861
+              ],
+              [
+                84,
+                548
+              ],
+              [
+                419,
+                374
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 1,
+          "label": "table top_2",
+          "color": "#34c759",
+          "score": 0.9395,
+          "bbox": [
+            633,
+            212,
+            318,
+            173
+          ],
+          "tight_rect": {
+            "center_x": 796.6,
+            "center_y": 294.9,
+            "width_px": 297.4,
+            "height_px": 102.7,
+            "angle_deg": 150.5,
+            "polygon": [
+              [
+                951,
+                266
+              ],
+              [
+                693,
+                413
+              ],
+              [
+                642,
+                323
+              ],
+              [
+                901,
+                177
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 794.8,
+            "center_y": 296.0,
+            "width_px": 391.7,
+            "height_px": 263.7,
+            "angle_deg": 150.5,
+            "polygon": [
+              [
+                1030,
+                314
+              ],
+              [
+                689,
+                507
+              ],
+              [
+                559,
+                278
+              ],
+              [
+                900,
+                85
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 2,
+          "label": "table top_3",
+          "color": "#007aff",
+          "score": 0.9403,
+          "bbox": [
+            402,
+            142,
+            273,
+            123
+          ],
+          "tight_rect": {
+            "center_x": 541.0,
+            "center_y": 203.1,
+            "width_px": 264.2,
+            "height_px": 59.8,
+            "angle_deg": 159.3,
+            "polygon": [
+              [
+                675,
+                184
+              ],
+              [
+                428,
+                278
+              ],
+              [
+                407,
+                222
+              ],
+              [
+                654,
+                129
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 541.0,
+            "center_y": 203.1,
+            "width_px": 339.2,
+            "height_px": 182.3,
+            "angle_deg": 159.3,
+            "polygon": [
+              [
+                732,
+                229
+              ],
+              [
+                414,
+                348
+              ],
+              [
+                350,
+                178
+              ],
+              [
+                668,
+                58
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 3,
+          "label": "table top_4",
+          "color": "#ff9500",
+          "score": 0.8991,
+          "bbox": [
+            933,
+            432,
+            251,
+            211
+          ],
+          "tight_rect": {
+            "center_x": 1069.5,
+            "center_y": 531.4,
+            "width_px": 247.0,
+            "height_px": 109.5,
+            "angle_deg": 31.3,
+            "polygon": [
+              [
+                992,
+                420
+              ],
+              [
+                1203,
+                549
+              ],
+              [
+                1147,
+                642
+              ],
+              [
+                936,
+                514
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 1069.5,
+            "center_y": 531.4,
+            "width_px": 353.3,
+            "height_px": 284.8,
+            "angle_deg": 31.3,
+            "polygon": [
+              [
+                993,
+                318
+              ],
+              [
+                1294,
+                502
+              ],
+              [
+                1146,
+                745
+              ],
+              [
+                845,
+                561
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 4,
+          "label": "table top_5",
+          "color": "#af52de",
+          "score": 0.8922,
+          "bbox": [
+            65,
+            332,
+            179,
+            109
+          ],
+          "tight_rect": {
+            "center_x": 153.5,
+            "center_y": 378.4,
+            "width_px": 179.2,
+            "height_px": 58.3,
+            "angle_deg": -25.4,
+            "polygon": [
+              [
+                60,
+                390
+              ],
+              [
+                222,
+                314
+              ],
+              [
+                247,
+                366
+              ],
+              [
+                85,
+                443
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 153.5,
+            "center_y": 378.4,
+            "width_px": 225.0,
+            "height_px": 133.1,
+            "angle_deg": -25.4,
+            "polygon": [
+              [
+                23,
+                366
+              ],
+              [
+                227,
+                270
+              ],
+              [
+                284,
+                390
+              ],
+              [
+                80,
+                487
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "camera_id": "mock-4",
+      "camera_name": "Mimosas IPC6",
+      "camera_number": 6,
+      "source_image": "Mimosas IPC6",
+      "image_width": 1280,
+      "image_height": 720,
+      "expansion_strength": 4.5,
+      "tables": [
+        {
+          "mask_id": 0,
+          "label": "table top_1",
+          "color": "#ff3b30",
+          "score": 0.9755,
+          "bbox": [
+            376,
+            414,
+            254,
+            179
+          ],
+          "tight_rect": {
+            "center_x": 509.0,
+            "center_y": 498.6,
+            "width_px": 200.1,
+            "height_px": 213.6,
+            "angle_deg": 154.5,
+            "polygon": [
+              [
+                645,
+                552
+              ],
+              [
+                465,
+                638
+              ],
+              [
+                373,
+                445
+              ],
+              [
+                553,
+                359
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 510.8,
+            "center_y": 502.3,
+            "width_px": 321.1,
+            "height_px": 405.2,
+            "angle_deg": 154.5,
+            "polygon": [
+              [
+                743,
+                616
+              ],
+              [
+                453,
+                754
+              ],
+              [
+                279,
+                388
+              ],
+              [
+                569,
+                250
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 1,
+          "label": "table top_2",
+          "color": "#34c759",
+          "score": 0.9721,
+          "bbox": [
+            705,
+            331,
+            262,
+            141
+          ],
+          "tight_rect": {
+            "center_x": 838.7,
+            "center_y": 397.2,
+            "width_px": 226.6,
+            "height_px": 108.3,
+            "angle_deg": 156.3,
+            "polygon": [
+              [
+                964,
+                401
+              ],
+              [
+                757,
+                492
+              ],
+              [
+                713,
+                393
+              ],
+              [
+                921,
+                302
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 838.7,
+            "center_y": 397.2,
+            "width_px": 320.1,
+            "height_px": 262.5,
+            "angle_deg": 156.3,
+            "polygon": [
+              [
+                1038,
+                453
+              ],
+              [
+                745,
+                582
+              ],
+              [
+                639,
+                341
+              ],
+              [
+                933,
+                213
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 2,
+          "label": "table top_3",
+          "color": "#007aff",
+          "score": 0.9711,
+          "bbox": [
+            78,
+            233,
+            133,
+            143
+          ],
+          "tight_rect": {
+            "center_x": 137.4,
+            "center_y": 304.1,
+            "width_px": 129.6,
+            "height_px": 105.3,
+            "angle_deg": -109.5,
+            "polygon": [
+              [
+                109,
+                383
+              ],
+              [
+                66,
+                261
+              ],
+              [
+                165,
+                225
+              ],
+              [
+                209,
+                348
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 137.4,
+            "center_y": 304.1,
+            "width_px": 218.8,
+            "height_px": 217.3,
+            "angle_deg": -109.5,
+            "polygon": [
+              [
+                71,
+                443
+              ],
+              [
+                -2,
+                237
+              ],
+              [
+                203,
+                165
+              ],
+              [
+                276,
+                371
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 3,
+          "label": "table top_4",
+          "color": "#ff9500",
+          "score": 0.9653,
+          "bbox": [
+            305,
+            190,
+            191,
+            119
+          ],
+          "tight_rect": {
+            "center_x": 398.2,
+            "center_y": 247.8,
+            "width_px": 175.3,
+            "height_px": 90.8,
+            "angle_deg": -134.3,
+            "polygon": [
+              [
+                427,
+                342
+              ],
+              [
+                305,
+                217
+              ],
+              [
+                369,
+                153
+              ],
+              [
+                492,
+                279
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 398.2,
+            "center_y": 247.8,
+            "width_px": 248.8,
+            "height_px": 212.0,
+            "angle_deg": -134.3,
+            "polygon": [
+              [
+                409,
+                411
+              ],
+              [
+                235,
+                233
+              ],
+              [
+                387,
+                85
+              ],
+              [
+                561,
+                263
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 4,
+          "label": "table top_5",
+          "color": "#af52de",
+          "score": 0.953,
+          "bbox": [
+            550,
+            155,
+            190,
+            90
+          ],
+          "tight_rect": {
+            "center_x": 644.2,
+            "center_y": 198.4,
+            "width_px": 184.1,
+            "height_px": 57.0,
+            "angle_deg": 34.6,
+            "polygon": [
+              [
+                585,
+                123
+              ],
+              [
+                736,
+                227
+              ],
+              [
+                704,
+                274
+              ],
+              [
+                552,
+                170
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 644.2,
+            "center_y": 198.4,
+            "width_px": 239.3,
+            "height_px": 147.1,
+            "angle_deg": 34.6,
+            "polygon": [
+              [
+                588,
+                70
+              ],
+              [
+                784,
+                206
+              ],
+              [
+                701,
+                327
+              ],
+              [
+                504,
+                191
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 5,
+          "label": "table top_6",
+          "color": "#5ac8fa",
+          "score": 0.9461,
+          "bbox": [
+            722,
+            144,
+            166,
+            76
+          ],
+          "tight_rect": {
+            "center_x": 804.5,
+            "center_y": 181.6,
+            "width_px": 165.8,
+            "height_px": 34.7,
+            "angle_deg": 29.5,
+            "polygon": [
+              [
+                741,
+                126
+              ],
+              [
+                885,
+                207
+              ],
+              [
+                868,
+                237
+              ],
+              [
+                724,
+                156
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 804.5,
+            "center_y": 181.6,
+            "width_px": 209.0,
+            "height_px": 105.1,
+            "angle_deg": 29.5,
+            "polygon": [
+              [
+                739,
+                84
+              ],
+              [
+                921,
+                187
+              ],
+              [
+                870,
+                279
+              ],
+              [
+                688,
+                176
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 6,
+          "label": "table top_7",
+          "color": "#ffcc00",
+          "score": 0.929,
+          "bbox": [
+            991,
+            259,
+            111,
+            73
+          ],
+          "tight_rect": {
+            "center_x": 1047.0,
+            "center_y": 292.3,
+            "width_px": 95.3,
+            "height_px": 64.3,
+            "angle_deg": 29.7,
+            "polygon": [
+              [
+                1022,
+                241
+              ],
+              [
+                1104,
+                288
+              ],
+              [
+                1072,
+                344
+              ],
+              [
+                990,
+                297
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 1044.6,
+            "center_y": 296.4,
+            "width_px": 141.7,
+            "height_px": 131.5,
+            "angle_deg": 29.7,
+            "polygon": [
+              [
+                1016,
+                204
+              ],
+              [
+                1139,
+                274
+              ],
+              [
+                1074,
+                389
+              ],
+              [
+                951,
+                318
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 7,
+          "label": "table top_8",
+          "color": "#ff2d55",
+          "score": 0.9214,
+          "bbox": [
+            875,
+            139,
+            124,
+            62
+          ],
+          "tight_rect": {
+            "center_x": 937.6,
+            "center_y": 168.9,
+            "width_px": 127.4,
+            "height_px": 24.9,
+            "angle_deg": -149.1,
+            "polygon": [
+              [
+                986,
+                212
+              ],
+              [
+                877,
+                147
+              ],
+              [
+                889,
+                126
+              ],
+              [
+                999,
+                191
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 937.6,
+            "center_y": 168.9,
+            "width_px": 159.2,
+            "height_px": 76.8,
+            "angle_deg": -149.1,
+            "polygon": [
+              [
+                986,
+                243
+              ],
+              [
+                850,
+                161
+              ],
+              [
+                889,
+                95
+              ],
+              [
+                1026,
+                177
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 8,
+          "label": "table top_9",
+          "color": "#5856d6",
+          "score": 0.9217,
+          "bbox": [
+            1061,
+            224,
+            81,
+            56
+          ],
+          "tight_rect": {
+            "center_x": 1101.1,
+            "center_y": 251.7,
+            "width_px": 86.4,
+            "height_px": 33.5,
+            "angle_deg": 22.1,
+            "polygon": [
+              [
+                1067,
+                220
+              ],
+              [
+                1147,
+                252
+              ],
+              [
+                1135,
+                283
+              ],
+              [
+                1055,
+                251
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 1100.9,
+            "center_y": 249.5,
+            "width_px": 114.0,
+            "height_px": 72.3,
+            "angle_deg": 22.1,
+            "polygon": [
+              [
+                1062,
+                195
+              ],
+              [
+                1167,
+                237
+              ],
+              [
+                1140,
+                304
+              ],
+              [
+                1034,
+                262
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 10,
+          "label": "table top_11",
+          "color": "#a2845e",
+          "score": 0.8408,
+          "bbox": [
+            1161,
+            241,
+            58,
+            37
+          ],
+          "tight_rect": {
+            "center_x": 1189.9,
+            "center_y": 257.2,
+            "width_px": 54.3,
+            "height_px": 28.5,
+            "angle_deg": 38.8,
+            "polygon": [
+              [
+                1178,
+                229
+              ],
+              [
+                1220,
+                263
+              ],
+              [
+                1202,
+                285
+              ],
+              [
+                1160,
+                251
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 1190.8,
+            "center_y": 257.9,
+            "width_px": 75.5,
+            "height_px": 67.2,
+            "angle_deg": 38.8,
+            "polygon": [
+              [
+                1182,
+                208
+              ],
+              [
+                1241,
+                255
+              ],
+              [
+                1199,
+                308
+              ],
+              [
+                1140,
+                260
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 11,
+          "label": "table top_12",
+          "color": "#ff375f",
+          "score": 0.8477,
+          "bbox": [
+            1051,
+            172,
+            64,
+            31
+          ],
+          "tight_rect": {
+            "center_x": 1083.5,
+            "center_y": 186.3,
+            "width_px": 60.9,
+            "height_px": 26.6,
+            "angle_deg": 33.3,
+            "polygon": [
+              [
+                1065,
+                158
+              ],
+              [
+                1116,
+                192
+              ],
+              [
+                1102,
+                214
+              ],
+              [
+                1051,
+                181
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 1082.9,
+            "center_y": 185.9,
+            "width_px": 81.0,
+            "height_px": 61.7,
+            "angle_deg": 33.3,
+            "polygon": [
+              [
+                1066,
+                138
+              ],
+              [
+                1134,
+                182
+              ],
+              [
+                1100,
+                234
+              ],
+              [
+                1032,
+                189
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "camera_id": "mock-5",
+      "camera_name": "Mimosas IPC7",
+      "camera_number": 7,
+      "source_image": "Mimosas IPC7",
+      "image_width": 1280,
+      "image_height": 720,
+      "expansion_strength": 4.5,
+      "tables": [
+        {
+          "mask_id": 0,
+          "label": "table top_1",
+          "color": "#ff3b30",
+          "score": 0.9694,
+          "bbox": [
+            361,
+            345,
+            357,
+            292
+          ],
+          "tight_rect": {
+            "center_x": 532.5,
+            "center_y": 483.0,
+            "width_px": 351.5,
+            "height_px": 154.3,
+            "angle_deg": 46.5,
+            "polygon": [
+              [
+                468,
+                302
+              ],
+              [
+                709,
+                557
+              ],
+              [
+                597,
+                664
+              ],
+              [
+                356,
+                409
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 532.5,
+            "center_y": 483.0,
+            "width_px": 490.1,
+            "height_px": 380.5,
+            "angle_deg": 46.5,
+            "polygon": [
+              [
+                502,
+                174
+              ],
+              [
+                839,
+                530
+              ],
+              [
+                563,
+                792
+              ],
+              [
+                226,
+                436
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 1,
+          "label": "table top_2",
+          "color": "#34c759",
+          "score": 0.89,
+          "bbox": [
+            16,
+            388,
+            225,
+            331
+          ],
+          "tight_rect": {
+            "center_x": 111.9,
+            "center_y": 567.1,
+            "width_px": 342.1,
+            "height_px": 140.5,
+            "angle_deg": -107.2,
+            "polygon": [
+              [
+                95,
+                751
+              ],
+              [
+                -6,
+                424
+              ],
+              [
+                129,
+                383
+              ],
+              [
+                229,
+                710
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 111.9,
+            "center_y": 567.1,
+            "width_px": 471.2,
+            "height_px": 351.2,
+            "angle_deg": -107.2,
+            "polygon": [
+              [
+                14,
+                844
+              ],
+              [
+                -125,
+                394
+              ],
+              [
+                210,
+                290
+              ],
+              [
+                349,
+                740
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 2,
+          "label": "table top_3",
+          "color": "#007aff",
+          "score": 0.9609,
+          "bbox": [
+            674,
+            256,
+            298,
+            195
+          ],
+          "tight_rect": {
+            "center_x": 824.2,
+            "center_y": 344.2,
+            "width_px": 297.2,
+            "height_px": 84.6,
+            "angle_deg": 36.2,
+            "polygon": [
+              [
+                729,
+                222
+              ],
+              [
+                969,
+                398
+              ],
+              [
+                919,
+                466
+              ],
+              [
+                679,
+                290
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 824.2,
+            "center_y": 344.2,
+            "width_px": 392.4,
+            "height_px": 240.0,
+            "angle_deg": 36.2,
+            "polygon": [
+              [
+                737,
+                131
+              ],
+              [
+                1053,
+                363
+              ],
+              [
+                911,
+                557
+              ],
+              [
+                595,
+                325
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 4,
+          "label": "table top_5",
+          "color": "#af52de",
+          "score": 0.8026,
+          "bbox": [
+            825,
+            168,
+            282,
+            167
+          ],
+          "tight_rect": {
+            "center_x": 968.5,
+            "center_y": 245.8,
+            "width_px": 301.2,
+            "height_px": 44.9,
+            "angle_deg": 32.2,
+            "polygon": [
+              [
+                853,
+                147
+              ],
+              [
+                1108,
+                307
+              ],
+              [
+                1084,
+                345
+              ],
+              [
+                829,
+                185
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 966.5,
+            "center_y": 249.0,
+            "width_px": 368.1,
+            "height_px": 146.4,
+            "angle_deg": 32.2,
+            "polygon": [
+              [
+                850,
+                89
+              ],
+              [
+                1161,
+                285
+              ],
+              [
+                1083,
+                409
+              ],
+              [
+                772,
+                213
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 5,
+          "label": "table top_6",
+          "color": "#5ac8fa",
+          "score": 0.9103,
+          "bbox": [
+            958,
+            148,
+            210,
+            126
+          ],
+          "tight_rect": {
+            "center_x": 1065.4,
+            "center_y": 205.2,
+            "width_px": 230.3,
+            "height_px": 29.5,
+            "angle_deg": 32.3,
+            "polygon": [
+              [
+                976,
+                131
+              ],
+              [
+                1171,
+                254
+              ],
+              [
+                1155,
+                279
+              ],
+              [
+                960,
+                156
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 1062.9,
+            "center_y": 209.2,
+            "width_px": 275.4,
+            "height_px": 93.8,
+            "angle_deg": 32.3,
+            "polygon": [
+              [
+                972,
+                96
+              ],
+              [
+                1204,
+                243
+              ],
+              [
+                1154,
+                322
+              ],
+              [
+                921,
+                175
+              ]
+            ]
+          }
+        },
+        {
+          "mask_id": 7,
+          "label": "table top_8",
+          "color": "#ff2d55",
+          "score": 0.7736,
+          "bbox": [
+            1238,
+            283,
+            41,
+            41
+          ],
+          "tight_rect": {
+            "center_x": 1261.4,
+            "center_y": 303.0,
+            "width_px": 45.9,
+            "height_px": 21.3,
+            "angle_deg": 38.0,
+            "polygon": [
+              [
+                1250,
+                281
+              ],
+              [
+                1286,
+                309
+              ],
+              [
+                1273,
+                325
+              ],
+              [
+                1237,
+                297
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 1261.4,
+            "center_y": 303.0,
+            "width_px": 64.2,
+            "height_px": 51.1,
+            "angle_deg": 38.0,
+            "polygon": [
+              [
+                1252,
+                263
+              ],
+              [
+                1302,
+                303
+              ],
+              [
+                1271,
+                343
+              ],
+              [
+                1220,
+                303
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "camera_id": "mock-6",
+      "camera_name": "Mimosas IPC8",
+      "camera_number": 8,
+      "source_image": "Mimosas IPC8",
+      "image_width": 1280,
+      "image_height": 720,
+      "expansion_strength": 4.5,
+      "tables": [
+        {
+          "mask_id": 0,
+          "label": "table top_1",
+          "color": "#ff3b30",
+          "score": 0.9497,
+          "bbox": [
+            197,
+            442,
+            445,
+            277
+          ],
+          "tight_rect": {
+            "center_x": 412.0,
+            "center_y": 583.7,
+            "width_px": 433.6,
+            "height_px": 142.1,
+            "angle_deg": -147.2,
+            "polygon": [
+              [
+                556,
+                761
+              ],
+              [
+                191,
+                526
+              ],
+              [
+                268,
+                407
+              ],
+              [
+                633,
+                641
+              ]
+            ]
+          },
+          "zone_rect": {
+            "center_x": 412.0,
+            "center_y": 583.7,
+            "width_px": 578.2,
+            "height_px": 378.1,
+            "angle_deg": -147.2,
+            "polygon": [
+              [
+                553,
+                899
+              ],
+              [
+                67,
+                586
+              ],
+              [
+                271,
+                268
+              ],
+              [
+                757,
+                581
+              ]
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

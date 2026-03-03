@@ -294,7 +294,7 @@ function displayResults(videos, labelingJobId, frameCount) {
 
         // Add click handler
         document.getElementById('label-frames-btn').addEventListener('click', () => {
-            window.location.href = `/label/${labelingJobId}`;
+            window.location.href = `/legacy/label/${labelingJobId}`;
         });
     }
 
