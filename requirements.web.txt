@@ -1,5 +1,0 @@
--r requirements.base.txt
-flask
-gunicorn
-psycopg[binary]
-psycopg_pool
