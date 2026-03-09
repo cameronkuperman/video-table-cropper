@@ -20,9 +20,10 @@ app = Flask(__name__)
 
 CACHE_DIR = Path(__file__).parent / "label_cache"
 
-# ── Drive client (lazy, one instance) ────────────────────────────────────
+# ── Drive client + cached folder IDs (single instance, computed once) ────
 
 _drive_client: DriveClient | None = None
+_folder_ids_cache: dict[str, str] | None = None
 
 
 def get_client() -> DriveClient:
@@ -32,8 +33,6 @@ def get_client() -> DriveClient:
     return _drive_client
 
 
-# ── Folder ID helpers ─────────────────────────────────────────────────────
-
 def _root_id() -> str:
     root = os.environ.get("DRIVE_PROJECT_ROOT_FOLDER_ID", "").strip()
     if not root:
@@ -42,11 +41,14 @@ def _root_id() -> str:
 
 
 def _folder_ids() -> dict[str, str]:
-    """Return {name: folder_id} for all 6 subfolders, creating if needed."""
-    client = get_client()
-    root = _root_id()
-    names = ["raw_videos", "temp_processing", "unlabeled", "clean", "dirty", "occupied"]
-    return {name: client.ensure_subfolder(root, name) for name in names}
+    """Return {name: folder_id} for all 6 subfolders. Cached after first call."""
+    global _folder_ids_cache
+    if _folder_ids_cache is None:
+        client = get_client()
+        root = _root_id()
+        names = ["raw_videos", "temp_processing", "unlabeled", "clean", "dirty", "occupied"]
+        _folder_ids_cache = {name: client.ensure_subfolder(root, name) for name in names}
+    return _folder_ids_cache
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
@@ -58,29 +60,34 @@ def index():
 
 @app.route("/api/folders")
 def api_folders():
-    """Return list of unlabeled subfolders with their Drive file IDs."""
+    """Return list of unlabeled subfolders (names + IDs only, no file listing)."""
     try:
         client = get_client()
         folder_ids = _folder_ids()
         unlabeled_id = folder_ids["unlabeled"]
-
         subfolders = client.list_folders(unlabeled_id)
-        result = []
-        for folder in subfolders:
-            files = client.list_files(folder["id"])
-            file_map = {f["name"]: f["id"] for f in files}
-            result.append({
-                "folder_id": folder["id"],
-                "folder_name": folder["name"],
-                "parent_id": unlabeled_id,
-                "frames": {
-                    "frame_0": file_map.get("frame_0.jpg"),
-                    "frame_1": file_map.get("frame_1.jpg"),
-                    "frame_2": file_map.get("frame_2.jpg"),
-                },
-            })
+        result = [
+            {"folder_id": f["id"], "folder_name": f["name"], "parent_id": unlabeled_id}
+            for f in subfolders
+        ]
         return jsonify({"folders": result})
     except (DriveClientError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/folder/<folder_id>/frames")
+def api_folder_frames(folder_id: str):
+    """Return frame file IDs for a single subfolder."""
+    try:
+        client = get_client()
+        files = client.list_files(folder_id)
+        file_map = {f["name"]: f["id"] for f in files}
+        return jsonify({
+            "frame_0": file_map.get("frame_0.jpg"),
+            "frame_1": file_map.get("frame_1.jpg"),
+            "frame_2": file_map.get("frame_2.jpg"),
+        })
+    except DriveClientError as e:
         return jsonify({"error": str(e)}), 500
 
 
@@ -138,4 +145,4 @@ def api_stats():
 
 def run_label_ui(port: int = 8080) -> None:
     print(f"Starting label UI at http://localhost:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=False)

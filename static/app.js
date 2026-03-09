@@ -2,6 +2,7 @@
 
 let folders = [];
 let currentIndex = 0;
+const frameCache = {};  // folder_id -> {frame_0, frame_1, frame_2}
 
 const cardEl = document.getElementById('card');
 const progressEl = document.getElementById('progress');
@@ -24,7 +25,7 @@ async function init() {
             doneEl.style.display = 'block';
         } else {
             doneEl.style.display = 'none';
-            renderCard();
+            await renderCard();
         }
     } catch (e) {
         showError('Failed to connect: ' + e.message);
@@ -42,7 +43,15 @@ async function loadStats() {
     } catch (_) {}
 }
 
-function renderCard() {
+async function fetchFrames(folder) {
+    if (frameCache[folder.folder_id]) return frameCache[folder.folder_id];
+    const res = await fetch(`/api/folder/${folder.folder_id}/frames`);
+    const data = await res.json();
+    frameCache[folder.folder_id] = data;
+    return data;
+}
+
+async function renderCard() {
     if (currentIndex >= folders.length) {
         cardEl.innerHTML = '';
         doneEl.style.display = 'block';
@@ -53,23 +62,38 @@ function renderCard() {
     const folder = folders[currentIndex];
     progressEl.textContent = `${currentIndex + 1} / ${folders.length}`;
 
-    const frames = ['frame_0', 'frame_1', 'frame_2'];
-    const imgHtml = frames.map(f => {
-        const fileId = folder.frames[f];
+    cardEl.innerHTML = '<p class="loading">Loading images...</p>';
+
+    let frames;
+    try {
+        frames = await fetchFrames(folder);
+    } catch (e) {
+        showError('Failed to load frames: ' + e.message);
+        return;
+    }
+
+    const frameKeys = ['frame_0', 'frame_1', 'frame_2'];
+    const imgHtml = frameKeys.map(f => {
+        const fileId = frames[f];
         if (!fileId) return `<div class="img-placeholder">no image</div>`;
-        return `<img src="/api/preview/${fileId}" alt="${f}" loading="lazy" />`;
+        return `<img src="/api/preview/${fileId}" alt="${f}" />`;
     }).join('');
 
     cardEl.innerHTML = `
         <div class="folder-name">${escapeHtml(folder.folder_name)}</div>
         <div class="images">${imgHtml}</div>
         <div class="buttons">
-            <button class="btn occupied" onclick="labelCurrent('occupied')">Occupied</button>
-            <button class="btn dirty"    onclick="labelCurrent('dirty')">Dirty</button>
-            <button class="btn clean"    onclick="labelCurrent('clean')">Clean</button>
-            <button class="btn skip"     onclick="skipCurrent()">Skip →</button>
+            <button class="btn occupied" onclick="labelCurrent('occupied')">Occupied [1]</button>
+            <button class="btn dirty"    onclick="labelCurrent('dirty')">Dirty [2]</button>
+            <button class="btn clean"    onclick="labelCurrent('clean')">Clean [3]</button>
+            <button class="btn skip"     onclick="skipCurrent()">Skip → [→]</button>
         </div>
     `;
+
+    // Prefetch next folder's frames in the background
+    if (currentIndex + 1 < folders.length) {
+        fetchFrames(folders[currentIndex + 1]).catch(() => {});
+    }
 }
 
 async function labelCurrent(label) {
@@ -92,9 +116,10 @@ async function labelCurrent(label) {
             return;
         }
         showError(null);
+        delete frameCache[folder.folder_id];
         folders.splice(currentIndex, 1);
         if (currentIndex >= folders.length && currentIndex > 0) currentIndex--;
-        renderCard();
+        await renderCard();
         loadStats();
     } catch (e) {
         showError('Network error: ' + e.message);
@@ -102,9 +127,9 @@ async function labelCurrent(label) {
     }
 }
 
-function skipCurrent() {
+async function skipCurrent() {
     currentIndex = (currentIndex + 1) % Math.max(folders.length, 1);
-    renderCard();
+    await renderCard();
 }
 
 function disableButtons() {
