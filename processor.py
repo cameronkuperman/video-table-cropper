@@ -11,6 +11,7 @@ import math
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -159,6 +160,17 @@ def ensure_drive_folders(client: DriveClient, project_root_id: str) -> dict[str,
     return {name: client.ensure_subfolder(project_root_id, name) for name in names}
 
 
+def _fmt_eta(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+    else:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
+
+
 # ── main process loop ──────────────────────────────────────────────────────
 
 def _find_videos_recursive(client: DriveClient, folder_id: str) -> list[dict]:
@@ -189,8 +201,19 @@ def run_processor(project_root_id: str, tables_json_path: Path, client: DriveCli
 
     with tempfile.TemporaryDirectory(prefix="autolabeler_") as tmpdir:
         tmp = Path(tmpdir)
-        for video_meta in video_files:
+        total = len(video_files)
+        video_durations: list[float] = []
+        for video_idx, video_meta in enumerate(video_files, 1):
+            t_start = time.time()
+            print(f"\n[{video_idx}/{total}] ", end="")
             _process_video(video_meta, cameras, folders, client, tmp, yolo_model)
+            elapsed = time.time() - t_start
+            video_durations.append(elapsed)
+            avg = sum(video_durations) / len(video_durations)
+            remaining = (total - video_idx) * avg
+            print(f"  Progress: {video_idx}/{total} videos done | "
+                  f"avg {avg:.0f}s/video | "
+                  f"ETA ~{_fmt_eta(remaining)}")
 
     print("Done.")
 
@@ -299,8 +322,19 @@ def _process_video(
     perception_note = " + perception" if yolo_model is not None else " (no perception — install ultralytics)"
     print(f"  {len(frame_paths)} frames → {len(triplets)} triplet(s), {len(table_polygons)} table(s){perception_note}")
 
+    # Build set of already-uploaded triplet names across all destination folders for resume
+    already_uploaded: set[str] = set()
+    for dest in ("temp_processing", "unlabeled", "clean", "dirty", "occupied"):
+        for f in client.list_folders(folders[dest]):
+            already_uploaded.add(f["name"])
+
     for triplet_idx, triplet in enumerate(triplets):
         triplet_name = f"{video_stem}_t{triplet_idx:04d}"
+
+        # Resume: skip if this triplet was already uploaded
+        if triplet_name in already_uploaded:
+            print(f"  Triplet {triplet_idx+1}/{len(triplets)} already uploaded, skipping.")
+            continue
 
         # ── Person detection for this triplet (full frames, once per triplet) ──
         frame_detections = None
@@ -337,6 +371,7 @@ def _process_video(
                 perc_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
                 client.upload_or_update_file(perc_path, unlabeled_subfolder_id, file_name="perception.json")
 
-        print(f"  Triplet {triplet_idx+1}/{len(triplets)} uploaded.")
+        pct = int((triplet_idx + 1) / len(triplets) * 100)
+        print(f"  Triplet {triplet_idx+1}/{len(triplets)} ({pct}%) uploaded.")
 
     print(f"  Done: {video_name}")

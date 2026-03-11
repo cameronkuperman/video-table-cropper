@@ -19,7 +19,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBa
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
-RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_HTTP_STATUSES = {403, 408, 425, 429, 500, 502, 503, 504}
 T = TypeVar("T")
 
 
@@ -33,8 +33,8 @@ class DriveClient:
     def __init__(self, credentials_path: str | None = None) -> None:
         credentials = self._load_credentials(credentials_path)
         self.service = build("drive", "v3", credentials=credentials, cache_discovery=False)
-        self.retry_attempts = max(1, int(os.environ.get("DRIVE_API_RETRY_ATTEMPTS", "4") or "4"))
-        self.retry_base_seconds = max(0.25, float(os.environ.get("DRIVE_API_RETRY_BASE_SECONDS", "1.0") or "1.0"))
+        self.retry_attempts = max(1, int(os.environ.get("DRIVE_API_RETRY_ATTEMPTS", "6") or "6"))
+        self.retry_base_seconds = max(0.25, float(os.environ.get("DRIVE_API_RETRY_BASE_SECONDS", "2.0") or "2.0"))
 
     @staticmethod
     def _load_credentials(credentials_path: str | None = None):
@@ -95,7 +95,7 @@ class DriveClient:
                 last_error = exc
                 if not self._is_retryable_exception(exc) or attempt >= self.retry_attempts:
                     break
-                time.sleep(self.retry_base_seconds * attempt)
+                time.sleep(self.retry_base_seconds * (2 ** (attempt - 1)))
 
         if isinstance(last_error, HttpError):
             raise DriveClientError(f"{context}: {last_error}") from last_error
