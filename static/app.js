@@ -72,6 +72,14 @@ async function renderCard() {
         return;
     }
 
+    // Skip folders that don't have all 3 frames yet (still uploading)
+    if (!frames.frame_0 || !frames.frame_1 || !frames.frame_2) {
+        folders.splice(currentIndex, 1);
+        if (currentIndex >= folders.length && currentIndex > 0) currentIndex--;
+        await renderCard();
+        return;
+    }
+
     const frameKeys = ['frame_0', 'frame_1', 'frame_2'];
     const imgHtml = frameKeys.map(f => {
         const fileId = frames[f];
