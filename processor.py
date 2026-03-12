@@ -84,6 +84,45 @@ def polygon_from_table(table: dict[str, Any]) -> list[tuple[float, float]] | Non
     return None
 
 
+def zone_polygon_from_table(table: dict[str, Any]) -> list[tuple[float, float]] | None:
+    """Return the zone_rect polygon as (x, y) tuples, or None if absent."""
+    zone_rect = table.get("zone_rect")
+    if zone_rect and zone_rect.get("polygon"):
+        return [(float(p[0]), float(p[1])) for p in zone_rect["polygon"]]
+    return None
+
+
+def perspective_crop_polygon(image_path: Path, polygon: list[tuple[float, float]]) -> Image.Image:
+    """
+    Warp-crop image to the exact bounds of a (possibly rotated) 4-point polygon.
+    Sorts the 4 points into top-left, top-right, bottom-right, bottom-left order,
+    then uses PIL QUAD transform to deskew to a clean rectangle.
+    Falls back to axis-aligned crop if polygon doesn't have exactly 4 points.
+    """
+    img = Image.open(image_path).convert("RGB")
+    if len(polygon) != 4:
+        # Fallback: axis-aligned crop
+        bbox = bbox_from_polygon(polygon)
+        return img.crop(bbox)
+
+    pts = sorted(polygon, key=lambda p: p[1])   # sort by y
+    top2 = sorted(pts[:2], key=lambda p: p[0])  # left-to-right within top pair
+    bot2 = sorted(pts[2:], key=lambda p: p[0])  # left-to-right within bottom pair
+    tl, tr = top2
+    bl, br = bot2
+
+    out_w = int(round(max(math.hypot(tr[0]-tl[0], tr[1]-tl[1]),
+                          math.hypot(br[0]-bl[0], br[1]-bl[1]))))
+    out_h = int(round(max(math.hypot(bl[0]-tl[0], bl[1]-tl[1]),
+                          math.hypot(br[0]-tr[0], br[1]-tr[1]))))
+    out_w = max(out_w, 1)
+    out_h = max(out_h, 1)
+
+    # PIL QUAD data: source coords mapping to dest corners (0,0),(0,h),(w,h),(w,0)
+    data = [tl[0], tl[1], bl[0], bl[1], br[0], br[1], tr[0], tr[1]]
+    return img.transform((out_w, out_h), Image.QUAD, data, Image.BICUBIC)
+
+
 def bbox_from_polygon(polygon: list[tuple[float, float]]) -> tuple[int, int, int, int]:
     """Return axis-aligned bounding box (x1, y1, x2, y2) for a polygon."""
     xs = [p[0] for p in polygon]
@@ -218,21 +257,25 @@ def run_processor(project_root_id: str, tables_json_path: Path, client: DriveCli
     print("Done.")
 
 
+def _scale_bbox(bbox: tuple[int,int,int,int], sx: float, sy: float) -> tuple[int,int,int,int]:
+    return (int(bbox[0]*sx), int(bbox[1]*sy), int(bbox[2]*sx), int(bbox[3]*sy))
+
+
 def _scale_table_polygons(
-    table_polygons: list[tuple[str, list[tuple[float, float]], tuple[int, int, int, int]]],
+    table_polygons: list,
     ref_w: int,
     ref_h: int,
     frame_w: int,
     frame_h: int,
-) -> list[tuple[str, list[tuple[float, float]], tuple[int, int, int, int]]]:
+) -> list:
     """Scale table polygon coords from JSON reference resolution to actual frame resolution."""
     sx = frame_w / ref_w
     sy = frame_h / ref_h
     scaled = []
-    for table_id, polygon, bbox in table_polygons:
-        new_poly = [(x * sx, y * sy) for x, y in polygon]
-        new_bbox = (int(bbox[0]*sx), int(bbox[1]*sy), int(bbox[2]*sx), int(bbox[3]*sy))
-        scaled.append((table_id, new_poly, new_bbox))
+    for table_id, tight_poly, tight_bbox, zone_poly in table_polygons:
+        new_tight = [(x * sx, y * sy) for x, y in tight_poly]
+        new_zone  = [(x * sx, y * sy) for x, y in zone_poly]
+        scaled.append((table_id, new_tight, _scale_bbox(tight_bbox, sx, sy), new_zone))
     return scaled
 
 
@@ -267,21 +310,23 @@ def _process_video(
         return
 
     # Build polygon list per table
-    table_polygons: list[tuple[str, list[tuple[float, float]], tuple[int, int, int, int]]] = []
+    # tuple: (table_id, tight_polygon, tight_bbox, zone_polygon)
+    table_polygons: list[tuple[str, list, tuple[int,int,int,int], list]] = []
     for i, table in enumerate(tables):
-        polygon = polygon_from_table(table)
-        if polygon is None:
+        tight_poly = polygon_from_table(table)
+        if tight_poly is None:
             print(f"  Warning: table {i} has no polygon, skipping")
             continue
         table_id = str(table.get("label") or table.get("mask_id") or i).replace(" ", "_")
-        bbox = bbox_from_polygon(polygon)
-        table_polygons.append((table_id, polygon, bbox))
+        tight_bbox = bbox_from_polygon(tight_poly)
+        zone_poly = zone_polygon_from_table(table) or tight_poly  # fallback to tight if no zone_rect
+        table_polygons.append((table_id, tight_poly, tight_bbox, zone_poly))
 
     if not table_polygons:
         print(f"  Skipping: no usable table polygons for IPC{ipc_num}")
         return
 
-    all_polygons = [p for _, p, _ in table_polygons]
+    all_polygons = [p for _, p, _, _ in table_polygons]
 
     # Download video
     video_path = tmp / video_name
@@ -311,7 +356,7 @@ def _process_video(
     if ref_w != frame_w or ref_h != frame_h:
         print(f"  Scaling polygons from {ref_w}×{ref_h} → {frame_w}×{frame_h}")
         table_polygons = _scale_table_polygons(table_polygons, ref_w, ref_h, frame_w, frame_h)
-        all_polygons = [p for _, p, _ in table_polygons]
+        all_polygons = [p for _, p, _, _ in table_polygons]
 
     # Group into non-overlapping triplets
     triplets = [frame_paths[i:i+3] for i in range(0, len(frame_paths) - 2, 3)]
@@ -353,19 +398,19 @@ def _process_video(
             client.upload_or_update_file(out, temp_subfolder_id, file_name=f"frame_{frame_idx}.jpg")
 
         # ── unlabeled: one subfolder per table, 3 cropped frames + perception ──
-        for table_id, polygon, bbox in table_polygons:
+        for table_id, tight_poly, tight_bbox, zone_poly in table_polygons:
             subfolder_name = f"{video_stem}_{table_id}_t{triplet_idx:04d}"
             unlabeled_subfolder_id = client.ensure_subfolder(folders["unlabeled"], subfolder_name)
 
             for frame_idx, frame_path in enumerate(triplet):
-                cropped = crop_to_bbox(frame_path, bbox)
+                cropped = perspective_crop_polygon(frame_path, zone_poly)
                 out = tmp / "crops" / f"{subfolder_name}_f{frame_idx}.jpg"
                 save_jpeg(cropped, out)
                 client.upload_or_update_file(out, unlabeled_subfolder_id, file_name=f"frame_{frame_idx}.jpg")
 
             # Write perception.json if person detection ran
             if frame_detections is not None:
-                perception = build_perception_for_table(frame_detections, polygon, img_shape)
+                perception = build_perception_for_table(frame_detections, tight_poly, img_shape)
                 perc_path = tmp / "perception" / f"{subfolder_name}_perception.json"
                 perc_path.parent.mkdir(parents=True, exist_ok=True)
                 perc_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
