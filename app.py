@@ -145,4 +145,4 @@ def api_stats():
 
 def run_label_ui(port: int = 8080) -> None:
     print(f"Starting label UI at http://localhost:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
