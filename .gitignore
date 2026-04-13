@@ -8,6 +8,7 @@ venv/
 uploads/
 output/
 frames/
+label_cache/
 
 # macOS
 .DS_Store

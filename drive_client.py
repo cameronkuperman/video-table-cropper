@@ -142,10 +142,14 @@ class DriveClient:
             f"Drive get file error for {file_id}",
         )
 
-    def list_folders(self, parent_id: str) -> list[dict[str, Any]]:
+    def list_folders(
+        self,
+        parent_id: str,
+        fields: str = "id,name,mimeType,parents",
+    ) -> list[dict[str, Any]]:
         escaped = self._escape_query_value(parent_id)
         query = f"'{escaped}' in parents and mimeType='{FOLDER_MIME}' and trashed=false"
-        return self._list_files(query)
+        return self._list_files(query, fields=fields)
 
     def list_folders_recursive(self, parent_id: str, include_root: bool = True) -> list[dict[str, Any]]:
         """Recursively list all folders under a parent folder."""
@@ -175,10 +179,14 @@ class DriveClient:
         files = self._list_files(query)
         return [f for f in files if str(f.get("mimeType", "")).startswith("image/")]
 
-    def list_files(self, folder_id: str) -> list[dict[str, Any]]:
+    def list_files(
+        self,
+        folder_id: str,
+        fields: str = "id,name,mimeType,parents",
+    ) -> list[dict[str, Any]]:
         escaped = self._escape_query_value(folder_id)
         query = f"'{escaped}' in parents and trashed=false"
-        return self._list_files(query)
+        return self._list_files(query, fields=fields)
 
     def find_file_by_name(
         self, folder_id: str, file_name: str, mime_type: str | None = None
@@ -395,24 +403,51 @@ class DriveClient:
             return self.update_file(existing["id"], local_path, file_name=target_name, mime_type=mime_type)
         return self.upload_file(local_path, parent_id=parent_id, file_name=target_name, mime_type=mime_type)
 
-    def move_file(self, file_id: str, new_parent_id: str, remove_parent_id: str | None = None) -> dict[str, Any]:
-        if not remove_parent_id:
-            current = self.get_file(file_id, fields="id,parents")
-            parent_ids = current.get("parents", [])
-            remove_parent_id = ",".join(parent_ids)
-
+    def update_file_metadata(
+        self,
+        file_id: str,
+        metadata: dict[str, Any],
+        fields: str = "id,name,mimeType,parents,appProperties",
+    ) -> dict[str, Any]:
         return self._execute_with_retry(
             lambda: (
                 self.service.files()
                 .update(
                     fileId=file_id,
-                    addParents=new_parent_id,
-                    removeParents=remove_parent_id,
-                    fields="id,name,parents",
+                    body=metadata,
+                    fields=fields,
                     supportsAllDrives=True,
                 )
                 .execute()
             ),
+            f"Drive metadata update error for {file_id}",
+        )
+
+    def move_file(self, file_id: str, new_parent_id: str, remove_parent_id: str | None = None) -> dict[str, Any]:
+        current = self.get_file(file_id, fields="id,name,parents")
+        current_parent_ids = [str(parent_id) for parent_id in current.get("parents", []) if parent_id]
+
+        if current_parent_ids == [new_parent_id]:
+            return current
+
+        remove_parent_ids = [parent_id for parent_id in current_parent_ids if parent_id != new_parent_id]
+        if not remove_parent_ids and remove_parent_id and remove_parent_id != new_parent_id:
+            remove_parent_ids = [remove_parent_id]
+
+        update_kwargs: dict[str, Any] = {
+            "fileId": file_id,
+            "fields": "id,name,parents",
+            "supportsAllDrives": True,
+            "enforceSingleParent": True,
+        }
+
+        if new_parent_id not in current_parent_ids:
+            update_kwargs["addParents"] = new_parent_id
+        if remove_parent_ids:
+            update_kwargs["removeParents"] = ",".join(remove_parent_ids)
+
+        return self._execute_with_retry(
+            lambda: self.service.files().update(**update_kwargs).execute(),
             f"Drive move error for {file_id}",
         )
 

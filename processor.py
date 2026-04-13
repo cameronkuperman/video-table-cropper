@@ -25,6 +25,7 @@ from person_detector import (
     detect_people_in_frame,
     load_yolo_model,
 )
+from queue_metadata import build_folder_app_properties
 
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 FRAME_INTERVAL_SECONDS = 3  # extract one frame every N seconds
@@ -194,8 +195,8 @@ def save_jpeg(img: Image.Image, path: Path) -> None:
 # ── Drive folder helpers ───────────────────────────────────────────────────
 
 def ensure_drive_folders(client: DriveClient, project_root_id: str) -> dict[str, str]:
-    """Ensure all 6 named subfolders exist under the project root. Returns {name: folder_id}."""
-    names = ["raw_videos", "temp_processing", "unlabeled", "clean", "dirty", "occupied"]
+    """Ensure all label workflow subfolders exist under the project root."""
+    names = ["raw_videos", "temp_processing", "unlabeled", "clean", "dirty", "occupied", "label_later"]
     return {name: client.ensure_subfolder(project_root_id, name) for name in names}
 
 
@@ -369,7 +370,7 @@ def _process_video(
 
     # Build set of already-uploaded triplet names across all destination folders for resume
     already_uploaded: set[str] = set()
-    for dest in ("temp_processing", "unlabeled", "clean", "dirty", "occupied"):
+    for dest in ("temp_processing", "unlabeled", "clean", "dirty", "occupied", "label_later"):
         for f in client.list_folders(folders[dest]):
             already_uploaded.add(f["name"])
 
@@ -401,12 +402,27 @@ def _process_video(
         for table_id, tight_poly, tight_bbox, zone_poly in table_polygons:
             subfolder_name = f"{video_stem}_{table_id}_t{triplet_idx:04d}"
             unlabeled_subfolder_id = client.ensure_subfolder(folders["unlabeled"], subfolder_name)
+            uploaded_frame_ids: dict[str, str | None] = {
+                "frame_0": None,
+                "frame_1": None,
+                "frame_2": None,
+            }
 
             for frame_idx, frame_path in enumerate(triplet):
                 cropped = perspective_crop_polygon(frame_path, zone_poly)
                 out = tmp / "crops" / f"{subfolder_name}_f{frame_idx}.jpg"
                 save_jpeg(cropped, out)
-                client.upload_or_update_file(out, unlabeled_subfolder_id, file_name=f"frame_{frame_idx}.jpg")
+                uploaded = client.upload_or_update_file(
+                    out,
+                    unlabeled_subfolder_id,
+                    file_name=f"frame_{frame_idx}.jpg",
+                )
+                uploaded_frame_ids[f"frame_{frame_idx}"] = str(uploaded["id"])
+
+            client.update_file_metadata(
+                unlabeled_subfolder_id,
+                {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
+            )
 
             # Write perception.json if person detection ran
             if frame_detections is not None:
