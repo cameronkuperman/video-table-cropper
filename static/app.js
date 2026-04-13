@@ -470,6 +470,27 @@ function warmBuffer() {
     }
 }
 
+function renderFolderCard(folder) {
+    const frameKeys = ['frame_0', 'frame_1', 'frame_2'];
+    const imgHtml = frameKeys.map(key => {
+        const url = folder.preview_urls?.[key];
+        if (!url) return '<div class="img-placeholder">no image</div>';
+        return `<img src="${url}" alt="${key}" loading="eager" decoding="async" />`;
+    }).join('');
+
+    cardEl.innerHTML = `
+        <div class="folder-name">${escapeHtml(folder.folder_name)}</div>
+        <div class="images">${imgHtml}</div>
+        <div class="buttons">
+            <button class="btn occupied" onclick="labelCurrent('occupied')">Occupied [1]</button>
+            <button class="btn dirty"    onclick="labelCurrent('dirty')">Dirty [2]</button>
+            <button class="btn clean"    onclick="labelCurrent('clean')">Clean [3]</button>
+            <button class="btn later"    onclick="labelCurrent('label_later')">Label Later [4]</button>
+            <button class="btn skip"     onclick="skipCurrent()">Skip &rarr; [&rarr;]</button>
+        </div>
+    `;
+}
+
 async function refreshStats() {
     const startedAt = performance.now();
     const requestSource = activeSource;
@@ -515,6 +536,25 @@ async function renderCard() {
     const startedAt = performance.now();
     const token = ++renderToken;
     showError(null);
+
+    const immediateFolder = folders[currentIndex] || null;
+    if (immediateFolder) {
+        doneEl.style.display = 'none';
+        updateProgress();
+        renderFolderCard(immediateFolder);
+        labeling = false;
+        logTiming('renderCard', {
+            ms: (performance.now() - startedAt).toFixed(1),
+            folderId: immediateFolder.folder_id,
+            folderName: immediateFolder.folder_name,
+            buffered: localReadyCount(),
+            queueKey: activeQueueKey(),
+            immediate: 1,
+        });
+        warmBuffer();
+        return;
+    }
+
     cardEl.innerHTML = '<p class="loading">Warming next images from Drive...</p>';
 
     let folder;
@@ -538,33 +578,9 @@ async function renderCard() {
     doneEl.style.display = 'none';
     updateProgress();
 
-    try {
-        await preloadFolder(folder);
-    } catch (e) {
-        showError('Failed to load images: ' + e.message);
-        return;
-    }
-
     if (token !== renderToken) return;
 
-    const frameKeys = ['frame_0', 'frame_1', 'frame_2'];
-    const imgHtml = frameKeys.map(key => {
-        const url = folder.preview_urls?.[key];
-        if (!url) return '<div class="img-placeholder">no image</div>';
-        return `<img src="${url}" alt="${key}" />`;
-    }).join('');
-
-    cardEl.innerHTML = `
-        <div class="folder-name">${escapeHtml(folder.folder_name)}</div>
-        <div class="images">${imgHtml}</div>
-        <div class="buttons">
-            <button class="btn occupied" onclick="labelCurrent('occupied')">Occupied [1]</button>
-            <button class="btn dirty"    onclick="labelCurrent('dirty')">Dirty [2]</button>
-            <button class="btn clean"    onclick="labelCurrent('clean')">Clean [3]</button>
-            <button class="btn later"    onclick="labelCurrent('label_later')">Label Later [4]</button>
-            <button class="btn skip"     onclick="skipCurrent()">Skip &rarr; [&rarr;]</button>
-        </div>
-    `;
+    renderFolderCard(folder);
 
     labeling = false;
     logTiming('renderCard', {
@@ -573,6 +589,7 @@ async function renderCard() {
         folderName: folder.folder_name,
         buffered: localReadyCount(),
         queueKey: activeQueueKey(),
+        immediate: 0,
     });
     warmBuffer();
 }
@@ -669,7 +686,7 @@ async function labelCurrent(label) {
     }
 }
 
-async function skipCurrent() {
+function skipCurrent() {
     if (folders.length === 0) return;
 
     if (currentIndex + 1 < folders.length) {
@@ -680,7 +697,7 @@ async function skipCurrent() {
         currentIndex = 0;
     }
 
-    await renderCard();
+    renderCard();
 }
 
 function showError(msg, isHtml = false) {
