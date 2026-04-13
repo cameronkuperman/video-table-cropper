@@ -1,10 +1,12 @@
 # AutoLabeler
 
-Label table images from Drive videos. Two commands, local-only, no database.
+Label table images from Google Drive. Two commands, local-only, no database.
 
 ## Drive folder structure
 
-One root folder on Google Drive. All subfolders are auto-created:
+### Video mode
+
+One project root folder on Google Drive. The video pipeline uses these subfolders:
 
 ```
 <your root folder>/
@@ -15,6 +17,40 @@ One root folder on Google Drive. All subfolders are auto-created:
 ├── dirty/              ← labeled output
 └── occupied/           ← labeled output
 ```
+
+`label_later/` is also auto-created for the label UI.
+
+### Reolink mode
+
+Reolink sites are separate sibling folders that are configured directly in `app.py`.
+Each site should look like:
+
+```
+<site root>/
+├── unassociated/       ← raw screenshot triplets grouped by channel/time
+├── crop_configs/       ← permanent manual crop configs (Matthews only)
+├── unlabeled/          ← generated per-table crops waiting to be labeled
+├── clean/              ← labeled output
+├── dirty/              ← labeled output
+├── occupied/           ← labeled output
+└── label_later/        ← labeled output
+```
+
+Each raw triplet folder in `unassociated/` should contain `frame_0.jpg`, `frame_1.jpg`,
+and `frame_2.jpg`. The labeler maps channel names like `CH-CH03` to the matching camera
+geometry (`IPC3`), runs the same YOLO/perception + table-crop flow used by the video
+pipeline, and materializes per-table folders into `unlabeled/`.
+
+`reolink-matthews-01` is now special-cased:
+- it does **not** use the general `CH-CHNN -> IPCN` mapping
+- it requires a saved `crop_configs/CH-CHNN.json` per channel before queue generation
+- those saved 4-point polygons drive cropped `frame_0.jpg`, `frame_1.jpg`, `frame_2.jpg`,
+  plus `perception.json`, exactly like the original video pipeline
+
+`restaurant-pi-1` stays on the general IPC-mapping behavior.
+
+If `metadata.json` is present in the raw triplet folder it is copied into each generated
+per-table folder and preserved when that folder is later moved to a label destination.
 
 ## Setup
 
@@ -65,7 +101,24 @@ python main.py --label
 ```
 
 Shows 3 images per unlabeled folder. Click **Occupied / Dirty / Clean**
-(or press `1` / `2` / `3`). The folder moves to the matching Drive folder instantly.
+(or press `1` / `2` / `3`). Press `4` for **Label Later**.
+
+The UI now supports two source types:
+- `Video`: reads from the project root `unlabeled/`
+- `Reolink`: generates per-table crops from a selected site `unassociated/`, then labels
+  the derived folders in that site `unlabeled/`
+
+For Matthews setup, open:
+
+```text
+http://localhost:8080/crop-editor?site=reolink-matthews-01
+```
+
+Pick a channel, open its full-frame reference image, click four corners per table, and save.
+If any Matthews channel in `unassociated/` is missing a saved config, the Reolink queue will
+stop and link you to the crop editor first.
+
+In both modes, labeling moves the entire triplet folder to the matching Drive folder instantly.
 Press `→` or `Space` to skip.
 
 ## Table geometry

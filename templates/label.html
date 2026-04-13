@@ -29,9 +29,52 @@
 
   h1 { font-size: 1.3rem; font-weight: 600; letter-spacing: 0.02em; }
 
+  .header-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  #source-summary {
+    font-size: 0.8rem;
+    color: #7a7a7a;
+  }
+
   #stats {
     font-size: 0.78rem;
     color: #888;
+    text-align: right;
+  }
+
+  .source-controls {
+    width: 100%;
+    max-width: 960px;
+    display: flex;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+
+  .source-control {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 180px;
+  }
+
+  .source-control span {
+    font-size: 0.72rem;
+    color: #8a8a8a;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .source-control select {
+    background: #1b1b1d;
+    color: #f0f0f0;
+    border: 1px solid #2c2c2e;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 0.92rem;
   }
 
   #progress {
@@ -155,14 +198,44 @@
     color: #555;
     text-align: center;
   }
+
+  @media (max-width: 720px) {
+    header {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 12px;
+    }
+
+    #stats {
+      text-align: left;
+    }
+
+    .source-controls {
+      flex-direction: column;
+    }
+  }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>AutoLabeler</h1>
+  <div class="header-copy">
+    <h1>AutoLabeler</h1>
+    <div id="source-summary">Video</div>
+  </div>
   <span id="stats"></span>
 </header>
+
+<div class="source-controls">
+  <label class="source-control">
+    <span>Mode</span>
+    <select id="source-mode"></select>
+  </label>
+  <label class="source-control" id="site-control" hidden>
+    <span>Site</span>
+    <select id="source-site"></select>
+  </label>
+</div>
 
 <div id="error"></div>
 <div id="progress"></div>
