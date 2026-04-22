@@ -1,0 +1,8 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "startCommand": "sh -c 'gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 8 --timeout 180 app:app'",
+    "healthcheckPath": "/healthz",
+    "healthcheckTimeout": 300
+  }
+}

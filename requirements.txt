@@ -1,8 +1,8 @@
 flask
 google-api-python-client
 google-auth
+gunicorn
 numpy
 Pillow
-
-# Optional: enables person detection + perception.json generation during --process
-# ultralytics
+pytest
+ultralytics

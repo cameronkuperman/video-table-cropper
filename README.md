@@ -15,10 +15,10 @@ One project root folder on Google Drive. The video pipeline uses these subfolder
 ├── unlabeled/          ← cropped table triplets waiting to be labeled
 ├── clean/              ← labeled output
 ├── dirty/              ← labeled output
-└── occupied/           ← labeled output
+├── occupied/           ← labeled output
+├── label_later/        ← labeled output
+└── discarded/          ← rejected output
 ```
-
-`label_later/` is also auto-created for the label UI.
 
 ### Reolink mode
 
@@ -33,7 +33,8 @@ Each site should look like:
 ├── clean/              ← labeled output
 ├── dirty/              ← labeled output
 ├── occupied/           ← labeled output
-└── label_later/        ← labeled output
+├── label_later/        ← labeled output
+└── discarded/          ← rejected output
 ```
 
 Each raw triplet folder in `unassociated/` should contain `frame_0.jpg`, `frame_1.jpg`,
@@ -83,6 +84,40 @@ You need:
 
 ## Usage
 
+### Deploy online
+
+This repo is set up for Railway with a Docker image that includes `ffmpeg`,
+Gunicorn, and YOLO dependencies.
+
+Create a Railway web service from the repo and set:
+
+```text
+DRIVE_PROJECT_ROOT_FOLDER_ID=...
+DRIVE_SERVICE_ACCOUNT_JSON_B64=...
+AUTH_REQUIRED=1
+LABELER_PASSWORD=...
+FLASK_SECRET_KEY=...
+WEB_CONCURRENCY=1
+```
+
+The default web start command is:
+
+```bash
+gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 8 --timeout 180 app:app
+```
+
+Create a second Railway service or job from the same repo for finite preprocessing:
+
+```bash
+python main.py --preprocess-until-empty --sources all
+```
+
+That command processes unmarked videos in `raw_videos/`, materializes missing
+Reolink crops from every configured site, stamps raw videos as `complete`,
+`skipped`, or `error`, prints a JSON summary, then exits. Real video batches need
+enough ephemeral disk for source downloads and extracted frames; avoid tiny free
+storage for large uploads.
+
 ### Process videos
 
 ```bash
@@ -119,7 +154,8 @@ If any Matthews channel in `unassociated/` is missing a saved config, the Reolin
 stop and link you to the crop editor first.
 
 In both modes, labeling moves the entire triplet folder to the matching Drive folder instantly.
-Press `→` or `Space` to skip.
+Press `→` or `Space` to discard the current triplet. Discarded triplets are moved
+to `discarded/` and are treated as already handled by future preprocessing.
 
 ## Table geometry
 

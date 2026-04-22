@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import app as label_app
+import processor
 
 
 class FakeDriveClient:
@@ -111,6 +112,7 @@ class FakeDriveClient:
             "name": name,
             "mimeType": mime_type,
             "parents": [parent_id],
+            "appProperties": {},
             "content": content if content is not None else b"{}",
         }
         self.items[item_id] = item
@@ -215,13 +217,14 @@ class FakeDriveClient:
         return self._copy(item_id)
 
 
-def _fake_prepare_reolink_unlabeled_queue(fake: FakeDriveClient, context, target_unlabeled_count: int) -> None:
+def _fake_prepare_reolink_unlabeled_queue(fake: FakeDriveClient, context, target_unlabeled_count: int) -> int:
     if context.source != label_app.REOLINK_SOURCE or not context.seed_folder_id:
-        return
+        return 0
 
     label_app._assert_manual_crop_setup_ready(fake, context)
     existing_names = label_app._existing_generated_folder_names(fake, context)
     raw_folders = fake.list_folders(context.seed_folder_id)
+    generated_count = 0
     for raw_folder in raw_folders:
         mapped = label_app._mapped_camera_tables_for_reolink_folder(
             raw_folder["name"],
@@ -237,8 +240,10 @@ def _fake_prepare_reolink_unlabeled_queue(fake: FakeDriveClient, context, target
         _channel_number, _camera, table_polygons = mapped
         max_tables = 2 if raw_folder["name"] == "Reolink-CH-CH03_t0002" else 1
         for table_id, *_rest in table_polygons[:max_tables]:
-            derived_name = label_app._derived_reolink_folder_name(raw_folder["name"], table_id)
-            if derived_name in existing_names:
+            label_source = label_app._resolve_label_source(context.source, context.site_key)
+            legacy_name = label_app._derived_reolink_folder_name(raw_folder["name"], table_id)
+            derived_name = label_app._apply_source_prefix(legacy_name, label_source)
+            if derived_name in existing_names or legacy_name in existing_names:
                 continue
             folder_id = fake.ensure_subfolder(context.input_folder_id, derived_name)
             fake._add_triplet_files(folder_id, derived_name.replace("/", "_"))
@@ -251,6 +256,8 @@ def _fake_prepare_reolink_unlabeled_queue(fake: FakeDriveClient, context, target
                 })},
             )
             existing_names.add(derived_name)
+            generated_count += 1
+    return generated_count
 
 
 @pytest.fixture()
@@ -280,6 +287,7 @@ def fake_drive(monkeypatch):
             target_unlabeled_count,
         ),
     )
+    monkeypatch.setattr(label_app, "_maybe_trigger_video_preprocess", lambda context, unlabeled_count: None)
 
     label_app._source_folder_ids_cache.clear()
     label_app._listing_cache.clear()
@@ -305,12 +313,15 @@ def test_api_sources_exposes_video_and_reolink_sites(client):
     payload = response.get_json()
     assert [source["source"] for source in payload["sources"]] == ["video", "reolink"]
     assert [site["site_key"] for site in payload["reolink_sites"]] == [
-        "reolink-matthews-01",
         "restaurant-pi-1",
+        "reolink-matthews-01",
     ]
-    matthews_site = payload["reolink_sites"][0]
+    sites_by_key = {site["site_key"]: site for site in payload["reolink_sites"]}
+    matthews_site = sites_by_key["reolink-matthews-01"]
     assert matthews_site["manual_crop_configs"] is True
     assert matthews_site["crop_editor_url"] == "/crop-editor?site=reolink-matthews-01"
+    assert matthews_site["label"] == "Matthews"
+    assert sites_by_key["restaurant-pi-1"]["label"] == "Mimosas (Photos)"
 
 
 def test_queue_is_source_aware_and_reolink_filters_incomplete_triplets(client):
@@ -327,8 +338,8 @@ def test_queue_is_source_aware_and_reolink_filters_incomplete_triplets(client):
     assert matthews_response.status_code == 200
     assert matthews_payload["source_context"]["queue_key"] == "reolink:reolink-matthews-01"
     assert [folder["folder_name"] for folder in matthews_payload["folders"]] == [
-        "Reolink-CH-CH03_table_top_1_t0002",
-        "Reolink-CH-CH03_table_top_2_t0002",
+        "matthews-Reolink-CH-CH03_table_top_1_t0002",
+        "matthews-Reolink-CH-CH03_table_top_2_t0002",
     ]
     assert matthews_payload["total_unlabeled"] == 2
 
@@ -338,7 +349,7 @@ def test_queue_is_source_aware_and_reolink_filters_incomplete_triplets(client):
     assert restaurant_response.status_code == 200
     assert restaurant_payload["source_context"]["queue_key"] == "reolink:restaurant-pi-1"
     assert [folder["folder_name"] for folder in restaurant_payload["folders"]] == [
-        "Reolink-CH-CH04_table_top_1_t0004"
+        "mimosas-Reolink-CH-CH04_table_top_1_t0004"
     ]
 
 
@@ -358,13 +369,18 @@ def test_reolink_label_moves_folder_within_same_site_tree(client, fake_drive):
     )
 
     assert label_response.status_code == 200
-    matthews_clean_id = fake_drive.find_file_by_name(
-        "site-matthews",
+    shared_clean_id = fake_drive.find_file_by_name(
+        "project-root",
         "clean",
         mime_type=label_app.FOLDER_MIME,
     )["id"]
-    assert fake_drive.items[folder["folder_id"]]["parents"] == [matthews_clean_id]
-    assert fake_drive.items[folder["folder_id"]]["parents"] != ["video-clean"]
+    assert fake_drive.items[folder["folder_id"]]["parents"] == [shared_clean_id]
+    # The per-site clean/ tree should no longer be the target.
+    assert fake_drive.find_file_by_name(
+        "site-matthews",
+        "clean",
+        mime_type=label_app.FOLDER_MIME,
+    ) is None
 
     stats_response = client.get("/api/stats?source=reolink&site=reolink-matthews-01")
     stats_payload = stats_response.get_json()
@@ -377,7 +393,168 @@ def test_reolink_queue_allows_triplets_without_metadata_json(client):
 
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload["folders"][0]["folder_name"] == "Reolink-CH-CH04_table_top_1_t0004"
+    assert payload["folders"][0]["folder_name"] == "mimosas-Reolink-CH-CH04_table_top_1_t0004"
+
+
+def test_apply_source_prefix_is_idempotent_and_per_restaurant():
+    mimosas_video = label_app._resolve_label_source("video", None)
+    mimosas_photos = label_app._resolve_label_source("reolink", "restaurant-pi-1")
+    matthews = label_app._resolve_label_source("reolink", "reolink-matthews-01")
+
+    assert label_app._apply_source_prefix("ipc3_table-4_t0001", mimosas_video) == "mimosas-ipc3_table-4_t0001"
+    assert label_app._apply_source_prefix("Reolink-CH-CH04_table_top_1_t0004", mimosas_photos) == "mimosas-Reolink-CH-CH04_table_top_1_t0004"
+    assert label_app._apply_source_prefix("Reolink-CH-CH03_table_top_1_t0002", matthews) == "matthews-Reolink-CH-CH03_table_top_1_t0002"
+
+    already = label_app._apply_source_prefix("mimosas-ipc3_table-4_t0001", mimosas_video)
+    assert already == "mimosas-ipc3_table-4_t0001"
+    still = label_app._apply_source_prefix(already, mimosas_video)
+    assert still == "mimosas-ipc3_table-4_t0001"
+
+    cross = label_app._apply_source_prefix("matthews-Reolink-CH-CH03_t0002", mimosas_video)
+    assert cross == "matthews-Reolink-CH-CH03_t0002"
+
+
+def test_label_discarded_route(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+
+    discarded_response = client.post(
+        "/api/label",
+        json={
+            "folder_id": folder["folder_id"],
+            "parent_id": folder["parent_id"],
+            "label": "discarded",
+            "source": folder["source"],
+            "site_key": folder["site_key"],
+        },
+    )
+
+    assert discarded_response.status_code == 200
+    discarded_dest = fake_drive.find_file_by_name(
+        "project-root", "discarded", mime_type=label_app.FOLDER_MIME
+    )
+    assert discarded_dest is not None
+    assert fake_drive.items[folder["folder_id"]]["parents"] == [discarded_dest["id"]]
+
+
+def test_mimosas_photos_label_routes_to_shared_clean(client, fake_drive):
+    queue_response = client.get("/api/queue?source=reolink&site=restaurant-pi-1&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+
+    label_response = client.post(
+        "/api/label",
+        json={
+            "folder_id": folder["folder_id"],
+            "parent_id": folder["parent_id"],
+            "label": "clean",
+            "source": folder["source"],
+            "site_key": folder["site_key"],
+        },
+    )
+
+    assert label_response.status_code == 200
+    shared_clean = fake_drive.find_file_by_name(
+        "project-root", "clean", mime_type=label_app.FOLDER_MIME
+    )
+    assert shared_clean is not None
+    assert fake_drive.items[folder["folder_id"]]["parents"] == [shared_clean["id"]]
+    # restaurant-pi-1 should not have a per-site clean/ tree anymore.
+    assert fake_drive.find_file_by_name(
+        "site-restaurant", "clean", mime_type=label_app.FOLDER_MIME
+    ) is None
+
+
+def test_label_route_rejects_unknown_label(client):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+
+    bogus_response = client.post(
+        "/api/label",
+        json={
+            "folder_id": folder["folder_id"],
+            "parent_id": folder["parent_id"],
+            "label": "bogus",
+            "source": folder["source"],
+            "site_key": folder["site_key"],
+        },
+    )
+
+    assert bogus_response.status_code == 400
+    assert "discarded" in bogus_response.get_json()["error"]
+
+
+def test_label_stamps_metadata_and_rejects_stale_second_move(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    payload = {
+        "folder_id": folder["folder_id"],
+        "parent_id": folder["parent_id"],
+        "label": "dirty",
+        "source": folder["source"],
+        "site_key": folder["site_key"],
+    }
+
+    first_response = client.post("/api/label", json=payload)
+    second_response = client.post("/api/label", json=payload)
+
+    assert first_response.status_code == 200
+    folder_item = fake_drive.items[folder["folder_id"]]
+    assert folder_item["appProperties"]["autolabel_final_label"] == "dirty"
+    assert folder_item["appProperties"]["autolabel_source"] == "video"
+    assert folder_item["appProperties"]["autolabel_queue_key"] == "video"
+    assert folder_item["appProperties"]["autolabel_labeled_by"] == "local"
+    assert second_response.status_code == 409
+    assert second_response.get_json()["code"] == "already_labeled"
+
+
+def test_cache_dir_reuses_existing_repo_cache(monkeypatch, tmp_path):
+    fake_repo = tmp_path / "repo"
+    repo_cache = fake_repo / "label_cache"
+    temp_root = tmp_path / "tmp"
+    temp_cache = temp_root / "AutoLabeler" / "label_cache"
+    repo_cache.mkdir(parents=True)
+    (repo_cache / "already-warm.jpg").write_bytes(b"cached")
+
+    monkeypatch.delenv("LABEL_CACHE_DIR", raising=False)
+    monkeypatch.setattr(label_app, "__file__", str(fake_repo / "app.py"))
+    monkeypatch.setattr(label_app.tempfile, "gettempdir", lambda: str(temp_root))
+    monkeypatch.setattr(label_app, "CACHE_DIR", temp_cache)
+
+    assert label_app._ensure_cache_dir() == repo_cache
+    assert label_app.CACHE_DIR == repo_cache
+    assert not temp_cache.exists()
+
+
+def test_auth_requires_login_and_csrf_for_mutations(client, monkeypatch):
+    monkeypatch.setattr(label_app, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(label_app, "LABELER_PASSWORD", "pw")
+
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/api/sources").status_code == 401
+
+    login_response = client.post("/login", data={"password": "pw", "labeler_name": "sam"})
+    assert login_response.status_code == 302
+    assert client.get("/api/sources").status_code == 200
+
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    payload = {
+        "folder_id": folder["folder_id"],
+        "parent_id": folder["parent_id"],
+        "label": "clean",
+        "source": folder["source"],
+        "site_key": folder["site_key"],
+    }
+
+    assert client.post("/api/label", json=payload).status_code == 403
+    with client.session_transaction() as session:
+        csrf_token = session["_csrf_token"]
+    ok_response = client.post(
+        "/api/label",
+        json=payload,
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert ok_response.status_code == 200
 
 
 def test_matthews_crop_status_and_existing_config_are_exposed(client):
@@ -467,3 +644,48 @@ def test_ordered_quadrilateral_points_normalizes_crossed_click_order():
         (100.0, 100.0),
         (10.0, 100.0),
     ]
+
+
+def test_video_processor_marks_completed_and_skips_marked_videos(fake_drive, monkeypatch):
+    fake_drive._add_file("video-1", "IPC3_sample.mp4", "video-raw", mime_type="video/mp4")
+    calls = []
+
+    def fake_process_video(video_meta, cameras, folders, client, tmp, yolo_model=None):
+        calls.append(video_meta["id"])
+        return processor.VideoProcessResult(status="complete", uploaded_triplets=2)
+
+    monkeypatch.setattr(processor, "load_yolo_model", lambda: None)
+    monkeypatch.setattr(processor, "_process_video", fake_process_video)
+
+    first = processor.run_processor(
+        "project-root",
+        Path(__file__).resolve().parents[1] / "approved_table_rectangles.json",
+        fake_drive,
+    )
+    second = processor.run_processor(
+        "project-root",
+        Path(__file__).resolve().parents[1] / "approved_table_rectangles.json",
+        fake_drive,
+    )
+
+    assert calls == ["video-1"]
+    assert first.completed == 1
+    assert first.triplets_uploaded == 2
+    assert second.already_marked == 1
+    assert fake_drive.items["video-1"]["appProperties"][processor.PREPROCESS_STATUS_PROPERTY] == "complete"
+    assert fake_drive.items["video-1"]["appProperties"][processor.PREPROCESS_TRIPLETS_PROPERTY] == "2"
+
+
+def test_reolink_drain_treats_legacy_unprefixed_folders_as_existing(fake_drive):
+    legacy_name = "Reolink-CH-CH04_table_top_1_t0004"
+    legacy_id = fake_drive.ensure_subfolder("r-unlabeled", legacy_name)
+    fake_drive._add_triplet_files(legacy_id, "legacy-rready")
+
+    summary = label_app.drain_reolink_preprocessing(fake_drive, ["restaurant-pi-1"])
+
+    assert summary["generated"] == 0
+    assert fake_drive.find_file_by_name(
+        "r-unlabeled",
+        "mimosas-Reolink-CH-CH04_table_top_1_t0004",
+        mime_type=label_app.FOLDER_MIME,
+    ) is None

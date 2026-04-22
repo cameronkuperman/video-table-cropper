@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="csrf-token" content="{{ csrf_token }}" />
 <title>AutoLabeler</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -248,7 +249,7 @@
   <button onclick="init(true)">Refresh from Drive</button>
 </div>
 
-<p class="hint">Keys: <b>1</b> Occupied &nbsp; <b>2</b> Dirty &nbsp; <b>3</b> Clean &nbsp; <b>4</b> Label Later &nbsp; <b>→ / Space</b> Skip</p>
+<p class="hint">Keys: <b>1</b> Occupied &nbsp; <b>2</b> Dirty &nbsp; <b>3</b> Clean &nbsp; <b>4</b> Label Later &nbsp; <b>→ / Space</b> Discard</p>
 
 <script src="/static/app.js"></script>
 </body>

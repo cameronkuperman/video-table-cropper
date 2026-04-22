@@ -23,12 +23,13 @@ let stats = {
     dirty: 0,
     occupied: 0,
     label_later: 0,
+    discarded: 0,
 };
 
 const INITIAL_QUEUE_BATCH_SIZE = 60;
 const REFILL_QUEUE_BATCH_SIZE = 120;
-const WARM_BUFFER_SIZE = 72;
-const LOW_WATERMARK = 80;
+const WARM_BUFFER_SIZE = 144;
+const LOW_WATERMARK = 160;
 const TIMING_LOGS_ENABLED = true;
 
 const cardEl = document.getElementById('card');
@@ -41,6 +42,7 @@ const sourceModeEl = document.getElementById('source-mode');
 const sourceSiteEl = document.getElementById('source-site');
 const siteControlEl = document.getElementById('site-control');
 const sourceSummaryEl = document.getElementById('source-summary');
+const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
 
 function buildApiError(data, res, fallbackLabel) {
     const error = new Error(data.error || `${fallbackLabel} failed (${res.status})`);
@@ -158,6 +160,7 @@ function extractStats(payload) {
         dirty: payload.dirty || 0,
         occupied: payload.occupied || 0,
         label_later: payload.label_later || 0,
+        discarded: payload.discarded || 0,
     };
 }
 
@@ -168,7 +171,7 @@ function setStats(nextStats) {
     };
 
     statsEl.textContent =
-        `${activePendingLabel}: ${stats.unlabeled}  |  clean: ${stats.clean}  |  dirty: ${stats.dirty}  |  occupied: ${stats.occupied}  |  later: ${stats.label_later}`;
+        `${activePendingLabel}: ${stats.unlabeled}  |  clean: ${stats.clean}  |  dirty: ${stats.dirty}  |  occupied: ${stats.occupied}  |  later: ${stats.label_later}  |  discarded: ${stats.discarded}`;
 }
 
 function localReadyCount() {
@@ -227,6 +230,14 @@ function appendSourceParams(params, source = activeSource, siteKey = activeSiteK
     if (source === 'reolink' && siteKey) {
         params.set('site', siteKey);
     }
+}
+
+function jsonPostHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (csrfToken) {
+        headers['X-CSRF-Token'] = csrfToken;
+    }
+    return headers;
 }
 
 async function fetchSources() {
@@ -408,7 +419,7 @@ function preloadFolder(folder) {
 
     const startedAt = performance.now();
     const urls = ['frame_0', 'frame_1', 'frame_2']
-        .map(key => folder.preview_urls?.[key])
+        .map(key => folder.thumb_urls?.[key] ?? folder.preview_urls?.[key])
         .filter(Boolean);
 
     folder.preloadPromise = Promise.all(urls.map(preloadImage))
@@ -486,7 +497,7 @@ function renderFolderCard(folder) {
             <button class="btn dirty"    onclick="labelCurrent('dirty')">Dirty [2]</button>
             <button class="btn clean"    onclick="labelCurrent('clean')">Clean [3]</button>
             <button class="btn later"    onclick="labelCurrent('label_later')">Label Later [4]</button>
-            <button class="btn skip"     onclick="skipCurrent()">Skip &rarr; [&rarr;]</button>
+            <button class="btn skip"     onclick="skipCurrent()">Discard [S / &rarr;]</button>
         </div>
     `;
 }
@@ -658,7 +669,7 @@ async function labelCurrent(label) {
     try {
         const res = await fetch('/api/label', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: jsonPostHeaders(),
             body: JSON.stringify({
                 folder_id: folder.folder_id,
                 parent_id: folder.parent_id,
@@ -669,6 +680,10 @@ async function labelCurrent(label) {
         });
         const data = await res.json();
         if (!res.ok || data.error) {
+            if (res.status === 409 && data.code === 'already_labeled') {
+                refreshStats();
+                return;
+            }
             throw new Error(data.error || `Move failed (${res.status})`);
         }
         logTiming('labelCurrent', {
@@ -687,17 +702,7 @@ async function labelCurrent(label) {
 }
 
 function skipCurrent() {
-    if (folders.length === 0) return;
-
-    if (currentIndex + 1 < folders.length) {
-        currentIndex += 1;
-    } else if (hasMore) {
-        currentIndex += 1;
-    } else {
-        currentIndex = 0;
-    }
-
-    renderCard();
+    labelCurrent('discarded');
 }
 
 function showError(msg, isHtml = false) {
@@ -745,7 +750,7 @@ document.addEventListener('keydown', e => {
     else if (e.key === '2') labelCurrent('dirty');
     else if (e.key === '3') labelCurrent('clean');
     else if (e.key === '4') labelCurrent('label_later');
-    else if (e.key === 'ArrowRight' || e.key === ' ') {
+    else if (e.key === 's' || e.key === 'S' || e.key === 'ArrowRight' || e.key === ' ') {
         e.preventDefault();
         skipCurrent();
     }

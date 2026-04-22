@@ -60,22 +60,10 @@ def _rasterize_polygon(points: list[tuple[float, float]], shape: tuple[int, int]
 
 # ── Step 1: per-frame detection ────────────────────────────────────────────
 
-def detect_people_in_frame(frame_path: Path, model) -> list[dict[str, Any]]:
-    """
-    Run YOLOv8-seg on one frame. Returns one dict per detected person.
-
-    Each dict:
-      mask         bool ndarray H×W — pixel-level segmentation (not saved to JSON)
-      bbox_xyxy    [x1, y1, x2, y2] in pixel coords of the original image
-      centroid_norm  (cx, cy) normalized 0–1 by frame width/height
-      score        detection confidence 0–1
-      track_id     None — filled in by assign_track_ids()
-    """
-    results = model(str(frame_path), classes=[0], conf=0.15, verbose=False)
-    result = results[0]
+def _people_from_result(result) -> list[dict[str, Any]]:
+    """Convert one ultralytics Results object into our list-of-dicts format."""
     orig_h, orig_w = result.orig_shape
-
-    people = []
+    people: list[dict[str, Any]] = []
     if result.masks is None:
         return people
 
@@ -96,6 +84,33 @@ def detect_people_in_frame(frame_path: Path, model) -> list[dict[str, Any]]:
             "track_id": None,
         })
     return people
+
+
+def detect_people_in_frame(frame_path: Path, model) -> list[dict[str, Any]]:
+    """
+    Run YOLOv8-seg on one frame. Returns one dict per detected person.
+
+    Each dict:
+      mask         bool ndarray H×W — pixel-level segmentation (not saved to JSON)
+      bbox_xyxy    [x1, y1, x2, y2] in pixel coords of the original image
+      centroid_norm  (cx, cy) normalized 0–1 by frame width/height
+      score        detection confidence 0–1
+      track_id     None — filled in by assign_track_ids()
+    """
+    results = model(str(frame_path), classes=[0], conf=0.15, verbose=False)
+    return _people_from_result(results[0])
+
+
+def detect_people_batch(frame_paths: list[Path], model) -> list[list[dict[str, Any]]]:
+    """
+    Run YOLOv8-seg on multiple frames in a single batched forward pass.
+    Returns one list-of-people per input frame, in the same order.
+    Ultralytics batches natively when passed a list of paths — 2–3× faster on GPU.
+    """
+    if not frame_paths:
+        return []
+    results = model([str(p) for p in frame_paths], classes=[0], conf=0.15, verbose=False)
+    return [_people_from_result(r) for r in results]
 
 
 # ── Step 2: within-triplet tracking ───────────────────────────────────────

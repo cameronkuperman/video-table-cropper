@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,13 +25,56 @@ from extract_frames import extract_frames
 from person_detector import (
     assign_track_ids,
     build_perception_for_table,
-    detect_people_in_frame,
+    detect_people_batch,
     load_yolo_model,
 )
 from queue_metadata import build_folder_app_properties
 
+VIDEO_FOLDER_PREFIX = "mimosas"
+KNOWN_FOLDER_PREFIXES = ("mimosas", "matthews")
+PREPROCESS_STATUS_PROPERTY = "autolabel_preprocess_status"
+PREPROCESS_AT_PROPERTY = "autolabel_preprocessed_at"
+PREPROCESS_ERROR_PROPERTY = "autolabel_preprocess_error"
+PREPROCESS_TRIPLETS_PROPERTY = "autolabel_preprocess_triplets"
+PREPROCESS_COMPLETE_STATUSES = {"complete", "skipped", "error"}
+
+AUTOLABEL_UPLOAD_WORKERS = max(1, int(os.environ.get("AUTOLABEL_UPLOAD_WORKERS", "16") or "16"))
+AUTOLABEL_TABLE_WORKERS = max(1, int(os.environ.get("AUTOLABEL_TABLE_WORKERS", "8") or "8"))
+
+
+def _apply_video_prefix(name: str) -> str:
+    """Prepend the video source's restaurant prefix to a folder name, idempotently."""
+    if not name:
+        return name
+    for known in KNOWN_FOLDER_PREFIXES:
+        if name.startswith(f"{known}-"):
+            return name
+    return f"{VIDEO_FOLDER_PREFIX}-{name}"
+
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 FRAME_INTERVAL_SECONDS = 3  # extract one frame every N seconds
+
+
+@dataclass
+class VideoProcessResult:
+    status: str
+    uploaded_triplets: int = 0
+    reason: str = ""
+
+
+@dataclass
+class ProcessorRunSummary:
+    scanned: int = 0
+    already_marked: int = 0
+    completed: int = 0
+    skipped: int = 0
+    errored: int = 0
+    videos_with_new_work: int = 0
+    triplets_uploaded: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.scanned - self.already_marked - self.completed - self.skipped - self.errored)
 
 
 # ── camera / table loading ─────────────────────────────────────────────────
@@ -196,7 +242,16 @@ def save_jpeg(img: Image.Image, path: Path) -> None:
 
 def ensure_drive_folders(client: DriveClient, project_root_id: str) -> dict[str, str]:
     """Ensure all label workflow subfolders exist under the project root."""
-    names = ["raw_videos", "temp_processing", "unlabeled", "clean", "dirty", "occupied", "label_later"]
+    names = [
+        "raw_videos",
+        "temp_processing",
+        "unlabeled",
+        "clean",
+        "dirty",
+        "occupied",
+        "label_later",
+        "discarded",
+    ]
     return {name: client.ensure_subfolder(project_root_id, name) for name in names}
 
 
@@ -216,7 +271,7 @@ def _fmt_eta(seconds: float) -> str:
 def _find_videos_recursive(client: DriveClient, folder_id: str) -> list[dict]:
     """Recursively find all video files in a folder and its subfolders. Skips images."""
     video_files = []
-    for item in client.list_files(folder_id):
+    for item in client.list_files(folder_id, fields="id,name,mimeType,parents,appProperties"):
         if item.get("mimeType") == "application/vnd.google-apps.folder":
             video_files.extend(_find_videos_recursive(client, item["id"]))
         elif Path(item["name"]).suffix.lower() in ALLOWED_VIDEO_EXTENSIONS:
@@ -224,38 +279,128 @@ def _find_videos_recursive(client: DriveClient, folder_id: str) -> list[dict]:
     return video_files
 
 
-def run_processor(project_root_id: str, tables_json_path: Path, client: DriveClient) -> None:
+def _video_preprocess_status(video_meta: dict[str, Any]) -> str | None:
+    app_properties = video_meta.get("appProperties") or {}
+    status = app_properties.get(PREPROCESS_STATUS_PROPERTY)
+    return str(status) if status else None
+
+
+def _mark_video_preprocess_status(
+    client: DriveClient,
+    video_id: str,
+    status: str,
+    *,
+    reason: str = "",
+    uploaded_triplets: int = 0,
+) -> None:
+    properties = {
+        PREPROCESS_STATUS_PROPERTY: status,
+        PREPROCESS_AT_PROPERTY: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        PREPROCESS_TRIPLETS_PROPERTY: str(uploaded_triplets),
+    }
+    if reason:
+        properties[PREPROCESS_ERROR_PROPERTY] = reason[:1200]
+    client.update_file_metadata(
+        video_id,
+        {"appProperties": properties},
+        fields="id,name,mimeType,parents,appProperties",
+    )
+
+
+def run_processor(
+    project_root_id: str,
+    tables_json_path: Path,
+    client: DriveClient,
+    max_videos: int | None = None,
+) -> ProcessorRunSummary:
     cameras = _load_tables_json(tables_json_path)
     folders = ensure_drive_folders(client, project_root_id)
+    summary = ProcessorRunSummary()
 
     print("Scanning raw_videos/ (including subfolders)...")
     video_files = _find_videos_recursive(client, folders["raw_videos"])
+    summary.scanned = len(video_files)
 
     if not video_files:
         print("No videos found in raw_videos/ (or its subfolders).")
-        return
+        return summary
 
-    print(f"Found {len(video_files)} video(s) to process.")
+    max_new_videos = max_videos if max_videos is not None and max_videos > 0 else None
+
+    if max_new_videos is None:
+        print(f"Found {len(video_files)} video(s) to process.")
+    else:
+        print(f"Found {len(video_files)} candidate video(s); processing up to {max_new_videos} with new work.")
 
     yolo_model = load_yolo_model()
 
     with tempfile.TemporaryDirectory(prefix="autolabeler_") as tmpdir:
         tmp = Path(tmpdir)
         total = len(video_files)
+        processed_videos = 0
         video_durations: list[float] = []
         for video_idx, video_meta in enumerate(video_files, 1):
+            existing_status = _video_preprocess_status(video_meta)
+            if existing_status in PREPROCESS_COMPLETE_STATUSES:
+                print(f"\n[{video_idx}/{total}] {video_meta['name']} already marked {existing_status}, skipping.")
+                summary.already_marked += 1
+                continue
+
             t_start = time.time()
             print(f"\n[{video_idx}/{total}] ", end="")
-            _process_video(video_meta, cameras, folders, client, tmp, yolo_model)
+            try:
+                result = _process_video(video_meta, cameras, folders, client, tmp, yolo_model)
+                _mark_video_preprocess_status(
+                    client,
+                    str(video_meta["id"]),
+                    result.status,
+                    reason=result.reason,
+                    uploaded_triplets=result.uploaded_triplets,
+                )
+            except Exception as exc:
+                result = VideoProcessResult(status="error", reason=str(exc))
+                _mark_video_preprocess_status(
+                    client,
+                    str(video_meta["id"]),
+                    "error",
+                    reason=str(exc),
+                )
+                print(f"  Error: {exc}")
+
+            if result.status == "complete":
+                summary.completed += 1
+            elif result.status == "skipped":
+                summary.skipped += 1
+            elif result.status == "error":
+                summary.errored += 1
+
+            if result.uploaded_triplets > 0:
+                processed_videos += 1
+                summary.videos_with_new_work += 1
+                summary.triplets_uploaded += result.uploaded_triplets
             elapsed = time.time() - t_start
             video_durations.append(elapsed)
             avg = sum(video_durations) / len(video_durations)
             remaining = (total - video_idx) * avg
-            print(f"  Progress: {video_idx}/{total} videos done | "
-                  f"avg {avg:.0f}s/video | "
-                  f"ETA ~{_fmt_eta(remaining)}")
+            if max_new_videos is None:
+                print(f"  Progress: {video_idx}/{total} videos scanned | "
+                      f"avg {avg:.0f}s/video | "
+                      f"ETA ~{_fmt_eta(remaining)}")
+            else:
+                print(f"  Progress: {video_idx}/{total} videos scanned | "
+                      f"{processed_videos}/{max_new_videos} with new work | "
+                      f"avg {avg:.0f}s/video | "
+                      f"ETA ~{_fmt_eta(remaining)}")
+                if processed_videos >= max_new_videos:
+                    break
 
-    print("Done.")
+    print(
+        "Done. "
+        f"scanned={summary.scanned} already_marked={summary.already_marked} "
+        f"completed={summary.completed} skipped={summary.skipped} errored={summary.errored} "
+        f"triplets_uploaded={summary.triplets_uploaded}"
+    )
+    return summary
 
 
 def _scale_bbox(bbox: tuple[int,int,int,int], sx: float, sy: float) -> tuple[int,int,int,int]:
@@ -287,7 +432,7 @@ def _process_video(
     client: DriveClient,
     tmp: Path,
     yolo_model=None,
-) -> None:
+) -> VideoProcessResult:
     video_name = video_meta["name"]
     video_id = video_meta["id"]
     video_stem = Path(video_name).stem
@@ -297,18 +442,21 @@ def _process_video(
     # Detect camera
     ipc_num = detect_camera_from_filename(video_name)
     if ipc_num is None:
-        print(f"  Skipping: could not detect camera from filename '{video_name}'")
-        return
+        reason = f"could not detect camera from filename '{video_name}'"
+        print(f"  Skipping: {reason}")
+        return VideoProcessResult(status="skipped", reason=reason)
 
     camera = find_camera_tables(cameras, ipc_num)
     if camera is None:
-        print(f"  Skipping: no table config found for IPC{ipc_num}")
-        return
+        reason = f"no table config found for IPC{ipc_num}"
+        print(f"  Skipping: {reason}")
+        return VideoProcessResult(status="skipped", reason=reason)
 
     tables = camera.get("tables", [])
     if not tables:
-        print(f"  Skipping: camera IPC{ipc_num} has no tables defined")
-        return
+        reason = f"camera IPC{ipc_num} has no tables defined"
+        print(f"  Skipping: {reason}")
+        return VideoProcessResult(status="skipped", reason=reason)
 
     # Build polygon list per table
     # tuple: (table_id, tight_polygon, tight_bbox, zone_polygon)
@@ -324,8 +472,9 @@ def _process_video(
         table_polygons.append((table_id, tight_poly, tight_bbox, zone_poly))
 
     if not table_polygons:
-        print(f"  Skipping: no usable table polygons for IPC{ipc_num}")
-        return
+        reason = f"no usable table polygons for IPC{ipc_num}"
+        print(f"  Skipping: {reason}")
+        return VideoProcessResult(status="skipped", reason=reason)
 
     all_polygons = [p for _, p, _, _ in table_polygons]
 
@@ -339,13 +488,15 @@ def _process_video(
     print(f"  Extracting frames every {FRAME_INTERVAL_SECONDS}s...")
     success, frames_info = extract_frames(video_path, frames_dir, interval=FRAME_INTERVAL_SECONDS)
     if not success or not frames_info:
-        print(f"  Frame extraction failed.")
-        return
+        reason = "frame extraction failed"
+        print(f"  {reason}.")
+        return VideoProcessResult(status="error", reason=reason)
 
     frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
     if not frame_paths:
-        print(f"  No frames extracted.")
-        return
+        reason = "no frames extracted"
+        print(f"  {reason}.")
+        return VideoProcessResult(status="error", reason=reason)
 
     # Get actual frame resolution and scale table polygons if needed
     with Image.open(frame_paths[0]) as _img:
@@ -362,77 +513,131 @@ def _process_video(
     # Group into non-overlapping triplets
     triplets = [frame_paths[i:i+3] for i in range(0, len(frame_paths) - 2, 3)]
     if not triplets:
-        print(f"  Not enough frames for a triplet (need ≥3, got {len(frame_paths)}).")
-        return
+        reason = f"not enough frames for a triplet (need >=3, got {len(frame_paths)})"
+        print(f"  {reason}.")
+        return VideoProcessResult(status="skipped", reason=reason)
 
     perception_note = " + perception" if yolo_model is not None else " (no perception — install ultralytics)"
     print(f"  {len(frame_paths)} frames → {len(triplets)} triplet(s), {len(table_polygons)} table(s){perception_note}")
 
-    # Build set of already-uploaded triplet names across all destination folders for resume
+    # Build set of generated folder names across all destinations for resume.
+    # This intentionally includes legacy unprefixed names so online deploys do
+    # not duplicate older Drive data under the newer restaurant prefixes.
     already_uploaded: set[str] = set()
-    for dest in ("temp_processing", "unlabeled", "clean", "dirty", "occupied", "label_later"):
+    for dest in ("temp_processing", "unlabeled", "clean", "dirty", "occupied", "label_later", "discarded"):
         for f in client.list_folders(folders[dest]):
             already_uploaded.add(f["name"])
 
-    for triplet_idx, triplet in enumerate(triplets):
-        triplet_name = f"{video_stem}_t{triplet_idx:04d}"
+    upload_executor = ThreadPoolExecutor(max_workers=AUTOLABEL_UPLOAD_WORKERS)
+    table_executor = ThreadPoolExecutor(max_workers=AUTOLABEL_TABLE_WORKERS)
+    uploaded_triplets = 0
+    try:
+        for triplet_idx, triplet in enumerate(triplets):
+            raw_triplet_name = f"{video_stem}_t{triplet_idx:04d}"
+            triplet_name = _apply_video_prefix(raw_triplet_name)
 
-        # Resume: skip if this triplet was already uploaded
-        if triplet_name in already_uploaded:
-            print(f"  Triplet {triplet_idx+1}/{len(triplets)} already uploaded, skipping.")
-            continue
+            # Resume: skip if this triplet was already uploaded
+            if triplet_name in already_uploaded or raw_triplet_name in already_uploaded:
+                print(f"  Triplet {triplet_idx+1}/{len(triplets)} already uploaded, skipping.")
+                continue
 
-        # ── Person detection for this triplet (full frames, once per triplet) ──
-        frame_detections = None
-        if yolo_model is not None:
-            frame_detections = [detect_people_in_frame(fp, yolo_model) for fp in triplet]
-            assign_track_ids(frame_detections)
+            # ── Person detection for this triplet (full frames, once per triplet) ──
+            frame_detections = None
+            if yolo_model is not None:
+                frame_detections = detect_people_batch(list(triplet), yolo_model)
+                assign_track_ids(frame_detections)
 
-        # ── temp_processing: 3 frames with all overlays drawn ──────────────
-        temp_subfolder_id = client.ensure_subfolder(folders["temp_processing"], triplet_name)
-        for frame_idx, frame_path in enumerate(triplet):
-            overlaid = draw_overlays(frame_path, all_polygons)
-            if frame_detections is not None:
-                overlaid = draw_person_detections(overlaid, frame_detections[frame_idx])
-            out = tmp / "overlay" / f"{triplet_name}_f{frame_idx}.jpg"
-            save_jpeg(overlaid, out)
-            client.upload_or_update_file(out, temp_subfolder_id, file_name=f"frame_{frame_idx}.jpg")
-
-        # ── unlabeled: one subfolder per table, 3 cropped frames + perception ──
-        for table_id, tight_poly, tight_bbox, zone_poly in table_polygons:
-            subfolder_name = f"{video_stem}_{table_id}_t{triplet_idx:04d}"
-            unlabeled_subfolder_id = client.ensure_subfolder(folders["unlabeled"], subfolder_name)
-            uploaded_frame_ids: dict[str, str | None] = {
-                "frame_0": None,
-                "frame_1": None,
-                "frame_2": None,
-            }
-
+            # ── temp_processing: 3 frames with all overlays drawn (parallel upload) ──
+            temp_subfolder_id = client.ensure_subfolder(folders["temp_processing"], triplet_name)
+            overlay_futures = []
             for frame_idx, frame_path in enumerate(triplet):
-                cropped = perspective_crop_polygon(frame_path, zone_poly)
-                out = tmp / "crops" / f"{subfolder_name}_f{frame_idx}.jpg"
-                save_jpeg(cropped, out)
-                uploaded = client.upload_or_update_file(
-                    out,
-                    unlabeled_subfolder_id,
-                    file_name=f"frame_{frame_idx}.jpg",
+                overlaid = draw_overlays(frame_path, all_polygons)
+                if frame_detections is not None:
+                    overlaid = draw_person_detections(overlaid, frame_detections[frame_idx])
+                out = tmp / "overlay" / f"{triplet_name}_f{frame_idx}.jpg"
+                save_jpeg(overlaid, out)
+                overlay_futures.append(
+                    upload_executor.submit(
+                        client.upload_or_update_file,
+                        out,
+                        temp_subfolder_id,
+                        file_name=f"frame_{frame_idx}.jpg",
+                    )
                 )
-                uploaded_frame_ids[f"frame_{frame_idx}"] = str(uploaded["id"])
+            for fut in overlay_futures:
+                fut.result()
 
-            client.update_file_metadata(
-                unlabeled_subfolder_id,
-                {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
-            )
+            # ── unlabeled: one subfolder per table — tables processed in parallel ──
+            def _process_table(entry):
+                table_id, tight_poly, _tight_bbox, zone_poly = entry
+                raw_subfolder_name = f"{video_stem}_{table_id}_t{triplet_idx:04d}"
+                subfolder_name = _apply_video_prefix(raw_subfolder_name)
+                if subfolder_name in already_uploaded or raw_subfolder_name in already_uploaded:
+                    print(f"  Table folder {raw_subfolder_name} already exists, skipping.")
+                    return False
 
-            # Write perception.json if person detection ran
-            if frame_detections is not None:
-                perception = build_perception_for_table(frame_detections, tight_poly, img_shape)
-                perc_path = tmp / "perception" / f"{subfolder_name}_perception.json"
-                perc_path.parent.mkdir(parents=True, exist_ok=True)
-                perc_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
-                client.upload_or_update_file(perc_path, unlabeled_subfolder_id, file_name="perception.json")
+                unlabeled_subfolder_id = client.ensure_subfolder(
+                    folders["unlabeled"], subfolder_name
+                )
+                uploaded_frame_ids: dict[str, str | None] = {
+                    "frame_0": None,
+                    "frame_1": None,
+                    "frame_2": None,
+                }
 
-        pct = int((triplet_idx + 1) / len(triplets) * 100)
-        print(f"  Triplet {triplet_idx+1}/{len(triplets)} ({pct}%) uploaded.")
+                crop_futures = {}
+                for frame_idx, frame_path in enumerate(triplet):
+                    cropped = perspective_crop_polygon(frame_path, zone_poly)
+                    out = tmp / "crops" / f"{subfolder_name}_f{frame_idx}.jpg"
+                    save_jpeg(cropped, out)
+                    crop_futures[frame_idx] = upload_executor.submit(
+                        client.upload_or_update_file,
+                        out,
+                        unlabeled_subfolder_id,
+                        file_name=f"frame_{frame_idx}.jpg",
+                    )
+                for frame_idx, fut in crop_futures.items():
+                    uploaded = fut.result()
+                    uploaded_frame_ids[f"frame_{frame_idx}"] = str(uploaded["id"])
+
+                client.update_file_metadata(
+                    unlabeled_subfolder_id,
+                    {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
+                )
+
+                if frame_detections is not None:
+                    perception = build_perception_for_table(frame_detections, tight_poly, img_shape)
+                    perc_path = tmp / "perception" / f"{subfolder_name}_perception.json"
+                    perc_path.parent.mkdir(parents=True, exist_ok=True)
+                    perc_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
+                    client.upload_or_update_file(
+                        perc_path,
+                        unlabeled_subfolder_id,
+                        file_name="perception.json",
+                    )
+                return True
+
+            table_futures = [
+                table_executor.submit(_process_table, entry)
+                for entry in table_polygons
+            ]
+            table_uploaded = False
+            for fut in as_completed(table_futures):
+                table_uploaded = bool(fut.result()) or table_uploaded
+
+            pct = int((triplet_idx + 1) / len(triplets) * 100)
+            if table_uploaded:
+                print(f"  Triplet {triplet_idx+1}/{len(triplets)} ({pct}%) uploaded.")
+                uploaded_triplets += 1
+            else:
+                print(f"  Triplet {triplet_idx+1}/{len(triplets)} ({pct}%) had no new table crops.")
+    finally:
+        upload_executor.shutdown(wait=True)
+        table_executor.shutdown(wait=True)
+
+    if uploaded_triplets == 0:
+        print(f"  No new triplets to upload.")
+        return VideoProcessResult(status="complete", uploaded_triplets=0)
 
     print(f"  Done: {video_name}")
+    return VideoProcessResult(status="complete", uploaded_triplets=uploaded_triplets)

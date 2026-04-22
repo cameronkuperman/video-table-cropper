@@ -1,4 +1,5 @@
 const defaults = window.CROP_EDITOR_DEFAULTS || {};
+const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
 
 const state = {
     siteKey: defaults.siteKey || 'reolink-matthews-01',
@@ -47,6 +48,14 @@ function showMessage(text, type = 'success') {
     editorMessageEl.hidden = false;
     editorMessageEl.textContent = text;
     editorMessageEl.className = `message ${type}`;
+}
+
+function jsonPostHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (csrfToken) {
+        headers['X-CSRF-Token'] = csrfToken;
+    }
+    return headers;
 }
 
 function colorForIndex(index) {
@@ -463,7 +472,7 @@ async function saveConfig() {
     try {
         const response = await fetch('/api/reolink/crop-config', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: jsonPostHeaders(),
             body: JSON.stringify({
                 site_key: state.siteKey,
                 channel_code: state.activeChannelCode,

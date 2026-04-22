@@ -9,6 +9,8 @@ import json
 import math
 import os
 import re
+import hmac
+import secrets
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +21,18 @@ from threading import Lock
 from typing import Any
 from urllib.parse import urlencode
 
-from flask import Flask, abort, g, jsonify, render_template, request, send_file
+from flask import (
+    Flask,
+    abort,
+    g,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    url_for,
+)
 
 from drive_client import DriveClient, DriveClientError, FOLDER_MIME
 from env_loader import load_local_env
@@ -32,6 +45,7 @@ from queue_metadata import (
 load_local_env()
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "autolabeler-dev-secret-change-me")
 
 QUEUE_BATCH_DEFAULT = max(36, int(os.environ.get("LABEL_QUEUE_BATCH_DEFAULT", "72") or "72"))
 QUEUE_BATCH_MAX = max(QUEUE_BATCH_DEFAULT, int(os.environ.get("LABEL_QUEUE_BATCH_MAX", "300") or "300"))
@@ -41,12 +55,24 @@ UNLABELED_LIST_CACHE_SECONDS = max(
 )
 HYDRATE_MAX_WORKERS = max(2, int(os.environ.get("LABEL_QUEUE_HYDRATE_WORKERS", "12") or "12"))
 PREVIEW_PREWARM_MAX_WORKERS = max(
-    2, int(os.environ.get("LABEL_PREVIEW_PREWARM_WORKERS", "24") or "24")
+    2, int(os.environ.get("LABEL_PREVIEW_PREWARM_WORKERS", "48") or "48")
 )
+THUMB_WIDTH = max(128, int(os.environ.get("LABEL_THUMB_WIDTH", "512") or "512"))
+THUMB_QUALITY = max(40, min(95, int(os.environ.get("LABEL_THUMB_QUALITY", "82") or "82")))
 FOLDER_PREWARM_MAX_WORKERS = max(
     2, int(os.environ.get("LABEL_FOLDER_PREWARM_WORKERS", "12") or "12")
 )
 PREWARM_FOLDER_COUNT = max(12, int(os.environ.get("LABEL_PREWARM_FOLDER_COUNT", "180") or "180"))
+REOLINK_PREWARM_TARGET = max(
+    PREWARM_FOLDER_COUNT,
+    int(os.environ.get("LABEL_REOLINK_PREWARM_TARGET", "200") or "200"),
+)
+AUTOLABEL_VIDEO_LOW_WATERMARK = max(
+    0, int(os.environ.get("AUTOLABEL_VIDEO_LOW_WATERMARK", "50") or "50")
+)
+AUTOLABEL_VIDEO_BATCH_SIZE = max(
+    1, int(os.environ.get("AUTOLABEL_VIDEO_BATCH_SIZE", "3") or "3")
+)
 HYDRATED_FOLDER_CACHE_TTL_SECONDS = max(60, int(os.environ.get("LABEL_HYDRATED_CACHE_TTL_SECONDS", "900") or "900"))
 READY_SCAN_MULTIPLIER = max(2, int(os.environ.get("LABEL_READY_SCAN_MULTIPLIER", "12") or "12"))
 READY_SCAN_MAX = max(100, int(os.environ.get("LABEL_READY_SCAN_MAX", "720") or "720"))
@@ -59,10 +85,20 @@ TIMING_LOGS_ENABLED = os.environ.get("LABEL_TIMING_LOGS", "1").strip().lower() n
     "off",
 }
 TIMING_LOG_MIN_MS = max(0.0, float(os.environ.get("LABEL_TIMING_LOG_MIN_MS", "0") or "0"))
+AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+LABELER_PASSWORD = os.environ.get("LABELER_PASSWORD", "")
+MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+if AUTH_REQUIRED and not os.environ.get("FLASK_SECRET_KEY"):
+    raise RuntimeError("FLASK_SECRET_KEY must be set when AUTH_REQUIRED=1")
 
 VIDEO_SOURCE = "video"
 REOLINK_SOURCE = "reolink"
-LABEL_DESTINATIONS = ("clean", "dirty", "occupied", "label_later")
+LABEL_DESTINATIONS = ("clean", "dirty", "occupied", "label_later", "discarded")
 MATTHEWS_SITE_KEY = "reolink-matthews-01"
 CROP_CONFIGS_FOLDER_NAME = "crop_configs"
 
@@ -124,20 +160,108 @@ class CropSetupRequiredError(RuntimeError):
         }
 
 
-# Keep this site list in code for now. If a site folder does not live directly
-# under DRIVE_PROJECT_ROOT_FOLDER_ID, set its root_id explicitly here.
-REOLINK_SITES = (
-    ReolinkSiteConfig(
-        site_key="reolink-matthews-01",
-        display_name="Reolink Matthews 01",
-        root_name="reolink-matthews-01",
-        manual_crop_configs=True,
+@dataclass(frozen=True)
+class LabelSource:
+    """Single source of truth for a labeling source.
+
+    Video and restaurant-pi-1 both belong to the Mimosas restaurant and share
+    the same folder_prefix, so labeled samples from both end up in the same
+    shared destination pool with a `mimosas-` name prefix. Intrinsic folder
+    name bodies (`<video_stem>_t0004` vs `Reolink-CH-…`) distinguish capture method.
+    """
+
+    source: str
+    site_key: str | None
+    queue_key: str
+    display_name: str
+    folder_prefix: str
+    manual_crop_configs: bool
+    root_name: str | None  # Drive folder name for reolink sources
+
+
+LABEL_SOURCES: tuple[LabelSource, ...] = (
+    LabelSource(
+        source="video",
+        site_key=None,
+        queue_key="video",
+        display_name="Mimosas (Video)",
+        folder_prefix="mimosas",
+        manual_crop_configs=False,
+        root_name=None,
     ),
-    ReolinkSiteConfig(
+    LabelSource(
+        source="reolink",
         site_key="restaurant-pi-1",
-        display_name="Restaurant Pi 1",
+        queue_key="reolink:restaurant-pi-1",
+        display_name="Mimosas (Photos)",
+        folder_prefix="mimosas",
+        manual_crop_configs=False,
         root_name="restaurant-pi-1",
     ),
+    LabelSource(
+        source="reolink",
+        site_key="reolink-matthews-01",
+        queue_key="reolink:reolink-matthews-01",
+        display_name="Matthews",
+        folder_prefix="matthews",
+        manual_crop_configs=True,
+        root_name="reolink-matthews-01",
+    ),
+)
+
+LABEL_SOURCES_BY_QUEUE_KEY: dict[str, LabelSource] = {
+    entry.queue_key: entry for entry in LABEL_SOURCES
+}
+
+KNOWN_FOLDER_PREFIXES: tuple[str, ...] = tuple(
+    sorted({entry.folder_prefix for entry in LABEL_SOURCES})
+)
+
+
+def _resolve_label_source(source: str | None, site_key: str | None) -> LabelSource:
+    normalized_source = (source or VIDEO_SOURCE).strip().lower() or VIDEO_SOURCE
+    normalized_site_key = (site_key or "").strip() or None
+
+    if normalized_source == VIDEO_SOURCE:
+        queue_key = VIDEO_SOURCE
+    elif normalized_source == REOLINK_SOURCE:
+        if not normalized_site_key:
+            raise ValueError("site is required when source=reolink")
+        queue_key = f"{REOLINK_SOURCE}:{normalized_site_key}"
+    else:
+        raise ValueError(f"Unknown source: {source}")
+
+    entry = LABEL_SOURCES_BY_QUEUE_KEY.get(queue_key)
+    if entry is None:
+        raise ValueError(f"Unknown labeling source: {queue_key}")
+    return entry
+
+
+def _apply_source_prefix(name: str, source: LabelSource) -> str:
+    """Prepend the restaurant prefix to a folder name unless already prefixed.
+
+    Idempotent: safe to call multiple times; never double-prefixes.
+    """
+    if not name:
+        return name
+    for known in KNOWN_FOLDER_PREFIXES:
+        if name.startswith(f"{known}-"):
+            return name
+    return f"{source.folder_prefix}-{name}"
+
+
+# Keep this site list in code for now. If a site folder does not live directly
+# under DRIVE_PROJECT_ROOT_FOLDER_ID, set its root_id explicitly here.
+# Derived from LABEL_SOURCES so display names/flags stay in one place.
+REOLINK_SITES = tuple(
+    ReolinkSiteConfig(
+        site_key=entry.site_key,  # type: ignore[arg-type]
+        display_name=entry.display_name,
+        root_name=entry.root_name,  # type: ignore[arg-type]
+        manual_crop_configs=entry.manual_crop_configs,
+    )
+    for entry in LABEL_SOURCES
+    if entry.source == "reolink" and entry.site_key and entry.root_name
 )
 REOLINK_SITES_BY_KEY = {site.site_key: site for site in REOLINK_SITES}
 
@@ -177,12 +301,62 @@ _hydrated_folder_cache: dict[tuple[str, str], tuple[float, dict | None]] = {}
 _hydrated_folder_cache_lock = Lock()
 _reolink_generation_lock = Lock()
 _yolo_model_lock = Lock()
+_video_preprocess_executor = ThreadPoolExecutor(max_workers=1)
+_video_preprocess_lock = Lock()
+_video_preprocess_state: dict[str, Any] = {
+    "inflight": False,
+    "last_run_at": None,
+    "last_run_videos": 0,
+    "last_run_triplets": 0,
+    "last_error": None,
+}
 _yolo_model: Any | None = None
 _camera_config_cache: dict[int, dict[str, Any]] | None = None
 _camera_config_lock = Lock()
 _crop_config_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
 _crop_config_lock = Lock()
 _CROP_CONFIG_CACHE_MISS = object()
+
+
+def _csrf_token() -> str:
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf_token"] = token
+    return str(token)
+
+
+@app.context_processor
+def _template_security_context() -> dict[str, str]:
+    return {"csrf_token": _csrf_token()}
+
+
+def _wants_json_response() -> bool:
+    return request.path.startswith("/api/") or "application/json" in request.headers.get("Accept", "")
+
+
+def _auth_public_endpoint() -> bool:
+    return request.endpoint in {"login", "healthz", "static"}
+
+
+@app.before_request
+def _require_auth_and_csrf() -> Any | None:
+    if request.method == "OPTIONS" or _auth_public_endpoint():
+        return None
+
+    if AUTH_REQUIRED and not session.get("authenticated"):
+        if _wants_json_response():
+            return jsonify({"error": "authentication_required"}), 401
+        next_url = request.full_path if request.query_string else request.path
+        return redirect(url_for("login", next=next_url))
+
+    if AUTH_REQUIRED and request.method in MUTATING_METHODS:
+        expected = session.get("_csrf_token")
+        supplied = request.headers.get("X-CSRF-Token", "")
+        if not expected or not hmac.compare_digest(str(expected), supplied):
+            return jsonify({"error": "csrf_token_invalid"}), 403
+
+    return None
 
 
 def _log_timing(event: str, **fields: object) -> None:
@@ -208,9 +382,18 @@ def get_client() -> DriveClient:
 def _ensure_cache_dir() -> Path:
     global CACHE_DIR
 
-    candidates = [CACHE_DIR]
     temp_cache = Path(tempfile.gettempdir()) / "AutoLabeler" / "label_cache"
     repo_cache = Path(__file__).parent / "label_cache"
+
+    configured_cache = os.environ.get("LABEL_CACHE_DIR", "").strip()
+    if configured_cache:
+        candidates = [CACHE_DIR]
+    elif repo_cache.exists():
+        # Older local runs used repo-local label_cache/. Reuse it when present
+        # so cached Drive previews do not get stranded behind a new temp path.
+        candidates = [repo_cache, temp_cache]
+    else:
+        candidates = [CACHE_DIR]
 
     for candidate in (temp_cache, repo_cache):
         if candidate not in candidates:
@@ -296,35 +479,63 @@ def _discover_reolink_root_id(client: DriveClient, site: ReolinkSiteConfig) -> s
     )
 
 
-def _video_folder_ids(client: DriveClient) -> dict[str, str]:
-    queue_key = VIDEO_SOURCE
+_SHARED_DESTINATIONS_CACHE_KEY = "__shared_destinations__"
+
+
+def _shared_destination_folder_ids(client: DriveClient) -> dict[str, str]:
+    """Return Drive IDs for the shared label destinations under the project root.
+
+    All sources write labeled samples into the same {clean, dirty, occupied,
+    label_later, discarded} folders under DRIVE_PROJECT_ROOT_FOLDER_ID. Folder
+    names carry a restaurant prefix to preserve source attribution.
+    """
     with _source_folder_ids_lock:
-        cached = _source_folder_ids_cache.get(queue_key)
+        cached = _source_folder_ids_cache.get(_SHARED_DESTINATIONS_CACHE_KEY)
         if cached is not None:
             return cached
 
         root = _root_id()
-        names = [
-            "raw_videos",
-            "temp_processing",
-            "unlabeled",
-            *LABEL_DESTINATIONS,
-        ]
-        folder_ids = {name: client.ensure_subfolder(root, name) for name in names}
+        shared = {name: client.ensure_subfolder(root, name) for name in LABEL_DESTINATIONS}
+        _source_folder_ids_cache[_SHARED_DESTINATIONS_CACHE_KEY] = shared
+        return shared
+
+
+def _video_folder_ids(client: DriveClient) -> dict[str, str]:
+    queue_key = VIDEO_SOURCE
+    shared = _shared_destination_folder_ids(client)
+    with _source_folder_ids_lock:
+        cached = _source_folder_ids_cache.get(queue_key)
+        if cached is not None:
+            if any(cached.get(name) != shared[name] for name in LABEL_DESTINATIONS):
+                cached = {**cached, **shared}
+                _source_folder_ids_cache[queue_key] = cached
+            return cached
+
+        root = _root_id()
+        folder_ids = {
+            name: client.ensure_subfolder(root, name)
+            for name in ("raw_videos", "temp_processing", "unlabeled")
+        }
+        folder_ids.update(shared)
         _source_folder_ids_cache[queue_key] = folder_ids
         return folder_ids
 
 
 def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, str]:
     queue_key = f"{REOLINK_SOURCE}:{site_key}"
+    shared = _shared_destination_folder_ids(client)
     with _source_folder_ids_lock:
         cached = _source_folder_ids_cache.get(queue_key)
         if cached is not None:
-            if _site_uses_manual_crop_configs(site_key) and "crop_configs" not in cached:
-                cached = dict(cached)
-                cached["crop_configs"] = client.ensure_subfolder(cached["root"], CROP_CONFIGS_FOLDER_NAME)
-                _source_folder_ids_cache[queue_key] = cached
-            return cached
+            updated = cached
+            if _site_uses_manual_crop_configs(site_key) and "crop_configs" not in updated:
+                updated = dict(updated)
+                updated["crop_configs"] = client.ensure_subfolder(updated["root"], CROP_CONFIGS_FOLDER_NAME)
+            if any(updated.get(name) != shared[name] for name in LABEL_DESTINATIONS):
+                updated = {**updated, **shared}
+            if updated is not cached:
+                _source_folder_ids_cache[queue_key] = updated
+            return updated
 
         site = _resolve_site_config(site_key)
         site_root_id = _discover_reolink_root_id(client, site)
@@ -341,8 +552,7 @@ def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, st
         }
         if site.manual_crop_configs:
             folder_ids["crop_configs"] = client.ensure_subfolder(site_root_id, CROP_CONFIGS_FOLDER_NAME)
-        for name in LABEL_DESTINATIONS:
-            folder_ids[name] = client.ensure_subfolder(site_root_id, name)
+        folder_ids.update(shared)
 
         _source_folder_ids_cache[queue_key] = folder_ids
         return folder_ids
@@ -429,14 +639,14 @@ def _resolve_queue_context(
     source: str,
     site_key: str | None,
 ) -> QueueContext:
-    normalized_source = (source or VIDEO_SOURCE).strip().lower() or VIDEO_SOURCE
-    if normalized_source == VIDEO_SOURCE:
+    label_source = _resolve_label_source(source, site_key)
+    if label_source.source == VIDEO_SOURCE:
         folder_ids = _video_folder_ids(client)
         return QueueContext(
-            source=VIDEO_SOURCE,
+            source=label_source.source,
             site_key=None,
-            queue_key=VIDEO_SOURCE,
-            display_name="Video",
+            queue_key=label_source.queue_key,
+            display_name=label_source.display_name,
             input_folder_name="unlabeled",
             input_folder_id=folder_ids["unlabeled"],
             seed_folder_name=None,
@@ -445,26 +655,19 @@ def _resolve_queue_context(
             persist_frame_metadata=True,
         )
 
-    if normalized_source == REOLINK_SOURCE:
-        normalized_site_key = (site_key or "").strip()
-        if not normalized_site_key:
-            raise ValueError("site is required when source=reolink")
-        site = _resolve_site_config(normalized_site_key)
-        folder_ids = _reolink_site_folder_ids(client, normalized_site_key)
-        return QueueContext(
-            source=REOLINK_SOURCE,
-            site_key=normalized_site_key,
-            queue_key=f"{REOLINK_SOURCE}:{normalized_site_key}",
-            display_name=site.display_name,
-            input_folder_name="unlabeled",
-            input_folder_id=folder_ids["unlabeled"],
-            seed_folder_name="unassociated",
-            seed_folder_id=folder_ids["unassociated"],
-            folder_ids=folder_ids,
-            persist_frame_metadata=False,
-        )
-
-    raise ValueError(f"Unknown source: {source}")
+    folder_ids = _reolink_site_folder_ids(client, label_source.site_key or "")
+    return QueueContext(
+        source=label_source.source,
+        site_key=label_source.site_key,
+        queue_key=label_source.queue_key,
+        display_name=label_source.display_name,
+        input_folder_name="unlabeled",
+        input_folder_id=folder_ids["unlabeled"],
+        seed_folder_name="unassociated",
+        seed_folder_id=folder_ids["unassociated"],
+        folder_ids=folder_ids,
+        persist_frame_metadata=False,
+    )
 
 
 def _request_source_args() -> tuple[str, str | None]:
@@ -478,6 +681,23 @@ def _payload_source_args(data: dict[str, Any]) -> tuple[str, str | None]:
     site_key_value = data.get("site_key", data.get("site"))
     site_key = str(site_key_value).strip() if site_key_value else None
     return source, site_key
+
+
+def _labeler_name() -> str:
+    return str(session.get("labeler_name") or "local")
+
+
+def _label_app_properties(label: str, context: QueueContext) -> dict[str, str]:
+    properties = {
+        "autolabel_final_label": label,
+        "autolabel_labeled_at": datetime.now(timezone.utc).isoformat(),
+        "autolabel_labeled_by": _labeler_name(),
+        "autolabel_source": context.source,
+        "autolabel_queue_key": context.queue_key,
+    }
+    if context.site_key:
+        properties["autolabel_site_key"] = context.site_key
+    return properties
 
 
 def _table_config_path() -> Path:
@@ -860,9 +1080,13 @@ def _materialize_reolink_table_crops(
         frame_detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
         assign_track_ids(frame_detections)
 
+        label_source = _resolve_label_source(context.source, context.site_key)
         generated_names: list[str] = []
         for table_id, tight_poly, _tight_bbox, zone_poly in scaled_polygons:
-            derived_name = _derived_reolink_folder_name(raw_folder["name"], table_id)
+            derived_name = _apply_source_prefix(
+                _derived_reolink_folder_name(raw_folder["name"], table_id),
+                label_source,
+            )
             dest_folder_id = client.ensure_subfolder(context.input_folder_id, derived_name)
             uploaded_frame_ids: dict[str, str | None] = {
                 "frame_0": None,
@@ -907,10 +1131,11 @@ def _prepare_reolink_unlabeled_queue(
     client: DriveClient,
     context: QueueContext,
     target_unlabeled_count: int,
-) -> None:
+) -> int:
     if context.source != REOLINK_SOURCE or not context.seed_folder_id:
-        return
+        return 0
 
+    label_source = _resolve_label_source(context.source, context.site_key)
     with _reolink_generation_lock:
         _assert_manual_crop_setup_ready(client, context)
         unlabeled_folders = client.list_folders(
@@ -920,8 +1145,9 @@ def _prepare_reolink_unlabeled_queue(
         existing_names = _existing_generated_folder_names(client, context)
         unlabeled_count = len(unlabeled_folders)
         if unlabeled_count >= target_unlabeled_count:
-            return
+            return 0
         generated_any = False
+        generated_count = 0
 
         raw_folders = _list_reolink_raw_folders(client, context)
 
@@ -941,7 +1167,15 @@ def _prepare_reolink_unlabeled_queue(
             missing_table_polygons = [
                 entry
                 for entry in table_polygons
-                if _derived_reolink_folder_name(str(raw_folder["name"]), entry[0]) not in existing_names
+                if (
+                    _derived_reolink_folder_name(str(raw_folder["name"]), entry[0])
+                    not in existing_names
+                    and _apply_source_prefix(
+                        _derived_reolink_folder_name(str(raw_folder["name"]), entry[0]),
+                        label_source,
+                    )
+                    not in existing_names
+                )
             ]
             if not missing_table_polygons:
                 continue
@@ -956,9 +1190,39 @@ def _prepare_reolink_unlabeled_queue(
                 existing_names.add(name)
                 unlabeled_count += 1
                 generated_any = True
+                generated_count += 1
 
         if generated_any:
             _invalidate_listing_cache(context.queue_key)
+        return generated_count
+
+
+def drain_reolink_preprocessing(
+    client: DriveClient | None = None,
+    site_keys: list[str] | None = None,
+) -> dict[str, Any]:
+    """Materialize all missing Reolink per-table folders and then stop."""
+    drive = client or DriveClient()
+    requested_site_keys = site_keys or [site.site_key for site in REOLINK_SITES]
+    summary: dict[str, Any] = {
+        "sites": {},
+        "generated": 0,
+        "errors": {},
+    }
+    for site_key in requested_site_keys:
+        try:
+            context = _resolve_queue_context(drive, REOLINK_SOURCE, site_key)
+            generated = _prepare_reolink_unlabeled_queue(
+                drive,
+                context,
+                target_unlabeled_count=1_000_000_000,
+            )
+            summary["sites"][site_key] = {"generated": generated}
+            summary["generated"] += generated
+        except Exception as exc:
+            summary["sites"][site_key] = {"generated": 0, "error": str(exc)}
+            summary["errors"][site_key] = str(exc)
+    return summary
 
 
 def _fetch_source_listing(client: DriveClient, context: QueueContext) -> list[dict[str, str]]:
@@ -1060,6 +1324,11 @@ def _build_folder_payload(
         for key, file_id in frames.items()
         if file_id
     }
+    thumb_urls = {
+        key: f"/api/thumb/{file_id}"
+        for key, file_id in frames.items()
+        if file_id
+    }
     return {
         "folder_id": folder["id"],
         "folder_name": folder["name"],
@@ -1069,6 +1338,7 @@ def _build_folder_payload(
         "queue_key": context.queue_key,
         "frames": frames,
         "preview_urls": preview_urls,
+        "thumb_urls": thumb_urls,
         "cache_ready": _frames_cache_ready(frames),
     }
 
@@ -1095,6 +1365,10 @@ def _persist_folder_frame_metadata(
 
 def _cache_path_for_file(file_id: str) -> Path:
     return _ensure_cache_dir() / f"{file_id}.jpg"
+
+
+def _thumb_path_for_file(file_id: str) -> Path:
+    return _ensure_cache_dir() / f"{file_id}.thumb.jpg"
 
 
 def _frames_cache_ready(frames: dict[str, str | None]) -> bool:
@@ -1552,6 +1826,44 @@ def _validate_crop_config_payload(data: dict[str, Any]) -> tuple[str, str, dict[
     return site_key, channel_code, payload
 
 
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True})
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not AUTH_REQUIRED:
+        return redirect(url_for("index"))
+
+    error = None
+    next_url = request.args.get("next") or request.form.get("next") or url_for("index")
+    if not next_url.startswith("/"):
+        next_url = url_for("index")
+
+    if request.method == "POST":
+        configured_password = LABELER_PASSWORD
+        supplied_password = request.form.get("password", "")
+        if configured_password and hmac.compare_digest(configured_password, supplied_password):
+            labeler_name = request.form.get("labeler_name", "").strip() or "labeler"
+            session.clear()
+            session["authenticated"] = True
+            session["labeler_name"] = labeler_name[:80]
+            _csrf_token()
+            return redirect(next_url)
+        error = "Invalid password."
+
+    if not LABELER_PASSWORD:
+        error = "LABELER_PASSWORD is not configured."
+    return render_template("login.html", error=error, next_url=next_url)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login") if AUTH_REQUIRED else url_for("index"))
+
+
 @app.route("/")
 def index():
     return render_template("label.html")
@@ -1671,7 +1983,7 @@ def api_folders():
         client = get_client()
         source, site_key = _request_source_args()
         context = _resolve_queue_context(client, source, site_key)
-        _prepare_reolink_unlabeled_queue(client, context, target_unlabeled_count=PREWARM_FOLDER_COUNT)
+        _prepare_reolink_unlabeled_queue(client, context, target_unlabeled_count=REOLINK_PREWARM_TARGET)
         subfolders = _list_source_subfolders(
             client,
             context,
@@ -1712,7 +2024,7 @@ def api_queue():
         force_refresh = request.args.get("refresh", "0") == "1"
         target_unlabeled_count = min(
             READY_SCAN_MAX,
-            max(limit * READY_SCAN_MULTIPLIER, PREWARM_FOLDER_COUNT),
+            max(limit * READY_SCAN_MULTIPLIER, REOLINK_PREWARM_TARGET),
         )
         _prepare_reolink_unlabeled_queue(client, context, target_unlabeled_count=target_unlabeled_count)
 
@@ -1720,6 +2032,9 @@ def api_queue():
         subfolders = _list_source_subfolders(client, context, force_refresh=force_refresh)
         list_ms = (time.perf_counter() - list_started) * 1000
         total_unlabeled = len(subfolders)
+
+        if context.source == VIDEO_SOURCE:
+            _maybe_trigger_video_preprocess(context, total_unlabeled)
 
         ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit)
 
@@ -1830,6 +2145,67 @@ def api_preview(file_id: str):
     return send_file(cache_path, mimetype="image/jpeg", conditional=True, max_age=3600)
 
 
+@app.route("/api/thumb/<file_id>")
+def api_thumb(file_id: str):
+    """Serve a downscaled JPEG (512px wide by default) for fast buffer warming.
+
+    Reuses the full-res cache at {file_id}.jpg and writes a parallel
+    {file_id}.thumb.jpg on first hit. Both share CACHE_DIR's LRU/TTL cleanup.
+    """
+    request_started = time.perf_counter()
+    _cleanup_cache_if_needed()
+
+    thumb_path = _thumb_path_for_file(file_id)
+    cache_path = _cache_path_for_file(file_id)
+    cache_hit = thumb_path.exists()
+    download_ms = 0.0
+    encode_ms = 0.0
+
+    if not thumb_path.exists():
+        if not cache_path.exists():
+            try:
+                client = get_client()
+                download_started = time.perf_counter()
+                client.download_file_to_path(file_id, cache_path)
+                download_ms = (time.perf_counter() - download_started) * 1000
+            except DriveClientError as e:
+                abort(404, description=str(e))
+
+        from PIL import Image
+
+        try:
+            encode_started = time.perf_counter()
+            with Image.open(cache_path) as img:
+                rgb = img.convert("RGB")
+                rgb.thumbnail((THUMB_WIDTH, THUMB_WIDTH * 4), Image.Resampling.LANCZOS)
+                rgb.save(thumb_path, "JPEG", quality=THUMB_QUALITY, optimize=True)
+            encode_ms = (time.perf_counter() - encode_started) * 1000
+        except Exception as e:
+            abort(500, description=f"Thumbnail generation failed: {e}")
+
+    try:
+        os.utime(thumb_path, None)
+    except OSError:
+        pass
+
+    try:
+        size_bytes = thumb_path.stat().st_size
+    except OSError:
+        size_bytes = 0
+
+    total_ms = (time.perf_counter() - request_started) * 1000
+    _log_timing(
+        "api_thumb",
+        total_ms=f"{total_ms:.1f}",
+        download_ms=f"{download_ms:.1f}",
+        encode_ms=f"{encode_ms:.1f}",
+        cache="hit" if cache_hit else "miss",
+        size_kb=f"{size_bytes / 1024:.1f}",
+        file_id=file_id,
+    )
+    return send_file(thumb_path, mimetype="image/jpeg", conditional=True, max_age=3600)
+
+
 @app.route("/api/label", methods=["POST"])
 def api_label():
     """Move a folder from unlabeled/ to a label destination."""
@@ -1843,7 +2219,7 @@ def api_label():
     if not folder_id or not parent_id:
         return jsonify({"error": "folder_id and parent_id required"}), 400
     if label not in LABEL_DESTINATIONS:
-        return jsonify({"error": "label must be clean, dirty, occupied, or label_later"}), 400
+        return jsonify({"error": f"label must be one of {', '.join(LABEL_DESTINATIONS)}"}), 400
 
     try:
         client = get_client()
@@ -1851,7 +2227,19 @@ def api_label():
         if parent_id != context.input_folder_id:
             return jsonify({"error": "parent_id does not match the active queue"}), 400
 
+        current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+        current_parents = [str(parent) for parent in current.get("parents", []) if parent]
+        if context.input_folder_id not in current_parents:
+            return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
+
         dest_id = context.folder_ids[label]
+        label_metadata = dict(current.get("appProperties") or {})
+        label_metadata.update(_label_app_properties(label, context))
+        client.update_file_metadata(
+            folder_id,
+            {"appProperties": label_metadata},
+            fields="id,name,mimeType,parents,appProperties",
+        )
         move_started = time.perf_counter()
         client.move_file(folder_id, new_parent_id=dest_id, remove_parent_id=parent_id)
         move_ms = (time.perf_counter() - move_started) * 1000
@@ -1882,8 +2270,10 @@ def api_stats():
         client = get_client()
         source, site_key = _request_source_args()
         context = _resolve_queue_context(client, source, site_key)
-        _prepare_reolink_unlabeled_queue(client, context, target_unlabeled_count=PREWARM_FOLDER_COUNT)
+        _prepare_reolink_unlabeled_queue(client, context, target_unlabeled_count=REOLINK_PREWARM_TARGET)
         stats = _compute_stats(client, context)
+        if context.source == VIDEO_SOURCE:
+            _maybe_trigger_video_preprocess(context, stats.get("unlabeled", 0))
         total_ms = (time.perf_counter() - request_started) * 1000
         _log_timing("api_stats", total_ms=f"{total_ms:.1f}", queue=context.queue_key, **stats)
         return jsonify({**stats, "source_context": context.to_payload()})
@@ -1893,6 +2283,84 @@ def api_stats():
         return jsonify({"error": str(e)}), 400
     except (DriveClientError, RuntimeError) as e:
         return jsonify({"error": str(e)}), 500
+
+
+def _run_video_preprocess_background(max_videos: int) -> None:
+    """Worker body for the background video preprocess executor."""
+    global _video_preprocess_state
+
+    try:
+        from processor import run_processor
+
+        tables_json_path = Path(__file__).parent / "approved_table_rectangles.json"
+        summary = run_processor(
+            project_root_id=_root_id(),
+            tables_json_path=tables_json_path,
+            client=DriveClient(),
+            max_videos=max_videos,
+        )
+        with _video_preprocess_lock:
+            _video_preprocess_state.update(
+                last_run_at=time.time(),
+                last_run_videos=summary.videos_with_new_work,
+                last_run_triplets=summary.triplets_uploaded,
+                last_error=None,
+            )
+    except Exception as exc:
+        with _video_preprocess_lock:
+            _video_preprocess_state.update(
+                last_run_at=time.time(),
+                last_error=str(exc),
+            )
+        print(f"[auto-preprocess] video run failed: {exc}")
+    finally:
+        # Invalidate the video listing cache so the new folders show up.
+        _invalidate_listing_cache(VIDEO_SOURCE)
+        with _video_preprocess_lock:
+            _video_preprocess_state["inflight"] = False
+
+
+def _maybe_trigger_video_preprocess(context: QueueContext, unlabeled_count: int) -> None:
+    """Kick off a background video preprocess run when the queue is drained."""
+    if AUTOLABEL_VIDEO_LOW_WATERMARK <= 0:
+        return
+    if context.source != VIDEO_SOURCE:
+        return
+    if unlabeled_count >= AUTOLABEL_VIDEO_LOW_WATERMARK:
+        return
+
+    with _video_preprocess_lock:
+        if _video_preprocess_state["inflight"]:
+            return
+        _video_preprocess_state["inflight"] = True
+
+    _video_preprocess_executor.submit(
+        _run_video_preprocess_background, AUTOLABEL_VIDEO_BATCH_SIZE
+    )
+
+
+@app.route("/api/preprocess/status")
+def api_preprocess_status():
+    """Expose whether a background preprocess run is in flight (useful for UI badges)."""
+    with _video_preprocess_lock:
+        video_state = dict(_video_preprocess_state)
+    return jsonify(
+        {
+            "video": {
+                "inflight": bool(video_state["inflight"]),
+                "last_run_at": video_state["last_run_at"],
+                "last_run_videos": int(video_state["last_run_videos"] or 0),
+                "last_run_triplets": int(video_state.get("last_run_triplets") or 0),
+                "last_error": video_state["last_error"],
+                "low_watermark": AUTOLABEL_VIDEO_LOW_WATERMARK,
+                "batch_size": AUTOLABEL_VIDEO_BATCH_SIZE,
+            },
+            "reolink": {
+                "prewarm_target": REOLINK_PREWARM_TARGET,
+                "sites": [site.site_key for site in REOLINK_SITES],
+            },
+        }
+    )
 
 
 def run_label_ui(port: int = 8080) -> None:

@@ -134,8 +134,8 @@ Reviewer assigns one of:
 | **clean**    | folder moved to `clean/`                         |
 | **dirty**    | folder moved to `dirty/`                         |
 | **occupied** | folder moved to `occupied/`                      |
-| skip         | folder stays in `unlabeled/`, skipped for now    |
-| trash        | folder recycled / deleted                        |
+| **label_later** | folder moved to `label_later/`                |
+| **discard**  | folder moved to `discarded/`                     |
 
 ### [8] Export
 
