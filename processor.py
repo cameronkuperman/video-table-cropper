@@ -15,6 +15,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,10 @@ PREPROCESS_AT_PROPERTY = "autolabel_preprocessed_at"
 PREPROCESS_ERROR_PROPERTY = "autolabel_preprocess_error"
 PREPROCESS_TRIPLETS_PROPERTY = "autolabel_preprocess_triplets"
 PREPROCESS_COMPLETE_STATUSES = {"complete", "skipped", "error"}
+PROCESSED_RAW_FOLDER_NAME = "processed_raw"
+PROCESSED_RAW_RETENTION_DAYS = max(
+    1, int(os.environ.get("PROCESSED_RAW_RETENTION_DAYS", "14") or "14")
+)
 
 AUTOLABEL_UPLOAD_WORKERS = max(1, int(os.environ.get("AUTOLABEL_UPLOAD_WORKERS", "16") or "16"))
 AUTOLABEL_TABLE_WORKERS = max(1, int(os.environ.get("AUTOLABEL_TABLE_WORKERS", "8") or "8"))
@@ -251,8 +256,63 @@ def ensure_drive_folders(client: DriveClient, project_root_id: str) -> dict[str,
         "occupied",
         "label_later",
         "discarded",
+        PROCESSED_RAW_FOLDER_NAME,
     ]
     return {name: client.ensure_subfolder(project_root_id, name) for name in names}
+
+
+def _parse_drive_timestamp(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _cleanup_processed_raw_folder(
+    client: DriveClient,
+    folder_id: str,
+    *,
+    retention_days: int = PROCESSED_RAW_RETENTION_DAYS,
+) -> int:
+    cutoff = datetime.now(timezone.utc).timestamp() - (retention_days * 24 * 60 * 60)
+    cleaned = 0
+    for item in client.list_files(
+        folder_id,
+        fields="id,name,mimeType,parents,modifiedTime,trashed",
+    ):
+        if item.get("trashed"):
+            continue
+        modified = _parse_drive_timestamp(item.get("modifiedTime"))
+        if modified is None or modified.timestamp() > cutoff:
+            continue
+        client.trash_file(str(item["id"]))
+        cleaned += 1
+    return cleaned
+
+
+def _move_video_to_processed_raw(
+    client: DriveClient,
+    video_meta: dict[str, Any],
+    folders: dict[str, str],
+) -> None:
+    processed_id = folders.get(PROCESSED_RAW_FOLDER_NAME)
+    if not processed_id:
+        return
+    parents = [str(parent) for parent in video_meta.get("parents", []) if parent]
+    if parents == [processed_id]:
+        return
+    remove_parent_id = parents[0] if parents else folders.get("raw_videos")
+    client.move_file(
+        str(video_meta["id"]),
+        new_parent_id=processed_id,
+        remove_parent_id=remove_parent_id,
+    )
+    video_meta["parents"] = [processed_id]
 
 
 def _fmt_eta(seconds: float) -> str:
@@ -315,6 +375,7 @@ def run_processor(
 ) -> ProcessorRunSummary:
     cameras = _load_tables_json(tables_json_path)
     folders = ensure_drive_folders(client, project_root_id)
+    _cleanup_processed_raw_folder(client, folders[PROCESSED_RAW_FOLDER_NAME])
     summary = ProcessorRunSummary()
 
     print("Scanning raw_videos/ (including subfolders)...")
@@ -369,6 +430,7 @@ def run_processor(
 
             if result.status == "complete":
                 summary.completed += 1
+                _move_video_to_processed_raw(client, video_meta, folders)
             elif result.status == "skipped":
                 summary.skipped += 1
             elif result.status == "error":

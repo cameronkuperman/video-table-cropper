@@ -101,8 +101,12 @@ REOLINK_SOURCE = "reolink"
 LABEL_DESTINATIONS = ("clean", "dirty", "occupied", "label_later", "discarded")
 MATTHEWS_SITE_KEY = "reolink-matthews-01"
 CROP_CONFIGS_FOLDER_NAME = "crop_configs"
+PROCESSED_RAW_FOLDER_NAME = "processed_raw"
 PREPROCESS_STATE_SCHEMA_VERSION = 1
 PREPROCESS_STATE_FILE_NAME = "preprocess_state.json"
+PROCESSED_RAW_RETENTION_DAYS = max(
+    1, int(os.environ.get("PROCESSED_RAW_RETENTION_DAYS", "14") or "14")
+)
 
 
 @dataclass(frozen=True)
@@ -533,6 +537,12 @@ def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, st
             if _site_uses_manual_crop_configs(site_key) and "crop_configs" not in updated:
                 updated = dict(updated)
                 updated["crop_configs"] = client.ensure_subfolder(updated["root"], CROP_CONFIGS_FOLDER_NAME)
+            if PROCESSED_RAW_FOLDER_NAME not in updated:
+                updated = dict(updated)
+                updated[PROCESSED_RAW_FOLDER_NAME] = client.ensure_subfolder(
+                    updated["root"],
+                    PROCESSED_RAW_FOLDER_NAME,
+                )
             if any(updated.get(name) != shared[name] for name in LABEL_DESTINATIONS):
                 updated = {**updated, **shared}
             if updated is not cached:
@@ -551,6 +561,10 @@ def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, st
             "root": site_root_id,
             "unassociated": str(unassociated["id"]),
             "unlabeled": client.ensure_subfolder(site_root_id, "unlabeled"),
+            PROCESSED_RAW_FOLDER_NAME: client.ensure_subfolder(
+                site_root_id,
+                PROCESSED_RAW_FOLDER_NAME,
+            ),
         }
         if site.manual_crop_configs:
             folder_ids["crop_configs"] = client.ensure_subfolder(site_root_id, CROP_CONFIGS_FOLDER_NAME)
@@ -881,6 +895,59 @@ def _list_reolink_raw_folders(
         ),
         key=lambda item: str(item.get("name", "")).lower(),
     )
+
+
+def _parse_drive_timestamp(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _cleanup_processed_raw_folder(
+    client: DriveClient,
+    folder_id: str,
+    *,
+    retention_days: int = PROCESSED_RAW_RETENTION_DAYS,
+) -> int:
+    cutoff = datetime.now(timezone.utc).timestamp() - (retention_days * 24 * 60 * 60)
+    cleaned = 0
+    for item in client.list_files(
+        folder_id,
+        fields="id,name,mimeType,parents,modifiedTime,trashed",
+    ):
+        if item.get("trashed"):
+            continue
+        modified = _parse_drive_timestamp(item.get("modifiedTime"))
+        if modified is None or modified.timestamp() > cutoff:
+            continue
+        client.trash_file(str(item["id"]))
+        cleaned += 1
+    return cleaned
+
+
+def _move_reolink_raw_to_processed(
+    client: DriveClient,
+    context: QueueContext,
+    raw_folder: dict[str, Any],
+) -> None:
+    processed_id = context.folder_ids.get(PROCESSED_RAW_FOLDER_NAME)
+    if not processed_id:
+        return
+    parents = [str(parent) for parent in raw_folder.get("parents", []) if parent]
+    if parents == [processed_id]:
+        return
+    client.move_file(
+        str(raw_folder["id"]),
+        new_parent_id=processed_id,
+        remove_parent_id=context.seed_folder_id,
+    )
+    raw_folder["parents"] = [processed_id]
 
 
 def _preprocess_state_dir() -> Path:
@@ -1247,10 +1314,16 @@ def _prepare_reolink_unlabeled_queue(
         )
         existing_names = _existing_generated_folder_names(client, context)
         unlabeled_count = len(unlabeled_folders)
-        if unlabeled_count >= target_unlabeled_count:
-            return 0
         generated_any = False
         generated_count = 0
+
+        if context.folder_ids.get(PROCESSED_RAW_FOLDER_NAME):
+            _cleanup_processed_raw_folder(
+                client,
+                context.folder_ids[PROCESSED_RAW_FOLDER_NAME],
+            )
+        if unlabeled_count >= target_unlabeled_count:
+            return 0
 
         raw_folders = _list_reolink_raw_folders(client, context)
         preprocess_state = _load_preprocess_state()
@@ -1260,6 +1333,7 @@ def _prepare_reolink_unlabeled_queue(
                 break
 
             if _reolink_raw_folder_processed(preprocess_state, context, raw_folder):
+                _move_reolink_raw_to_processed(client, context, raw_folder)
                 continue
 
             mapped = _mapped_camera_tables_for_reolink_folder(
@@ -1292,6 +1366,7 @@ def _prepare_reolink_unlabeled_queue(
                     status="complete",
                     generated=0,
                 )
+                _move_reolink_raw_to_processed(client, context, raw_folder)
                 continue
 
             generated_names = _materialize_reolink_table_crops(
@@ -1316,6 +1391,7 @@ def _prepare_reolink_unlabeled_queue(
                     status="complete",
                     generated=raw_generated_count,
                 )
+                _move_reolink_raw_to_processed(client, context, raw_folder)
             if raw_generated_count == 0:
                 continue
 

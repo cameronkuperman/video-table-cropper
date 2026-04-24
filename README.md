@@ -98,7 +98,16 @@ AUTH_REQUIRED=1
 LABELER_PASSWORD=...
 FLASK_SECRET_KEY=...
 WEB_CONCURRENCY=1
+LABEL_CACHE_DIR=/data/label_cache
+LABEL_CACHE_MAX_MB=20000
+LABEL_CACHE_TTL_HOURS=336
+LABEL_PREWARM_FOLDER_COUNT=5000
+LABEL_REOLINK_PREWARM_TARGET=5000
+LABEL_READY_SCAN_MAX=5000
 ```
+
+Mount a Railway volume on the web service at `/data` when using
+`LABEL_CACHE_DIR=/data/label_cache`.
 
 The default web start command is:
 
@@ -116,6 +125,7 @@ For Reolink preprocessing persistence, mount a Railway volume at `/data` and set
 
 ```text
 PREPROCESS_STATE_DIR=/data/autolabeler
+PROCESSED_RAW_RETENTION_DAYS=14
 ```
 
 That command processes unmarked videos in `raw_videos/`, materializes missing
@@ -127,7 +137,8 @@ storage for large uploads.
 Reolink raw triplets are recorded in that local state directory after successful
 crop materialization, so later job runs skip them without extra Drive metadata
 writes. Existing Drive destination folders are still checked as a fallback if
-the local state file is missing.
+the local state file is missing. Successfully processed raw inputs are moved to
+`processed_raw/` and trashed after `PROCESSED_RAW_RETENTION_DAYS`.
 
 ### Process videos
 

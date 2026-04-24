@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ class FakeDriveClient:
         self.children: dict[str, list[str]] = defaultdict(list)
         self.created_subfolders: list[tuple[str, str, str]] = []
         self.moves: list[tuple[str, str, str | None]] = []
+        self.trashed: list[str] = []
         self._seed()
 
     def _seed(self) -> None:
@@ -94,6 +96,8 @@ class FakeDriveClient:
             "mimeType": label_app.FOLDER_MIME,
             "parents": [parent_id] if parent_id else [],
             "appProperties": app_properties or {},
+            "modifiedTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "trashed": False,
         }
         self.items[item_id] = item
         if parent_id:
@@ -114,6 +118,8 @@ class FakeDriveClient:
             "parents": [parent_id],
             "appProperties": {},
             "content": content if content is not None else b"{}",
+            "modifiedTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "trashed": False,
         }
         self.items[item_id] = item
         self.children[parent_id].append(item_id)
@@ -187,8 +193,14 @@ class FakeDriveClient:
                 child_id for child_id in self.children[current_parent] if child_id != file_id
             ]
         self.items[file_id]["parents"] = [new_parent_id]
+        self.items[file_id]["modifiedTime"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self.children[new_parent_id].append(file_id)
         self.moves.append((file_id, new_parent_id, remove_parent_id))
+        return self._copy(file_id)
+
+    def trash_file(self, file_id: str) -> dict:
+        self.items[file_id]["trashed"] = True
+        self.trashed.append(file_id)
         return self._copy(file_id)
 
     def download_file_to_path(self, file_id: str, output_path: Path) -> Path:
@@ -646,7 +658,7 @@ def test_ordered_quadrilateral_points_normalizes_crossed_click_order():
     ]
 
 
-def test_video_processor_marks_completed_and_skips_marked_videos(fake_drive, monkeypatch):
+def test_video_processor_marks_completed_and_moves_raw_video(fake_drive, monkeypatch):
     fake_drive._add_file("video-1", "IPC3_sample.mp4", "video-raw", mime_type="video/mp4")
     calls = []
 
@@ -671,9 +683,51 @@ def test_video_processor_marks_completed_and_skips_marked_videos(fake_drive, mon
     assert calls == ["video-1"]
     assert first.completed == 1
     assert first.triplets_uploaded == 2
-    assert second.already_marked == 1
+    assert second.scanned == 0
     assert fake_drive.items["video-1"]["appProperties"][processor.PREPROCESS_STATUS_PROPERTY] == "complete"
     assert fake_drive.items["video-1"]["appProperties"][processor.PREPROCESS_TRIPLETS_PROPERTY] == "2"
+    assert fake_drive.items["video-1"]["parents"] == ["project-root:processed_raw"]
+
+
+def test_video_processor_does_not_move_failed_video(fake_drive, monkeypatch):
+    fake_drive._add_file("video-err", "IPC3_error.mp4", "video-raw", mime_type="video/mp4")
+
+    def fail_process(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(processor, "load_yolo_model", lambda: None)
+    monkeypatch.setattr(processor, "_process_video", fail_process)
+
+    summary = processor.run_processor(
+        "project-root",
+        Path(__file__).resolve().parents[1] / "approved_table_rectangles.json",
+        fake_drive,
+    )
+
+    assert summary.errored == 1
+    assert fake_drive.items["video-err"]["parents"] == ["video-raw"]
+
+
+def test_video_processed_raw_cleanup_trashes_only_old_items(fake_drive):
+    processed_id = fake_drive.ensure_subfolder("project-root", processor.PROCESSED_RAW_FOLDER_NAME)
+    fake_drive._add_file("old-video", "old.mp4", processed_id, mime_type="video/mp4")
+    fake_drive._add_file("new-video", "new.mp4", processed_id, mime_type="video/mp4")
+    fake_drive.items["old-video"]["modifiedTime"] = (
+        datetime.now(timezone.utc) - timedelta(days=15)
+    ).isoformat().replace("+00:00", "Z")
+    fake_drive.items["new-video"]["modifiedTime"] = (
+        datetime.now(timezone.utc) - timedelta(days=2)
+    ).isoformat().replace("+00:00", "Z")
+
+    cleaned = processor._cleanup_processed_raw_folder(
+        fake_drive,
+        processed_id,
+        retention_days=14,
+    )
+
+    assert cleaned == 1
+    assert fake_drive.items["old-video"]["trashed"] is True
+    assert fake_drive.items["new-video"]["trashed"] is False
 
 
 def test_reolink_drain_treats_legacy_unprefixed_folders_as_existing(fake_drive):
@@ -733,6 +787,7 @@ def test_reolink_preprocess_records_raw_folder_in_local_state_and_skips_rerun(mo
     assert record["status"] == "complete"
     assert record["generated"] == first_count
     assert fake.items["r-ready"]["appProperties"] == {}
+    assert fake.items["r-ready"]["parents"] == ["site-restaurant:processed_raw"]
 
 
 def test_reolink_preprocess_skips_raw_folder_already_in_local_state(monkeypatch, tmp_path):
@@ -796,6 +851,7 @@ def test_reolink_preprocess_records_existing_drive_folders_in_local_state(monkey
     assert generated == 0
     state = json.loads((tmp_path / label_app.PREPROCESS_STATE_FILE_NAME).read_text())
     assert state["reolink_processed"]["restaurant-pi-1:r-ready"]["status"] == "complete"
+    assert fake.items["r-ready"]["parents"] == ["site-restaurant:processed_raw"]
 
 
 def test_reolink_preprocess_failed_materialization_does_not_mark_state(monkeypatch, tmp_path):
@@ -818,3 +874,26 @@ def test_reolink_preprocess_failed_materialization_does_not_mark_state(monkeypat
         )
 
     assert not (tmp_path / label_app.PREPROCESS_STATE_FILE_NAME).exists()
+    assert fake.items["r-ready"]["parents"] == ["r-unassociated"]
+
+
+def test_reolink_processed_raw_cleanup_trashes_only_old_items(fake_drive):
+    processed_id = fake_drive.ensure_subfolder("site-restaurant", label_app.PROCESSED_RAW_FOLDER_NAME)
+    fake_drive._add_folder("old-raw", "old_raw", processed_id)
+    fake_drive._add_folder("new-raw", "new_raw", processed_id)
+    fake_drive.items["old-raw"]["modifiedTime"] = (
+        datetime.now(timezone.utc) - timedelta(days=15)
+    ).isoformat().replace("+00:00", "Z")
+    fake_drive.items["new-raw"]["modifiedTime"] = (
+        datetime.now(timezone.utc) - timedelta(days=2)
+    ).isoformat().replace("+00:00", "Z")
+
+    cleaned = label_app._cleanup_processed_raw_folder(
+        fake_drive,
+        processed_id,
+        retention_days=14,
+    )
+
+    assert cleaned == 1
+    assert fake_drive.items["old-raw"]["trashed"] is True
+    assert fake_drive.items["new-raw"]["trashed"] is False
