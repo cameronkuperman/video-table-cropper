@@ -112,11 +112,22 @@ Create a second Railway service or job from the same repo for finite preprocessi
 python main.py --preprocess-until-empty --sources all
 ```
 
+For Reolink preprocessing persistence, mount a Railway volume at `/data` and set:
+
+```text
+PREPROCESS_STATE_DIR=/data/autolabeler
+```
+
 That command processes unmarked videos in `raw_videos/`, materializes missing
 Reolink crops from every configured site, stamps raw videos as `complete`,
 `skipped`, or `error`, prints a JSON summary, then exits. Real video batches need
 enough ephemeral disk for source downloads and extracted frames; avoid tiny free
 storage for large uploads.
+
+Reolink raw triplets are recorded in that local state directory after successful
+crop materialization, so later job runs skip them without extra Drive metadata
+writes. Existing Drive destination folders are still checked as a fallback if
+the local state file is missing.
 
 ### Process videos
 

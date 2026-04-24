@@ -101,6 +101,8 @@ REOLINK_SOURCE = "reolink"
 LABEL_DESTINATIONS = ("clean", "dirty", "occupied", "label_later", "discarded")
 MATTHEWS_SITE_KEY = "reolink-matthews-01"
 CROP_CONFIGS_FOLDER_NAME = "crop_configs"
+PREPROCESS_STATE_SCHEMA_VERSION = 1
+PREPROCESS_STATE_FILE_NAME = "preprocess_state.json"
 
 
 @dataclass(frozen=True)
@@ -881,6 +883,107 @@ def _list_reolink_raw_folders(
     )
 
 
+def _preprocess_state_dir() -> Path:
+    configured = os.environ.get("PREPROCESS_STATE_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"):
+        return Path("/data/autolabeler")
+    return Path(tempfile.gettempdir()) / "AutoLabeler" / "preprocess_state"
+
+
+def _preprocess_state_path() -> Path:
+    return _preprocess_state_dir() / PREPROCESS_STATE_FILE_NAME
+
+
+def _load_preprocess_state() -> dict[str, Any]:
+    path = _preprocess_state_path()
+    if not path.exists():
+        return {
+            "schema_version": PREPROCESS_STATE_SCHEMA_VERSION,
+            "reolink_processed": {},
+        }
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {
+            "schema_version": PREPROCESS_STATE_SCHEMA_VERSION,
+            "reolink_processed": {},
+        }
+
+    if not isinstance(data, dict):
+        data = {}
+    processed = data.get("reolink_processed")
+    if not isinstance(processed, dict):
+        processed = {}
+    return {
+        "schema_version": PREPROCESS_STATE_SCHEMA_VERSION,
+        "reolink_processed": processed,
+    }
+
+
+def _save_preprocess_state(state: dict[str, Any]) -> None:
+    path = _preprocess_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": PREPROCESS_STATE_SCHEMA_VERSION,
+        "reolink_processed": state.get("reolink_processed") or {},
+    }
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _reolink_state_key(context: QueueContext, raw_folder: dict[str, Any]) -> str:
+    site_key = context.site_key or "unknown-site"
+    raw_id = str(raw_folder.get("id") or "")
+    raw_name = str(raw_folder.get("name") or "")
+    return f"{site_key}:{raw_id or raw_name}"
+
+
+def _reolink_state_name_key(context: QueueContext, raw_folder: dict[str, Any]) -> str:
+    site_key = context.site_key or "unknown-site"
+    raw_name = str(raw_folder.get("name") or "")
+    return f"{site_key}:name:{raw_name}" if raw_name else _reolink_state_key(context, raw_folder)
+
+
+def _reolink_raw_folder_processed(
+    state: dict[str, Any],
+    context: QueueContext,
+    raw_folder: dict[str, Any],
+) -> bool:
+    processed = state.get("reolink_processed") or {}
+    return (
+        _reolink_state_key(context, raw_folder) in processed
+        or _reolink_state_name_key(context, raw_folder) in processed
+    )
+
+
+def _mark_reolink_raw_folder_processed(
+    state: dict[str, Any],
+    context: QueueContext,
+    raw_folder: dict[str, Any],
+    *,
+    status: str,
+    generated: int = 0,
+    reason: str = "",
+) -> None:
+    processed = state.setdefault("reolink_processed", {})
+    record = {
+        "site_key": context.site_key,
+        "raw_folder_id": str(raw_folder.get("id") or ""),
+        "raw_folder_name": str(raw_folder.get("name") or ""),
+        "status": status,
+        "generated": int(generated),
+        "reason": reason[:1200],
+        "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    processed[_reolink_state_key(context, raw_folder)] = record
+    processed[_reolink_state_name_key(context, raw_folder)] = record
+    _save_preprocess_state(state)
+
+
 def _missing_manual_crop_channels(
     client: DriveClient,
     context: QueueContext,
@@ -1150,10 +1253,14 @@ def _prepare_reolink_unlabeled_queue(
         generated_count = 0
 
         raw_folders = _list_reolink_raw_folders(client, context)
+        preprocess_state = _load_preprocess_state()
 
         for raw_folder in raw_folders:
             if unlabeled_count >= target_unlabeled_count:
                 break
+
+            if _reolink_raw_folder_processed(preprocess_state, context, raw_folder):
+                continue
 
             mapped = _mapped_camera_tables_for_reolink_folder(
                 str(raw_folder.get("name", "")),
@@ -1178,6 +1285,13 @@ def _prepare_reolink_unlabeled_queue(
                 )
             ]
             if not missing_table_polygons:
+                _mark_reolink_raw_folder_processed(
+                    preprocess_state,
+                    context,
+                    raw_folder,
+                    status="complete",
+                    generated=0,
+                )
                 continue
 
             generated_names = _materialize_reolink_table_crops(
@@ -1186,11 +1300,24 @@ def _prepare_reolink_unlabeled_queue(
                 raw_folder,
                 missing_table_polygons,
             )
+            raw_generated_count = 0
             for name in generated_names:
                 existing_names.add(name)
                 unlabeled_count += 1
                 generated_any = True
                 generated_count += 1
+                raw_generated_count += 1
+
+            if raw_generated_count > 0:
+                _mark_reolink_raw_folder_processed(
+                    preprocess_state,
+                    context,
+                    raw_folder,
+                    status="complete",
+                    generated=raw_generated_count,
+                )
+            if raw_generated_count == 0:
+                continue
 
         if generated_any:
             _invalidate_listing_cache(context.queue_key)

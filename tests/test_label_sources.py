@@ -689,3 +689,132 @@ def test_reolink_drain_treats_legacy_unprefixed_folders_as_existing(fake_drive):
         "mimosas-Reolink-CH-CH04_table_top_1_t0004",
         mime_type=label_app.FOLDER_MIME,
     ) is None
+
+
+def test_reolink_preprocess_records_raw_folder_in_local_state_and_skips_rerun(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    label_app._crop_config_cache.clear()
+
+    calls = []
+
+    def fake_materialize(client, context, raw_folder, missing_table_polygons):
+        calls.append(raw_folder["id"])
+        label_source = label_app._resolve_label_source(context.source, context.site_key)
+        return [
+            label_app._apply_source_prefix(
+                label_app._derived_reolink_folder_name(raw_folder["name"], table_id),
+                label_source,
+            )
+            for table_id, *_rest in missing_table_polygons
+        ]
+
+    monkeypatch.setattr(label_app, "_materialize_reolink_table_crops", fake_materialize)
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    first_count = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1_000_000,
+    )
+    second_count = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1_000_000,
+    )
+
+    assert first_count > 0
+    assert second_count == 0
+    assert calls == ["r-ready"]
+    state = json.loads((tmp_path / label_app.PREPROCESS_STATE_FILE_NAME).read_text())
+    record = state["reolink_processed"]["restaurant-pi-1:r-ready"]
+    assert record["status"] == "complete"
+    assert record["generated"] == first_count
+    assert fake.items["r-ready"]["appProperties"] == {}
+
+
+def test_reolink_preprocess_skips_raw_folder_already_in_local_state(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    state = {
+        "schema_version": label_app.PREPROCESS_STATE_SCHEMA_VERSION,
+        "reolink_processed": {
+            "restaurant-pi-1:r-ready": {
+                "site_key": "restaurant-pi-1",
+                "raw_folder_id": "r-ready",
+                "raw_folder_name": "Reolink-CH-CH04_t0004",
+                "status": "complete",
+                "generated": 1,
+                "reason": "",
+                "processed_at": "2026-04-24T00:00:00Z",
+            }
+        },
+    }
+    (tmp_path / label_app.PREPROCESS_STATE_FILE_NAME).write_text(json.dumps(state), encoding="utf-8")
+    label_app._source_folder_ids_cache.clear()
+
+    def fail_materialize(*_args, **_kwargs):
+        raise AssertionError("state-recorded raw folder should not be materialized again")
+
+    monkeypatch.setattr(label_app, "_materialize_reolink_table_crops", fail_materialize)
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1_000_000,
+    )
+
+    assert generated == 0
+
+
+def test_reolink_preprocess_records_existing_drive_folders_in_local_state(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+
+    legacy_name = "Reolink-CH-CH04_table_top_1_t0004"
+    legacy_id = fake.ensure_subfolder("r-unlabeled", legacy_name)
+    fake._add_triplet_files(legacy_id, "legacy-rready")
+
+    def fail_materialize(*_args, **_kwargs):
+        raise AssertionError("existing Drive folders should prevent materialization")
+
+    monkeypatch.setattr(label_app, "_materialize_reolink_table_crops", fail_materialize)
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1_000_000,
+    )
+
+    assert generated == 0
+    state = json.loads((tmp_path / label_app.PREPROCESS_STATE_FILE_NAME).read_text())
+    assert state["reolink_processed"]["restaurant-pi-1:r-ready"]["status"] == "complete"
+
+
+def test_reolink_preprocess_failed_materialization_does_not_mark_state(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+
+    def fail_materialize(*_args, **_kwargs):
+        raise RuntimeError("upload failed")
+
+    monkeypatch.setattr(label_app, "_materialize_reolink_table_crops", fail_materialize)
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    with pytest.raises(RuntimeError, match="upload failed"):
+        label_app._prepare_reolink_unlabeled_queue(
+            fake,
+            context,
+            target_unlabeled_count=1_000_000,
+        )
+
+    assert not (tmp_path / label_app.PREPROCESS_STATE_FILE_NAME).exists()
