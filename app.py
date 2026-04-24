@@ -316,6 +316,9 @@ _video_preprocess_state: dict[str, Any] = {
     "last_run_triplets": 0,
     "last_error": None,
 }
+_reolink_preprocess_executor = ThreadPoolExecutor(max_workers=1)
+_reolink_preprocess_lock = Lock()
+_reolink_preprocess_inflight: set[str] = set()
 _yolo_model: Any | None = None
 _camera_config_cache: dict[int, dict[str, Any]] | None = None
 _camera_config_lock = Lock()
@@ -1428,6 +1431,53 @@ def drain_reolink_preprocessing(
     return summary
 
 
+def _run_reolink_preprocess_background(
+    source: str,
+    site_key: str | None,
+    target_unlabeled_count: int,
+    queue_key: str,
+) -> None:
+    try:
+        drive = DriveClient()
+        context = _resolve_queue_context(drive, source, site_key)
+        generated = _prepare_reolink_unlabeled_queue(
+            drive,
+            context,
+            target_unlabeled_count=target_unlabeled_count,
+        )
+        if generated:
+            _invalidate_listing_cache(context.queue_key)
+    except Exception as exc:
+        print(f"[auto-preprocess] reolink run failed: {exc}")
+    finally:
+        with _reolink_preprocess_lock:
+            _reolink_preprocess_inflight.discard(queue_key)
+
+
+def _maybe_trigger_reolink_preprocess(
+    context: QueueContext,
+    total_unlabeled: int,
+    target_unlabeled_count: int,
+) -> None:
+    if context.source != REOLINK_SOURCE or not context.site_key:
+        return
+    if total_unlabeled >= target_unlabeled_count:
+        return
+
+    with _reolink_preprocess_lock:
+        if context.queue_key in _reolink_preprocess_inflight:
+            return
+        _reolink_preprocess_inflight.add(context.queue_key)
+
+    _reolink_preprocess_executor.submit(
+        _run_reolink_preprocess_background,
+        context.source,
+        context.site_key,
+        target_unlabeled_count,
+        context.queue_key,
+    )
+
+
 def _fetch_source_listing(client: DriveClient, context: QueueContext) -> list[dict[str, str]]:
     return sorted(
         client.list_folders(
@@ -2186,12 +2236,17 @@ def api_folders():
         client = get_client()
         source, site_key = _request_source_args()
         context = _resolve_queue_context(client, source, site_key)
-        _prepare_reolink_unlabeled_queue(client, context, target_unlabeled_count=REOLINK_PREWARM_TARGET)
         subfolders = _list_source_subfolders(
             client,
             context,
             force_refresh=request.args.get("refresh", "0") == "1",
         )
+        if context.source == REOLINK_SOURCE:
+            _maybe_trigger_reolink_preprocess(
+                context,
+                len(subfolders),
+                REOLINK_PREWARM_TARGET,
+            )
         result = [
             {
                 "folder_id": f["id"],
@@ -2229,7 +2284,6 @@ def api_queue():
             READY_SCAN_MAX,
             max(limit * READY_SCAN_MULTIPLIER, REOLINK_PREWARM_TARGET),
         )
-        _prepare_reolink_unlabeled_queue(client, context, target_unlabeled_count=target_unlabeled_count)
 
         list_started = time.perf_counter()
         subfolders = _list_source_subfolders(client, context, force_refresh=force_refresh)
@@ -2238,6 +2292,8 @@ def api_queue():
 
         if context.source == VIDEO_SOURCE:
             _maybe_trigger_video_preprocess(context, total_unlabeled)
+        elif context.source == REOLINK_SOURCE:
+            _maybe_trigger_reolink_preprocess(context, total_unlabeled, target_unlabeled_count)
 
         ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit)
 

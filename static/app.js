@@ -53,6 +53,18 @@ function buildApiError(data, res, fallbackLabel) {
     return error;
 }
 
+async function readApiJson(res, fallbackLabel) {
+    const text = await res.text();
+    if (!text) {
+        return {};
+    }
+    try {
+        return JSON.parse(text);
+    } catch (_error) {
+        throw new Error(`${fallbackLabel} returned non-JSON response: ${text.slice(0, 160)}`);
+    }
+}
+
 function formatErrorContent(prefix, error = null) {
     const message = `${prefix}${error?.message || ''}`;
     if (error?.setupRequired && error?.setupUrl) {
@@ -242,7 +254,7 @@ function jsonPostHeaders() {
 
 async function fetchSources() {
     const res = await fetch('/api/sources');
-    const data = await res.json();
+    const data = await readApiJson(res, 'Sources request');
     if (!res.ok || data.error) {
         throw buildApiError(data, res, 'Sources request');
     }
@@ -313,7 +325,7 @@ async function fetchQueue({
 
     queueRequest = fetch(`/api/queue?${params.toString()}`)
         .then(async res => {
-            const data = await res.json();
+            const data = await readApiJson(res, 'Queue request');
             if (!res.ok || data.error) {
                 throw buildApiError(data, res, 'Queue request');
             }
@@ -518,7 +530,7 @@ async function refreshStats() {
         const params = new URLSearchParams();
         appendSourceParams(params, requestSource, requestSiteKey);
         const res = await fetch(`/api/stats?${params.toString()}`);
-        const data = await res.json();
+        const data = await readApiJson(res, 'Stats request');
         if (!res.ok || data.error) {
             throw buildApiError(data, res, 'Stats request');
         }
@@ -678,7 +690,7 @@ async function labelCurrent(label) {
                 site_key: folder.site_key,
             }),
         });
-        const data = await res.json();
+        const data = await readApiJson(res, 'Label request');
         if (!res.ok || data.error) {
             if (res.status === 409 && data.code === 'already_labeled') {
                 refreshStats();
