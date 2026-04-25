@@ -32,6 +32,9 @@ const REFILL_QUEUE_BATCH_SIZE = 120;
 const WARM_BUFFER_SIZE = 144;
 const LOW_WATERMARK = 160;
 const TIMING_LOGS_ENABLED = true;
+const QUEUE_SNAPSHOT_PREFIX = 'autolabeler.queueSnapshot.';
+const QUEUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
+const QUEUE_SNAPSHOT_MAX_FOLDERS = 300;
 
 const cardEl = document.getElementById('card');
 const progressEl = document.getElementById('progress');
@@ -94,6 +97,89 @@ function activeQueueKey() {
     return activeSource === 'reolink'
         ? `reolink:${activeSiteKey || ''}`
         : 'video';
+}
+
+function queueSnapshotKey(queueKey = activeQueueKey()) {
+    return `${QUEUE_SNAPSHOT_PREFIX}${queueKey}`;
+}
+
+function saveQueueSnapshot() {
+    try {
+        const remaining = folders
+            .slice(currentIndex, currentIndex + QUEUE_SNAPSHOT_MAX_FOLDERS)
+            .map(folder => {
+                const clone = { ...folder };
+                delete clone.preloadPromise;
+                delete clone.preloadedImages;
+                delete clone.preloaded;
+                return clone;
+            });
+        window.localStorage.setItem(
+            queueSnapshotKey(),
+            JSON.stringify({
+                savedAt: Date.now(),
+                queueKey: activeQueueKey(),
+                source: activeSource,
+                siteKey: activeSiteKey,
+                displayName: activeDisplayName,
+                pendingLabel: activePendingLabel,
+                folders: remaining,
+                hasMore,
+                initialTotalUnlabeled,
+                readyBufferCount,
+                warmingCount,
+                stats,
+            }),
+        );
+    } catch (_error) {}
+}
+
+function clearQueueSnapshot(queueKey = activeQueueKey()) {
+    try {
+        window.localStorage.removeItem(queueSnapshotKey(queueKey));
+    } catch (_error) {}
+}
+
+function restoreQueueSnapshot() {
+    try {
+        const raw = window.localStorage.getItem(queueSnapshotKey());
+        if (!raw) {
+            return false;
+        }
+        const snapshot = JSON.parse(raw);
+        if (!snapshot || snapshot.queueKey !== activeQueueKey()) {
+            return false;
+        }
+        if ((Date.now() - Number(snapshot.savedAt || 0)) > QUEUE_SNAPSHOT_TTL_MS) {
+            clearQueueSnapshot();
+            return false;
+        }
+        const restoredFolders = Array.isArray(snapshot.folders) ? snapshot.folders : [];
+        if (restoredFolders.length === 0) {
+            return false;
+        }
+        folders = restoredFolders;
+        currentIndex = 0;
+        hasMore = Boolean(snapshot.hasMore);
+        initialTotalUnlabeled = Number(snapshot.initialTotalUnlabeled || restoredFolders.length);
+        readyBufferCount = Number(snapshot.readyBufferCount || 0);
+        warmingCount = Number(snapshot.warmingCount || 0);
+        activeDisplayName = snapshot.displayName || activeDisplayName;
+        activePendingLabel = snapshot.pendingLabel || activePendingLabel;
+        if (snapshot.stats) {
+            setStats(extractStats(snapshot.stats));
+        }
+        updateSourceSummary();
+        updateProgress();
+        logTiming('restoreQueueSnapshot', {
+            folders: restoredFolders.length,
+            queueKey: activeQueueKey(),
+        });
+        return true;
+    } catch (_error) {
+        clearQueueSnapshot();
+        return false;
+    }
 }
 
 function getActiveSiteLabel() {
@@ -366,6 +452,7 @@ async function fetchQueue({
             nextQueueFetchAt = added === 0 && hasMore
                 ? performance.now() + queueRetryMs
                 : 0;
+            saveQueueSnapshot();
 
             logTiming('fetchQueue', {
                 ms: (performance.now() - startedAt).toFixed(1),
@@ -701,6 +788,21 @@ async function init(forceRefresh = false) {
     }
 
     try {
+        const restored = !forceRefresh && restoreQueueSnapshot();
+        if (restored) {
+            await renderCard();
+            refreshStats();
+            fetchQueue({
+                reset: false,
+                includeStats: false,
+                limit: REFILL_QUEUE_BATCH_SIZE,
+            }).then(() => {
+                updateProgress();
+                warmBuffer();
+            }).catch(() => {});
+            return;
+        }
+
         await fetchQueue({
             reset: true,
             includeStats: false,
@@ -712,6 +814,7 @@ async function init(forceRefresh = false) {
             doneEl.style.display = 'block';
             updateProgress();
             refreshStats();
+            clearQueueSnapshot();
             return;
         }
         await renderCard();
@@ -735,6 +838,7 @@ async function labelCurrent(label) {
     if (currentIndex >= folders.length && currentIndex > 0) {
         currentIndex--;
     }
+    saveQueueSnapshot();
 
     applyOptimisticLabel(label);
     renderCard();
@@ -802,6 +906,7 @@ function escapeHtml(s) {
 async function handleSourceChange() {
     normalizeSourceSelection({ source: activeSource, site_key: activeSiteKey });
     renderSourceControls();
+    clearQueueSnapshot();
     await init(true);
 }
 
