@@ -452,18 +452,55 @@ def test_cache_warmer_skips_existing_volume_files(fake_drive, tmp_path, monkeypa
     assert state["errors"] == []
 
 
+def test_interactive_preview_prewarm_is_bounded(tmp_path, monkeypatch):
+    submitted: list[str] = []
+
+    class FakeExecutor:
+        def submit(self, _fn, file_id):
+            submitted.append(file_id)
+
+    monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(label_app, "_preview_prewarm_executor", FakeExecutor())
+    label_app._preview_prewarm_inflight.clear()
+    folders = [
+        {
+            "frames": {
+                "frame_0": f"folder-{idx}-0",
+                "frame_1": f"folder-{idx}-1",
+                "frame_2": f"folder-{idx}-2",
+            }
+        }
+        for idx in range(label_app.PREWARM_FOLDER_COUNT + 25)
+    ]
+
+    scheduled = label_app._schedule_preview_prewarm(folders)
+
+    assert scheduled == label_app.PREWARM_FOLDER_COUNT * 3
+    assert len(submitted) == scheduled
+
+
 def test_cache_status_reports_cache_dir_and_writable(client, tmp_path, monkeypatch):
     monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
     (tmp_path / "full.jpg").write_bytes(b"full")
     (tmp_path / "full.thumb.jpg").write_bytes(b"thumb")
 
-    response = client.get("/api/cache/status")
+    light_response = client.get("/api/cache/status")
+    light_payload = light_response.get_json()
+
+    assert light_response.status_code == 200
+    assert light_payload["scan_included"] is False
+    assert light_payload["full_res_count"] is None
+    assert light_payload["thumb_count"] is None
+
+    response = client.get("/api/cache/status?scan=1")
     payload = response.get_json()
 
     assert response.status_code == 200
     assert payload["cache_dir"] == str(tmp_path)
     assert payload["writable"] is True
+    assert payload["scan_included"] is True
     assert payload["full_res_count"] == 1
     assert payload["thumb_count"] == 1
     assert payload["configured_cache_dir"] == str(tmp_path)
@@ -471,6 +508,16 @@ def test_cache_status_reports_cache_dir_and_writable(client, tmp_path, monkeypat
     assert payload["cache_max_mb"] == label_app.CACHE_MAX_MB
     assert payload["cache_ttl_hours"] == label_app.CACHE_TTL_HOURS
     assert payload["size_mb"] >= 0
+
+
+def test_cache_warm_status_and_cancel_are_lightweight(client):
+    status_response = client.get("/api/cache/warm/status")
+    cancel_response = client.post("/api/cache/warm/cancel")
+
+    assert status_response.status_code == 200
+    assert "inflight" in status_response.get_json()
+    assert cancel_response.status_code == 200
+    assert cancel_response.get_json()["stop_requested"] is True
 
 
 def test_reolink_label_moves_folder_within_same_site_tree(client, fake_drive):

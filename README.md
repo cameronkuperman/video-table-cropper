@@ -97,13 +97,12 @@ DRIVE_SERVICE_ACCOUNT_JSON_B64=...
 AUTH_REQUIRED=1
 LABELER_PASSWORD=...
 FLASK_SECRET_KEY=...
-WEB_CONCURRENCY=1
 LABEL_CACHE_DIR=/data/label_cache
 LABEL_CACHE_MAX_MB=20000
 LABEL_CACHE_TTL_HOURS=336
-LABEL_PREWARM_FOLDER_COUNT=5000
 LABEL_REOLINK_PREWARM_TARGET=5000
-LABEL_READY_SCAN_MAX=5000
+LABEL_PREWARM_FOLDER_COUNT=60
+LABEL_READY_SCAN_MAX=180
 ```
 
 Mount a Railway volume on the web service at `/data` when using
@@ -115,16 +114,18 @@ To fill the persistent image cache after deploys or new queue generation:
 curl -X POST https://YOUR_DEPLOYMENT/api/cache/warm
 curl https://YOUR_DEPLOYMENT/api/cache/warm/status
 curl https://YOUR_DEPLOYMENT/api/cache/status
+curl https://YOUR_DEPLOYMENT/api/cache/status?scan=1
 ```
 
 The warmer walks the current unlabeled queues, downloads each missing Drive
 frame once, writes `{file_id}.jpg` plus `{file_id}.thumb.jpg` into
-`LABEL_CACHE_DIR`, and skips files already present on the volume.
+`LABEL_CACHE_DIR`, and skips files already present on the volume. If it needs
+to be stopped, call `POST /api/cache/warm/cancel`.
 
 The default web start command is:
 
 ```bash
-gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 8 --timeout 180 app:app
+gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 4 --timeout 180 app:app
 ```
 
 Create a second Railway service or job from the same repo for finite preprocessing:

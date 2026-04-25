@@ -50,23 +50,33 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "autolabeler-dev-secret-chan
 QUEUE_BATCH_DEFAULT = max(36, int(os.environ.get("LABEL_QUEUE_BATCH_DEFAULT", "72") or "72"))
 QUEUE_BATCH_MAX = max(QUEUE_BATCH_DEFAULT, int(os.environ.get("LABEL_QUEUE_BATCH_MAX", "300") or "300"))
 CACHE_CLEANUP_INTERVAL_SECONDS = 300
+INTERACTIVE_PREWARM_FOLDER_CAP = max(
+    12, int(os.environ.get("LABEL_INTERACTIVE_PREWARM_FOLDER_CAP", "96") or "96")
+)
+INTERACTIVE_READY_SCAN_CAP = max(
+    100, int(os.environ.get("LABEL_INTERACTIVE_READY_SCAN_CAP", "240") or "240")
+)
 UNLABELED_LIST_CACHE_SECONDS = max(
     15, int(os.environ.get("LABEL_UNLABELED_CACHE_SECONDS", "300") or "300")
 )
 HYDRATE_MAX_WORKERS = max(2, int(os.environ.get("LABEL_QUEUE_HYDRATE_WORKERS", "12") or "12"))
 PREVIEW_PREWARM_MAX_WORKERS = max(
-    2, int(os.environ.get("LABEL_PREVIEW_PREWARM_WORKERS", "48") or "48")
+    2, min(12, int(os.environ.get("LABEL_PREVIEW_PREWARM_WORKERS", "8") or "8"))
 )
 THUMB_WIDTH = max(128, int(os.environ.get("LABEL_THUMB_WIDTH", "512") or "512"))
 THUMB_QUALITY = max(40, min(95, int(os.environ.get("LABEL_THUMB_QUALITY", "82") or "82")))
 FOLDER_PREWARM_MAX_WORKERS = max(
-    2, int(os.environ.get("LABEL_FOLDER_PREWARM_WORKERS", "12") or "12")
+    2, min(6, int(os.environ.get("LABEL_FOLDER_PREWARM_WORKERS", "4") or "4"))
 )
-PREWARM_FOLDER_COUNT = max(12, int(os.environ.get("LABEL_PREWARM_FOLDER_COUNT", "180") or "180"))
+PREWARM_FOLDER_COUNT = min(
+    INTERACTIVE_PREWARM_FOLDER_CAP,
+    max(12, int(os.environ.get("LABEL_PREWARM_FOLDER_COUNT", "60") or "60")),
+)
 REOLINK_PREWARM_TARGET = max(
     PREWARM_FOLDER_COUNT,
     int(os.environ.get("LABEL_REOLINK_PREWARM_TARGET", "200") or "200"),
 )
+INTERACTIVE_REOLINK_PREWARM_TARGET = min(REOLINK_PREWARM_TARGET, INTERACTIVE_READY_SCAN_CAP)
 AUTOLABEL_VIDEO_LOW_WATERMARK = max(
     0, int(os.environ.get("AUTOLABEL_VIDEO_LOW_WATERMARK", "50") or "50")
 )
@@ -75,7 +85,10 @@ AUTOLABEL_VIDEO_BATCH_SIZE = max(
 )
 HYDRATED_FOLDER_CACHE_TTL_SECONDS = max(60, int(os.environ.get("LABEL_HYDRATED_CACHE_TTL_SECONDS", "900") or "900"))
 READY_SCAN_MULTIPLIER = max(2, int(os.environ.get("LABEL_READY_SCAN_MULTIPLIER", "12") or "12"))
-READY_SCAN_MAX = max(100, int(os.environ.get("LABEL_READY_SCAN_MAX", "720") or "720"))
+READY_SCAN_MAX = min(
+    INTERACTIVE_READY_SCAN_CAP,
+    max(100, int(os.environ.get("LABEL_READY_SCAN_MAX", "180") or "180")),
+)
 QUEUE_RETRY_MS = max(100, int(os.environ.get("LABEL_QUEUE_RETRY_MS", "250") or "250"))
 TIMING_LOGS_ENABLED = os.environ.get("LABEL_TIMING_LOGS", "1").strip().lower() not in {
     "",
@@ -294,6 +307,11 @@ _DEFAULT_CACHE_MAX_MB = "20000" if _RAILWAY_ENV else "1024"
 CACHE_TTL_HOURS = max(1, int(os.environ.get("LABEL_CACHE_TTL_HOURS", _DEFAULT_CACHE_TTL_HOURS) or _DEFAULT_CACHE_TTL_HOURS))
 CACHE_MAX_MB = max(64, int(os.environ.get("LABEL_CACHE_MAX_MB", _DEFAULT_CACHE_MAX_MB) or _DEFAULT_CACHE_MAX_MB))
 CACHE_WARM_ERROR_LIMIT = max(1, int(os.environ.get("LABEL_CACHE_WARM_ERROR_LIMIT", "25") or "25"))
+CACHE_WARM_BATCH_SIZE = max(1, int(os.environ.get("LABEL_CACHE_WARM_BATCH_SIZE", "25") or "25"))
+CACHE_WARM_BATCH_PAUSE_SECONDS = max(
+    0.0,
+    float(os.environ.get("LABEL_CACHE_WARM_BATCH_PAUSE_SECONDS", "0.05") or "0.05"),
+)
 
 # Drive client + cached folder IDs
 _source_folder_ids_cache: dict[str, dict[str, str]] = {}
@@ -326,6 +344,8 @@ _cache_warm_state: dict[str, Any] = {
     "skipped_thumbs": 0,
     "errors": [],
     "last_error": None,
+    "stop_requested": False,
+    "batch_size": CACHE_WARM_BATCH_SIZE,
 }
 _folder_prewarm_executor = ThreadPoolExecutor(max_workers=FOLDER_PREWARM_MAX_WORKERS)
 _folder_prewarm_inflight: set[tuple[str, str]] = set()
@@ -1817,6 +1837,20 @@ def _increment_cache_warm_state(**increments: int) -> None:
             _cache_warm_state[key] = int(_cache_warm_state.get(key) or 0) + amount
 
 
+def _cache_warm_stop_requested() -> bool:
+    with _cache_warm_lock:
+        return bool(_cache_warm_state.get("stop_requested"))
+
+
+def _request_cache_warm_stop() -> dict[str, Any]:
+    with _cache_warm_lock:
+        if _cache_warm_state.get("inflight"):
+            _cache_warm_state["stop_requested"] = True
+        state = dict(_cache_warm_state)
+        state["errors"] = list(_cache_warm_state.get("errors", []))
+        return state
+
+
 def _cache_warm_contexts(
     client: DriveClient,
     source: str | None = None,
@@ -1869,21 +1903,31 @@ def _warm_cache_for_context(client: DriveClient, context: QueueContext, limit: i
         subfolders = subfolders[:limit]
     _increment_cache_warm_state(folders_scanned=len(subfolders))
 
-    for folder in subfolders:
-        try:
-            payload = _hydrate_folder(client, context, folder)
-            if payload is None:
-                continue
-            _increment_cache_warm_state(folders_hydrated=1)
-            frames = payload.get("frames", {})
-            for key in ("frame_0", "frame_1", "frame_2"):
-                file_id = frames.get(key)
-                if not file_id:
+    for batch_start in range(0, len(subfolders), CACHE_WARM_BATCH_SIZE):
+        if _cache_warm_stop_requested():
+            break
+        folder_batch = subfolders[batch_start:batch_start + CACHE_WARM_BATCH_SIZE]
+        for folder in folder_batch:
+            if _cache_warm_stop_requested():
+                break
+            try:
+                payload = _hydrate_folder(client, context, folder)
+                if payload is None:
                     continue
-                _warm_cache_file_once(client, str(file_id))
-        except Exception as exc:
-            folder_name = str(folder.get("name") or folder.get("id") or "unknown")
-            _append_cache_warm_error(f"{context.queue_key}/{folder_name}: {exc}")
+                _increment_cache_warm_state(folders_hydrated=1)
+                frames = payload.get("frames", {})
+                for key in ("frame_0", "frame_1", "frame_2"):
+                    if _cache_warm_stop_requested():
+                        break
+                    file_id = frames.get(key)
+                    if not file_id:
+                        continue
+                    _warm_cache_file_once(client, str(file_id))
+            except Exception as exc:
+                folder_name = str(folder.get("name") or folder.get("id") or "unknown")
+                _append_cache_warm_error(f"{context.queue_key}/{folder_name}: {exc}")
+        if CACHE_WARM_BATCH_PAUSE_SECONDS > 0:
+            time.sleep(CACHE_WARM_BATCH_PAUSE_SECONDS)
 
     _increment_cache_warm_state(queues_completed=1)
 
@@ -1914,6 +1958,8 @@ def _run_cache_warm_background(source: str | None, site_key: str | None, limit: 
                 "skipped_thumbs": 0,
                 "errors": [],
                 "last_error": None,
+                "stop_requested": False,
+                "batch_size": CACHE_WARM_BATCH_SIZE,
             }
         )
 
@@ -1922,6 +1968,8 @@ def _run_cache_warm_background(source: str | None, site_key: str | None, limit: 
         contexts = _cache_warm_contexts(client, source, site_key)
         _set_cache_warm_state(queues_total=len(contexts))
         for context in contexts:
+            if _cache_warm_stop_requested():
+                break
             _warm_cache_for_context(client, context, limit)
     except Exception as exc:
         _append_cache_warm_error(str(exc))
@@ -1940,6 +1988,7 @@ def _start_cache_warm(source: str | None, site_key: str | None, limit: int | Non
             state["errors"] = list(_cache_warm_state.get("errors", []))
             return False, state
         _cache_warm_state["inflight"] = True
+        _cache_warm_state["stop_requested"] = False
 
     _cache_warm_executor.submit(_run_cache_warm_background, source, site_key, limit)
     return True, _cache_warm_state_snapshot()
@@ -2465,7 +2514,7 @@ def api_folders():
             _maybe_trigger_reolink_preprocess(
                 context,
                 len(subfolders),
-                REOLINK_PREWARM_TARGET,
+                INTERACTIVE_REOLINK_PREWARM_TARGET,
             )
         result = [
             {
@@ -2502,7 +2551,7 @@ def api_queue():
         force_refresh = request.args.get("refresh", "0") == "1"
         target_unlabeled_count = min(
             READY_SCAN_MAX,
-            max(limit * READY_SCAN_MULTIPLIER, REOLINK_PREWARM_TARGET),
+            max(limit * READY_SCAN_MULTIPLIER, INTERACTIVE_REOLINK_PREWARM_TARGET),
         )
 
         list_started = time.perf_counter()
@@ -2589,6 +2638,7 @@ def api_folder_frames(folder_id: str):
 @app.route("/api/cache/status")
 def api_cache_status():
     cache_dir = _ensure_cache_dir()
+    include_counts = request.args.get("scan", "0") == "1"
     writable = False
     error = None
     try:
@@ -2602,18 +2652,19 @@ def api_cache_status():
     full_res_count = 0
     thumb_count = 0
     total_bytes = 0
-    try:
-        for path in cache_dir.glob("*.jpg"):
-            try:
-                total_bytes += path.stat().st_size
-            except OSError:
-                pass
-            if path.name.endswith(".thumb.jpg"):
-                thumb_count += 1
-            else:
-                full_res_count += 1
-    except OSError as exc:
-        error = error or str(exc)
+    if include_counts:
+        try:
+            for path in cache_dir.glob("*.jpg"):
+                try:
+                    total_bytes += path.stat().st_size
+                except OSError:
+                    pass
+                if path.name.endswith(".thumb.jpg"):
+                    thumb_count += 1
+                else:
+                    full_res_count += 1
+        except OSError as exc:
+            error = error or str(exc)
 
     temp_root = Path(tempfile.gettempdir()).resolve()
     try:
@@ -2640,9 +2691,10 @@ def api_cache_status():
             "uses_temp_cache": uses_temp_cache,
             "cache_max_mb": CACHE_MAX_MB,
             "cache_ttl_hours": CACHE_TTL_HOURS,
-            "full_res_count": full_res_count,
-            "thumb_count": thumb_count,
-            "size_mb": round(total_bytes / (1024 * 1024), 2),
+            "scan_included": include_counts,
+            "full_res_count": full_res_count if include_counts else None,
+            "thumb_count": thumb_count if include_counts else None,
+            "size_mb": round(total_bytes / (1024 * 1024), 2) if include_counts else None,
             "error": error,
             "production_warning": production_warning,
         }
@@ -2675,6 +2727,11 @@ def api_cache_warm_start():
 @app.route("/api/cache/warm/status")
 def api_cache_warm_status():
     return jsonify(_cache_warm_state_snapshot())
+
+
+@app.route("/api/cache/warm/cancel", methods=["POST"])
+def api_cache_warm_cancel():
+    return jsonify({"stop_requested": True, "state": _request_cache_warm_stop()})
 
 
 @app.route("/api/preview/<file_id>")
@@ -2821,7 +2878,12 @@ def api_stats():
         client = get_client()
         source, site_key = _request_source_args()
         context = _resolve_queue_context(client, source, site_key)
-        _prepare_reolink_unlabeled_queue(client, context, target_unlabeled_count=REOLINK_PREWARM_TARGET)
+        if context.source == REOLINK_SOURCE:
+            _prepare_reolink_unlabeled_queue(
+                client,
+                context,
+                target_unlabeled_count=INTERACTIVE_REOLINK_PREWARM_TARGET,
+            )
         stats = _compute_stats(client, context)
         if context.source == VIDEO_SOURCE:
             _maybe_trigger_video_preprocess(context, stats.get("unlabeled", 0))

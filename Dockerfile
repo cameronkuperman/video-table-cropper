@@ -16,4 +16,4 @@ RUN pip install --upgrade pip \
 
 COPY . .
 
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 8 --timeout 180 app:app"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 4 --timeout 180 app:app"]
