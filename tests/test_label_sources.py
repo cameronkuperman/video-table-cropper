@@ -389,8 +389,35 @@ def test_queue_prefers_cached_folders_when_available(client):
     assert [folder["folder_name"] for folder in payload["folders"]] == ["ipc3_table-4_t0001"]
     assert payload["folders"][0]["cache_ready"] is True
     assert payload["ready_buffer_count"] == 1
+    assert payload["folders"][0]["frame_signature"] == "video-frame0|video-frame1|video-frame2"
     assert payload["folders"][0]["thumb_urls"]["frame_0"].startswith("/api/thumb/")
     assert payload["folders"][0]["preview_urls"]["frame_0"].startswith("/api/preview/")
+
+
+def test_queue_dedupes_duplicate_frame_signatures(client, fake_drive):
+    fake_drive._add_folder("video-triplet-copy", "ipc3_table-4_t0001_copy", "video-unlabeled")
+    fake_drive.update_file_metadata(
+        "video-triplet-copy",
+        {
+            "appProperties": label_app.build_folder_app_properties(
+                {
+                    "frame_0": "video-frame0",
+                    "frame_1": "video-frame1",
+                    "frame_2": "video-frame2",
+                }
+            )
+        },
+    )
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert [folder["frame_signature"] for folder in payload["folders"]] == [
+        "video-frame0|video-frame1|video-frame2"
+    ]
 
 
 def test_thumb_cache_ready_uses_persistent_thumb_files(tmp_path, monkeypatch):
