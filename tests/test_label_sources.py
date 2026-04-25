@@ -393,6 +393,20 @@ def test_queue_prefers_cached_folders_when_available(client):
     assert payload["folders"][0]["preview_urls"]["frame_0"].startswith("/api/preview/")
 
 
+def test_thumb_cache_ready_uses_persistent_thumb_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
+    frames = {
+        "frame_0": "ready-0",
+        "frame_1": "ready-1",
+        "frame_2": "ready-2",
+    }
+    for file_id in frames.values():
+        (tmp_path / f"{file_id}.thumb.jpg").write_bytes(b"thumb")
+
+    assert label_app._thumbs_cache_ready(frames) is True
+
+
 def test_thumbnail_prewarm_writes_thumb_cache_without_browser_request(fake_drive, tmp_path, monkeypatch):
     image_bytes = io.BytesIO()
     Image.new("RGB", (800, 450), color=(20, 40, 60)).save(image_bytes, format="JPEG")
@@ -414,6 +428,30 @@ def test_thumbnail_prewarm_writes_thumb_cache_without_browser_request(fake_drive
     assert encode_ms >= 0
 
 
+def test_cache_warmer_skips_existing_volume_files(fake_drive, tmp_path, monkeypatch):
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (800, 450), color=(20, 40, 60)).save(image_bytes, format="JPEG")
+    for file_id in ("video-frame0", "video-frame1", "video-frame2"):
+        fake_drive.items[file_id]["content"] = image_bytes.getvalue()
+
+    monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
+    (tmp_path / "video-frame0.jpg").write_bytes(image_bytes.getvalue())
+    (tmp_path / "video-frame0.thumb.jpg").write_bytes(image_bytes.getvalue())
+
+    label_app._run_cache_warm_background(label_app.VIDEO_SOURCE, None, limit=1)
+    state = label_app._cache_warm_state_snapshot()
+
+    assert state["folders_scanned"] == 1
+    assert state["folders_hydrated"] == 1
+    assert state["frames_seen"] == 3
+    assert state["full_res_cached"] == 2
+    assert state["thumbs_cached"] == 2
+    assert state["skipped_full_res"] == 1
+    assert state["skipped_thumbs"] == 1
+    assert state["errors"] == []
+
+
 def test_cache_status_reports_cache_dir_and_writable(client, tmp_path, monkeypatch):
     monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
@@ -428,6 +466,10 @@ def test_cache_status_reports_cache_dir_and_writable(client, tmp_path, monkeypat
     assert payload["writable"] is True
     assert payload["full_res_count"] == 1
     assert payload["thumb_count"] == 1
+    assert payload["configured_cache_dir"] == str(tmp_path)
+    assert payload["expected_volume_cache_dir"] == "/data/label_cache"
+    assert payload["cache_max_mb"] == label_app.CACHE_MAX_MB
+    assert payload["cache_ttl_hours"] == label_app.CACHE_TTL_HOURS
     assert payload["size_mb"] >= 0
 
 

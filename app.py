@@ -277,6 +277,9 @@ def _default_cache_dir() -> Path:
     if configured:
         return Path(configured).expanduser()
 
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"):
+        return Path("/data/label_cache")
+
     local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
     if local_appdata:
         return Path(local_appdata) / "AutoLabeler" / "label_cache"
@@ -285,8 +288,12 @@ def _default_cache_dir() -> Path:
 
 
 CACHE_DIR = _default_cache_dir()
-CACHE_TTL_HOURS = max(1, int(os.environ.get("LABEL_CACHE_TTL_HOURS", "72") or "72"))
-CACHE_MAX_MB = max(64, int(os.environ.get("LABEL_CACHE_MAX_MB", "1024") or "1024"))
+_RAILWAY_ENV = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
+_DEFAULT_CACHE_TTL_HOURS = "336" if _RAILWAY_ENV else "72"
+_DEFAULT_CACHE_MAX_MB = "20000" if _RAILWAY_ENV else "1024"
+CACHE_TTL_HOURS = max(1, int(os.environ.get("LABEL_CACHE_TTL_HOURS", _DEFAULT_CACHE_TTL_HOURS) or _DEFAULT_CACHE_TTL_HOURS))
+CACHE_MAX_MB = max(64, int(os.environ.get("LABEL_CACHE_MAX_MB", _DEFAULT_CACHE_MAX_MB) or _DEFAULT_CACHE_MAX_MB))
+CACHE_WARM_ERROR_LIMIT = max(1, int(os.environ.get("LABEL_CACHE_WARM_ERROR_LIMIT", "25") or "25"))
 
 # Drive client + cached folder IDs
 _source_folder_ids_cache: dict[str, dict[str, str]] = {}
@@ -300,6 +307,26 @@ _listing_refresh_inflight: set[str] = set()
 _preview_prewarm_executor = ThreadPoolExecutor(max_workers=PREVIEW_PREWARM_MAX_WORKERS)
 _preview_prewarm_inflight: set[str] = set()
 _preview_prewarm_lock = Lock()
+_cache_warm_executor = ThreadPoolExecutor(max_workers=1)
+_cache_warm_lock = Lock()
+_cache_warm_state: dict[str, Any] = {
+    "inflight": False,
+    "started_at": None,
+    "completed_at": None,
+    "requested": {},
+    "current_queue": None,
+    "queues_total": 0,
+    "queues_completed": 0,
+    "folders_scanned": 0,
+    "folders_hydrated": 0,
+    "frames_seen": 0,
+    "full_res_cached": 0,
+    "thumbs_cached": 0,
+    "skipped_full_res": 0,
+    "skipped_thumbs": 0,
+    "errors": [],
+    "last_error": None,
+}
 _folder_prewarm_executor = ThreadPoolExecutor(max_workers=FOLDER_PREWARM_MAX_WORKERS)
 _folder_prewarm_inflight: set[tuple[str, str]] = set()
 _folder_prewarm_lock = Lock()
@@ -1592,7 +1619,7 @@ def _build_folder_payload(
         "frames": frames,
         "preview_urls": preview_urls,
         "thumb_urls": thumb_urls,
-        "cache_ready": _frames_cache_ready(frames),
+        "cache_ready": _thumbs_cache_ready(frames),
     }
 
 
@@ -1761,6 +1788,161 @@ def _schedule_preview_prewarm(hydrated_folders: list[dict]) -> int:
             _preview_prewarm_executor.submit(_warm_thumb, file_id)
             scheduled += 1
     return scheduled
+
+
+def _cache_warm_state_snapshot() -> dict[str, Any]:
+    with _cache_warm_lock:
+        state = dict(_cache_warm_state)
+        state["errors"] = list(_cache_warm_state.get("errors", []))
+        return state
+
+
+def _set_cache_warm_state(**updates: Any) -> None:
+    with _cache_warm_lock:
+        _cache_warm_state.update(updates)
+
+
+def _append_cache_warm_error(message: str) -> None:
+    with _cache_warm_lock:
+        errors = list(_cache_warm_state.get("errors", []))
+        if len(errors) < CACHE_WARM_ERROR_LIMIT:
+            errors.append(message)
+        _cache_warm_state["errors"] = errors
+        _cache_warm_state["last_error"] = message
+
+
+def _increment_cache_warm_state(**increments: int) -> None:
+    with _cache_warm_lock:
+        for key, amount in increments.items():
+            _cache_warm_state[key] = int(_cache_warm_state.get(key) or 0) + amount
+
+
+def _cache_warm_contexts(
+    client: DriveClient,
+    source: str | None = None,
+    site_key: str | None = None,
+) -> list[QueueContext]:
+    if source:
+        return [_resolve_queue_context(client, source, site_key)]
+
+    contexts: list[QueueContext] = []
+    for label_source in LABEL_SOURCES:
+        try:
+            contexts.append(
+                _resolve_queue_context(
+                    client,
+                    label_source.source,
+                    label_source.site_key,
+                )
+            )
+        except Exception as exc:
+            _append_cache_warm_error(f"{label_source.queue_key}: {exc}")
+    return contexts
+
+
+def _warm_cache_file_once(client: DriveClient, file_id: str) -> None:
+    cache_path = _cache_path_for_file(file_id)
+    thumb_path = _thumb_path_for_file(file_id)
+    full_existed = cache_path.exists()
+    thumb_existed = thumb_path.exists()
+
+    _ensure_thumb_for_file(file_id, client)
+
+    increments = {"frames_seen": 1}
+    if full_existed:
+        increments["skipped_full_res"] = 1
+    elif cache_path.exists():
+        increments["full_res_cached"] = 1
+
+    if thumb_existed:
+        increments["skipped_thumbs"] = 1
+    elif thumb_path.exists():
+        increments["thumbs_cached"] = 1
+
+    _increment_cache_warm_state(**increments)
+
+
+def _warm_cache_for_context(client: DriveClient, context: QueueContext, limit: int | None = None) -> None:
+    _set_cache_warm_state(current_queue=context.queue_key)
+    subfolders = _list_source_subfolders(client, context)
+    if limit is not None:
+        subfolders = subfolders[:limit]
+    _increment_cache_warm_state(folders_scanned=len(subfolders))
+
+    for folder in subfolders:
+        try:
+            payload = _hydrate_folder(client, context, folder)
+            if payload is None:
+                continue
+            _increment_cache_warm_state(folders_hydrated=1)
+            frames = payload.get("frames", {})
+            for key in ("frame_0", "frame_1", "frame_2"):
+                file_id = frames.get(key)
+                if not file_id:
+                    continue
+                _warm_cache_file_once(client, str(file_id))
+        except Exception as exc:
+            folder_name = str(folder.get("name") or folder.get("id") or "unknown")
+            _append_cache_warm_error(f"{context.queue_key}/{folder_name}: {exc}")
+
+    _increment_cache_warm_state(queues_completed=1)
+
+
+def _run_cache_warm_background(source: str | None, site_key: str | None, limit: int | None) -> None:
+    started_at = datetime.now(timezone.utc).isoformat()
+    requested = {
+        "source": source or "all",
+        "site_key": site_key,
+        "limit": limit,
+    }
+    with _cache_warm_lock:
+        _cache_warm_state.update(
+            {
+                "inflight": True,
+                "started_at": started_at,
+                "completed_at": None,
+                "requested": requested,
+                "current_queue": None,
+                "queues_total": 0,
+                "queues_completed": 0,
+                "folders_scanned": 0,
+                "folders_hydrated": 0,
+                "frames_seen": 0,
+                "full_res_cached": 0,
+                "thumbs_cached": 0,
+                "skipped_full_res": 0,
+                "skipped_thumbs": 0,
+                "errors": [],
+                "last_error": None,
+            }
+        )
+
+    try:
+        client = DriveClient()
+        contexts = _cache_warm_contexts(client, source, site_key)
+        _set_cache_warm_state(queues_total=len(contexts))
+        for context in contexts:
+            _warm_cache_for_context(client, context, limit)
+    except Exception as exc:
+        _append_cache_warm_error(str(exc))
+    finally:
+        _set_cache_warm_state(
+            inflight=False,
+            current_queue=None,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+
+def _start_cache_warm(source: str | None, site_key: str | None, limit: int | None) -> tuple[bool, dict[str, Any]]:
+    with _cache_warm_lock:
+        if _cache_warm_state.get("inflight"):
+            state = dict(_cache_warm_state)
+            state["errors"] = list(_cache_warm_state.get("errors", []))
+            return False, state
+        _cache_warm_state["inflight"] = True
+
+    _cache_warm_executor.submit(_run_cache_warm_background, source, site_key, limit)
+    return True, _cache_warm_state_snapshot()
 
 
 def _hydrate_folder_with_fresh_client(
@@ -2433,16 +2615,66 @@ def api_cache_status():
     except OSError as exc:
         error = error or str(exc)
 
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    try:
+        resolved_cache_dir = cache_dir.resolve()
+    except OSError:
+        resolved_cache_dir = cache_dir
+    railway_env = _RAILWAY_ENV
+    configured_cache = os.environ.get("LABEL_CACHE_DIR", "").strip()
+    uses_temp_cache = str(resolved_cache_dir).startswith(str(temp_root))
+    expected_volume_path = "/data/label_cache"
+    production_warning = None
+    if railway_env and not str(resolved_cache_dir).startswith("/data/"):
+        production_warning = "Railway cache is not under /data; cached images may not survive redeploys."
+    elif uses_temp_cache:
+        production_warning = "Cache is under the system temp directory; use LABEL_CACHE_DIR for persistence."
+
     return jsonify(
         {
             "cache_dir": str(cache_dir),
             "writable": writable,
+            "configured_cache_dir": configured_cache or None,
+            "expected_volume_cache_dir": expected_volume_path,
+            "railway_environment": railway_env,
+            "uses_temp_cache": uses_temp_cache,
+            "cache_max_mb": CACHE_MAX_MB,
+            "cache_ttl_hours": CACHE_TTL_HOURS,
             "full_res_count": full_res_count,
             "thumb_count": thumb_count,
             "size_mb": round(total_bytes / (1024 * 1024), 2),
             "error": error,
+            "production_warning": production_warning,
         }
     )
+
+
+@app.route("/api/cache/warm", methods=["POST"])
+def api_cache_warm_start():
+    data = request.get_json(silent=True) or {}
+    source = (data.get("source") or request.args.get("source") or "").strip().lower() or None
+    site_key = (data.get("site_key") or data.get("site") or request.args.get("site") or "").strip() or None
+    raw_limit = data.get("limit", request.args.get("limit"))
+    limit = None
+    if raw_limit not in (None, ""):
+        try:
+            limit = max(1, int(raw_limit))
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit must be a positive integer"}), 400
+
+    try:
+        if source:
+            _resolve_label_source(source, site_key)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    started, state = _start_cache_warm(source, site_key, limit)
+    return jsonify({"started": started, "state": state}), 202 if started else 409
+
+
+@app.route("/api/cache/warm/status")
+def api_cache_warm_status():
+    return jsonify(_cache_warm_state_snapshot())
 
 
 @app.route("/api/preview/<file_id>")

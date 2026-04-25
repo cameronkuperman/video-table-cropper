@@ -109,6 +109,18 @@ LABEL_READY_SCAN_MAX=5000
 Mount a Railway volume on the web service at `/data` when using
 `LABEL_CACHE_DIR=/data/label_cache`.
 
+To fill the persistent image cache after deploys or new queue generation:
+
+```bash
+curl -X POST https://YOUR_DEPLOYMENT/api/cache/warm
+curl https://YOUR_DEPLOYMENT/api/cache/warm/status
+curl https://YOUR_DEPLOYMENT/api/cache/status
+```
+
+The warmer walks the current unlabeled queues, downloads each missing Drive
+frame once, writes `{file_id}.jpg` plus `{file_id}.thumb.jpg` into
+`LABEL_CACHE_DIR`, and skips files already present on the volume.
+
 The default web start command is:
 
 ```bash
