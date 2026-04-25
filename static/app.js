@@ -3,6 +3,8 @@
 let folders = [];
 let currentIndex = 0;
 let labeling = false;
+let suppressedFolderIds = new Set();
+let suppressedFrameSignatures = new Set();
 let hasMore = true;
 let queueRequest = null;
 let renderToken = 0;
@@ -35,6 +37,7 @@ const TIMING_LOGS_ENABLED = true;
 const QUEUE_SNAPSHOT_PREFIX = 'autolabeler.queueSnapshot.';
 const QUEUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
 const QUEUE_SNAPSHOT_MAX_FOLDERS = 300;
+const SUPPRESSED_QUEUE_MAX = 1000;
 
 const cardEl = document.getElementById('card');
 const progressEl = document.getElementById('progress');
@@ -99,6 +102,40 @@ function activeQueueKey() {
         : 'video';
 }
 
+function frameSignature(folder) {
+    if (folder?.frame_signature) {
+        return String(folder.frame_signature);
+    }
+    const frames = folder?.frames || {};
+    return ['frame_0', 'frame_1', 'frame_2']
+        .map(key => frames[key] || '')
+        .join('|');
+}
+
+function isSuppressedFolder(folder) {
+    const folderId = String(folder?.folder_id || '');
+    const signature = frameSignature(folder);
+    return (folderId && suppressedFolderIds.has(folderId))
+        || (signature && suppressedFrameSignatures.has(signature));
+}
+
+function rememberSuppressedFolder(folder) {
+    const folderId = String(folder?.folder_id || '');
+    const signature = frameSignature(folder);
+    if (folderId) {
+        suppressedFolderIds.add(folderId);
+    }
+    if (signature) {
+        suppressedFrameSignatures.add(signature);
+    }
+    while (suppressedFolderIds.size > SUPPRESSED_QUEUE_MAX) {
+        suppressedFolderIds.delete(suppressedFolderIds.values().next().value);
+    }
+    while (suppressedFrameSignatures.size > SUPPRESSED_QUEUE_MAX) {
+        suppressedFrameSignatures.delete(suppressedFrameSignatures.values().next().value);
+    }
+}
+
 function queueSnapshotKey(queueKey = activeQueueKey()) {
     return `${QUEUE_SNAPSHOT_PREFIX}${queueKey}`;
 }
@@ -129,6 +166,8 @@ function saveQueueSnapshot() {
                 readyBufferCount,
                 warmingCount,
                 stats,
+                suppressedFolderIds: Array.from(suppressedFolderIds).slice(-SUPPRESSED_QUEUE_MAX),
+                suppressedFrameSignatures: Array.from(suppressedFrameSignatures).slice(-SUPPRESSED_QUEUE_MAX),
             }),
         );
     } catch (_error) {}
@@ -164,6 +203,8 @@ function restoreQueueSnapshot() {
         initialTotalUnlabeled = Number(snapshot.initialTotalUnlabeled || restoredFolders.length);
         readyBufferCount = Number(snapshot.readyBufferCount || 0);
         warmingCount = Number(snapshot.warmingCount || 0);
+        suppressedFolderIds = new Set((snapshot.suppressedFolderIds || []).map(String));
+        suppressedFrameSignatures = new Set((snapshot.suppressedFrameSignatures || []).map(String));
         activeDisplayName = snapshot.displayName || activeDisplayName;
         activePendingLabel = snapshot.pendingLabel || activePendingLabel;
         if (snapshot.stats) {
@@ -365,11 +406,13 @@ async function fetchQueue({
         ? `reolink:${requestSiteKey || ''}`
         : 'video';
 
-    if (reset) {
-        folders = [];
-        currentIndex = 0;
-        hasMore = true;
-        queueRequest = null;
+            if (reset) {
+                folders = [];
+                suppressedFolderIds = new Set();
+                suppressedFrameSignatures = new Set();
+                currentIndex = 0;
+                hasMore = true;
+                queueRequest = null;
         initialTotalUnlabeled = 0;
         readyBufferCount = 0;
         warmingCount = 0;
@@ -440,11 +483,20 @@ async function fetchQueue({
             }
 
             const existingIds = new Set(folders.map(folder => folder.folder_id));
+            const existingSignatures = new Set(folders.map(frameSignature).filter(Boolean));
             let added = 0;
             for (const folder of data.folders || []) {
-                if (!existingIds.has(folder.folder_id)) {
+                const signature = frameSignature(folder);
+                if (
+                    !isSuppressedFolder(folder)
+                    && !existingIds.has(folder.folder_id)
+                    && (!signature || !existingSignatures.has(signature))
+                ) {
                     folders.push(folder);
                     existingIds.add(folder.folder_id);
+                    if (signature) {
+                        existingSignatures.add(signature);
+                    }
                     added += 1;
                 }
             }
@@ -835,10 +887,8 @@ async function labelCurrent(label) {
 
     const startedAt = performance.now();
     labeling = true;
+    rememberSuppressedFolder(folder);
     folders.splice(currentIndex, 1);
-    if (currentIndex >= folders.length && currentIndex > 0) {
-        currentIndex--;
-    }
     saveQueueSnapshot();
 
     applyOptimisticLabel(label);

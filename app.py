@@ -1619,6 +1619,7 @@ def _build_folder_payload(
     context: QueueContext,
     frames: dict[str, str | None],
 ) -> dict:
+    frame_signature = "|".join(str(frames.get(key) or "") for key in ("frame_0", "frame_1", "frame_2"))
     preview_urls = {
         key: f"/api/preview/{file_id}"
         for key, file_id in frames.items()
@@ -1637,6 +1638,7 @@ def _build_folder_payload(
         "site_key": context.site_key,
         "queue_key": context.queue_key,
         "frames": frames,
+        "frame_signature": frame_signature,
         "preview_urls": preview_urls,
         "thumb_urls": thumb_urls,
         "cache_ready": _thumbs_cache_ready(frames),
@@ -2097,6 +2099,7 @@ def _collect_ready_folders(
 ) -> tuple[list[dict], dict[str, int | float]]:
     ready: list[dict] = []
     fallback: list[dict] = []
+    seen_signatures: set[str] = set()
     nonready = 0
     hydrated_valid = 0
     scanned = 0
@@ -2132,6 +2135,11 @@ def _collect_ready_folders(
             absolute_idx = scanned + offset
             if payload is None:
                 continue
+            signature = str(payload.get("frame_signature") or "")
+            if signature and signature in seen_signatures:
+                continue
+            if signature:
+                seen_signatures.add(signature)
             hydrated_valid += 1
             payload["cache_ready"] = _folder_cache_ready(payload)
             if payload["cache_ready"]:
@@ -2838,6 +2846,9 @@ def api_label():
         current = client.get_file(folder_id, fields="id,name,parents,appProperties")
         current_parents = [str(parent) for parent in current.get("parents", []) if parent]
         if context.input_folder_id not in current_parents:
+            return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
+        if str(current.get("appProperties", {}).get("autolabel_final_label") or ""):
+            _remove_folder_from_listing_cache(context.queue_key, folder_id)
             return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
 
         dest_id = context.folder_ids[label]
