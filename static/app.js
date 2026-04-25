@@ -27,7 +27,7 @@ let stats = {
     discarded: 0,
 };
 
-const INITIAL_QUEUE_BATCH_SIZE = 60;
+const INITIAL_QUEUE_BATCH_SIZE = 12;
 const REFILL_QUEUE_BATCH_SIZE = 120;
 const WARM_BUFFER_SIZE = 144;
 const LOW_WATERMARK = 160;
@@ -585,7 +585,8 @@ function renderFolderCard(folder) {
     currentImagesReady = false;
     const frameKeys = ['frame_0', 'frame_1', 'frame_2'];
     const imgHtml = frameKeys.map((key, idx) => {
-        const url = folder.preview_urls?.[key];
+        const url = folder.thumb_urls?.[key] ?? folder.preview_urls?.[key];
+        const fullUrl = folder.preview_urls?.[key] || '';
         if (!url) {
             return `
                 <div class="image-slot error" data-frame="${key}">
@@ -596,7 +597,7 @@ function renderFolderCard(folder) {
         return `
             <div class="image-slot" data-frame="${key}">
                 <div class="img-placeholder">loading</div>
-                <img src="${url}" alt="${key}" loading="eager" decoding="async" data-frame-index="${idx}" />
+                <img src="${url}" data-full-src="${fullUrl}" alt="${key}" loading="eager" decoding="async" data-frame-index="${idx}" />
             </div>
         `;
     }).join('');

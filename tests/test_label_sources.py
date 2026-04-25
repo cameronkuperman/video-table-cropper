@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import io
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 import app as label_app
 import processor
@@ -281,7 +283,7 @@ def fake_drive(monkeypatch):
     monkeypatch.setattr(label_app, "get_client", lambda: fake)
     monkeypatch.setattr(
         label_app,
-        "_frames_cache_ready",
+        "_thumbs_cache_ready",
         lambda frames: all(frames.get(key) for key in ("frame_0", "frame_1", "frame_2")),
     )
     monkeypatch.setattr(label_app, "_schedule_preview_prewarm", lambda hydrated_folders: 0)
@@ -366,7 +368,7 @@ def test_queue_is_source_aware_and_reolink_filters_incomplete_triplets(client):
 
 
 def test_queue_returns_uncached_fallback_when_no_frames_are_cached(client, fake_drive, monkeypatch):
-    monkeypatch.setattr(label_app, "_frames_cache_ready", lambda frames: False)
+    monkeypatch.setattr(label_app, "_thumbs_cache_ready", lambda frames: False)
     label_app._hydrated_folder_cache.clear()
 
     response = client.get("/api/queue?source=video&limit=10")
@@ -387,6 +389,29 @@ def test_queue_prefers_cached_folders_when_available(client):
     assert [folder["folder_name"] for folder in payload["folders"]] == ["ipc3_table-4_t0001"]
     assert payload["folders"][0]["cache_ready"] is True
     assert payload["ready_buffer_count"] == 1
+    assert payload["folders"][0]["thumb_urls"]["frame_0"].startswith("/api/thumb/")
+    assert payload["folders"][0]["preview_urls"]["frame_0"].startswith("/api/preview/")
+
+
+def test_thumbnail_prewarm_writes_thumb_cache_without_browser_request(fake_drive, tmp_path, monkeypatch):
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (800, 450), color=(20, 40, 60)).save(image_bytes, format="JPEG")
+    fake_drive.items["video-frame0"]["content"] = image_bytes.getvalue()
+
+    monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
+
+    thumb_path, cache_hit, download_ms, encode_ms = label_app._ensure_thumb_for_file(
+        "video-frame0",
+        fake_drive,
+    )
+
+    assert thumb_path == tmp_path / "video-frame0.thumb.jpg"
+    assert thumb_path.exists()
+    assert (tmp_path / "video-frame0.jpg").exists()
+    assert cache_hit is False
+    assert download_ms >= 0
+    assert encode_ms >= 0
 
 
 def test_cache_status_reports_cache_dir_and_writable(client, tmp_path, monkeypatch):

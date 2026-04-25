@@ -1632,8 +1632,16 @@ def _frames_cache_ready(frames: dict[str, str | None]) -> bool:
     return True
 
 
+def _thumbs_cache_ready(frames: dict[str, str | None]) -> bool:
+    for key in ("frame_0", "frame_1", "frame_2"):
+        file_id = frames.get(key)
+        if not file_id or not _thumb_path_for_file(file_id).exists():
+            return False
+    return True
+
+
 def _folder_cache_ready(folder: dict) -> bool:
-    return _frames_cache_ready(folder.get("frames", {}))
+    return _thumbs_cache_ready(folder.get("frames", {}))
 
 
 def _hydrate_folder(client: DriveClient, context: QueueContext, folder: dict[str, str]) -> dict | None:
@@ -1678,17 +1686,40 @@ def _set_cached_hydrated_folder(queue_key: str, folder_id: str, payload: dict | 
 _MISSING = object()
 
 
-def _warm_file(file_id: str) -> None:
-    try:
-        cache_path = _cache_path_for_file(file_id)
-        if cache_path.exists():
-            try:
-                os.utime(cache_path, None)
-            except OSError:
-                pass
-            return
+def _ensure_thumb_for_file(file_id: str, client: DriveClient | None = None) -> tuple[Path, bool, float, float]:
+    thumb_path = _thumb_path_for_file(file_id)
+    cache_path = _cache_path_for_file(file_id)
+    cache_hit = thumb_path.exists()
+    download_ms = 0.0
+    encode_ms = 0.0
 
-        DriveClient().download_file_to_path(file_id, cache_path)
+    if cache_hit:
+        return thumb_path, True, download_ms, encode_ms
+
+    if not cache_path.exists():
+        active_client = client or DriveClient()
+        download_started = time.perf_counter()
+        active_client.download_file_to_path(file_id, cache_path)
+        download_ms = (time.perf_counter() - download_started) * 1000
+
+    from PIL import Image
+
+    encode_started = time.perf_counter()
+    with Image.open(cache_path) as img:
+        rgb = img.convert("RGB")
+        rgb.thumbnail((THUMB_WIDTH, THUMB_WIDTH * 4), Image.Resampling.LANCZOS)
+        rgb.save(thumb_path, "JPEG", quality=THUMB_QUALITY, optimize=True)
+    encode_ms = (time.perf_counter() - encode_started) * 1000
+    return thumb_path, False, download_ms, encode_ms
+
+
+def _warm_thumb(file_id: str) -> None:
+    try:
+        thumb_path, _, _, _ = _ensure_thumb_for_file(file_id, DriveClient())
+        try:
+            os.utime(thumb_path, None)
+        except OSError:
+            pass
     except Exception:
         return
     finally:
@@ -1721,13 +1752,13 @@ def _schedule_preview_prewarm(hydrated_folders: list[dict]) -> int:
             file_id = frames.get(key)
             if not file_id:
                 continue
-            if _cache_path_for_file(file_id).exists():
+            if _thumb_path_for_file(file_id).exists():
                 continue
             with _preview_prewarm_lock:
                 if file_id in _preview_prewarm_inflight:
                     continue
                 _preview_prewarm_inflight.add(file_id)
-            _preview_prewarm_executor.submit(_warm_file, file_id)
+            _preview_prewarm_executor.submit(_warm_thumb, file_id)
             scheduled += 1
     return scheduled
 
@@ -2464,33 +2495,12 @@ def api_thumb(file_id: str):
     request_started = time.perf_counter()
     _cleanup_cache_if_needed()
 
-    thumb_path = _thumb_path_for_file(file_id)
-    cache_path = _cache_path_for_file(file_id)
-    cache_hit = thumb_path.exists()
-    download_ms = 0.0
-    encode_ms = 0.0
-
-    if not thumb_path.exists():
-        if not cache_path.exists():
-            try:
-                client = get_client()
-                download_started = time.perf_counter()
-                client.download_file_to_path(file_id, cache_path)
-                download_ms = (time.perf_counter() - download_started) * 1000
-            except DriveClientError as e:
-                abort(404, description=str(e))
-
-        from PIL import Image
-
-        try:
-            encode_started = time.perf_counter()
-            with Image.open(cache_path) as img:
-                rgb = img.convert("RGB")
-                rgb.thumbnail((THUMB_WIDTH, THUMB_WIDTH * 4), Image.Resampling.LANCZOS)
-                rgb.save(thumb_path, "JPEG", quality=THUMB_QUALITY, optimize=True)
-            encode_ms = (time.perf_counter() - encode_started) * 1000
-        except Exception as e:
-            abort(500, description=f"Thumbnail generation failed: {e}")
+    try:
+        thumb_path, cache_hit, download_ms, encode_ms = _ensure_thumb_for_file(file_id, get_client())
+    except DriveClientError as e:
+        abort(404, description=str(e))
+    except Exception as e:
+        abort(500, description=f"Thumbnail generation failed: {e}")
 
     try:
         os.utime(thumb_path, None)
