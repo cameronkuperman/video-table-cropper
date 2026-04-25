@@ -1834,6 +1834,7 @@ def _collect_ready_folders(
     limit: int,
 ) -> tuple[list[dict], dict[str, int | float]]:
     ready: list[dict] = []
+    fallback: list[dict] = []
     nonready = 0
     hydrated_valid = 0
     scanned = 0
@@ -1844,7 +1845,7 @@ def _collect_ready_folders(
     hydrate_worker_max = 0
     first_unready_idx = len(subfolders)
 
-    target_scan = min(len(subfolders), max(limit * READY_SCAN_MULTIPLIER, PREWARM_FOLDER_COUNT))
+    target_scan = min(len(subfolders), max(limit * READY_SCAN_MULTIPLIER, limit))
     target_scan = min(target_scan, READY_SCAN_MAX)
 
     while scanned < target_scan and len(ready) < limit:
@@ -1875,12 +1876,16 @@ def _collect_ready_folders(
                 ready.append(payload)
             else:
                 nonready += 1
+                if len(fallback) < limit:
+                    fallback.append(payload)
                 first_unready_idx = min(first_unready_idx, absolute_idx)
                 _schedule_preview_prewarm([payload])
             if len(ready) >= limit:
                 break
 
         scanned += len(folder_batch)
+        if not ready and len(fallback) >= limit:
+            break
 
     prewarm_scan_start = first_unready_idx if first_unready_idx < len(subfolders) else scanned
     folder_prewarm_scheduled = _schedule_folder_hydration_prewarm(
@@ -1889,7 +1894,8 @@ def _collect_ready_folders(
         context,
     )
 
-    return ready, {
+    returned = ready if ready else fallback
+    return returned, {
         "scanned": scanned,
         "hydrate_ms": hydrate_ms,
         "hydrate_requested": hydrate_requested,
@@ -1900,6 +1906,7 @@ def _collect_ready_folders(
         "prewarm_scan_start": prewarm_scan_start,
         "hydrated_valid": hydrated_valid,
         "nonready": nonready,
+        "returned_uncached": 0 if ready else len(fallback),
     }
 
 
@@ -2298,7 +2305,8 @@ def api_queue():
         ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit)
 
         preview_prewarm_scheduled = _schedule_preview_prewarm(ready_folders)
-        ready_buffer_count = len(ready_folders)
+        ready_buffer_count = sum(1 for folder in ready_folders if folder.get("cache_ready"))
+        returned_count = len(ready_folders)
         warming_count = int(ready_stats["nonready"])
 
         response: dict[str, object] = {
@@ -2306,10 +2314,10 @@ def api_queue():
             "next_cursor": 0,
             "source_context": context.to_payload(),
             "total_unlabeled": total_unlabeled,
-            "has_more": total_unlabeled > ready_buffer_count,
+            "has_more": total_unlabeled > returned_count,
             "ready_buffer_count": ready_buffer_count,
             "warming_count": warming_count,
-            "retry_ms": QUEUE_RETRY_MS if total_unlabeled > 0 and ready_buffer_count < limit else 0,
+            "retry_ms": QUEUE_RETRY_MS if total_unlabeled > 0 and returned_count < limit else 0,
         }
         if include_stats:
             stats_started = time.perf_counter()
@@ -2328,6 +2336,7 @@ def api_queue():
             limit=limit,
             returned=len(ready_folders),
             ready_buffer=ready_buffer_count,
+            returned_uncached=ready_stats["returned_uncached"],
             warming=warming_count,
             scanned=ready_stats["scanned"],
             hydrated_valid=ready_stats["hydrated_valid"],
@@ -2362,6 +2371,47 @@ def api_folder_frames(folder_id: str):
         return jsonify(frames)
     except DriveClientError as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cache/status")
+def api_cache_status():
+    cache_dir = _ensure_cache_dir()
+    writable = False
+    error = None
+    try:
+        probe = cache_dir / ".cache_status_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        writable = True
+    except OSError as exc:
+        error = str(exc)
+
+    full_res_count = 0
+    thumb_count = 0
+    total_bytes = 0
+    try:
+        for path in cache_dir.glob("*.jpg"):
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                pass
+            if path.name.endswith(".thumb.jpg"):
+                thumb_count += 1
+            else:
+                full_res_count += 1
+    except OSError as exc:
+        error = error or str(exc)
+
+    return jsonify(
+        {
+            "cache_dir": str(cache_dir),
+            "writable": writable,
+            "full_res_count": full_res_count,
+            "thumb_count": thumb_count,
+            "size_mb": round(total_bytes / (1024 * 1024), 2),
+            "error": error,
+        }
+    )
 
 
 @app.route("/api/preview/<file_id>")

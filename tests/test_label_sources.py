@@ -365,6 +365,47 @@ def test_queue_is_source_aware_and_reolink_filters_incomplete_triplets(client):
     ]
 
 
+def test_queue_returns_uncached_fallback_when_no_frames_are_cached(client, fake_drive, monkeypatch):
+    monkeypatch.setattr(label_app, "_frames_cache_ready", lambda frames: False)
+    label_app._hydrated_folder_cache.clear()
+
+    response = client.get("/api/queue?source=video&limit=10")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert [folder["folder_name"] for folder in payload["folders"]] == ["ipc3_table-4_t0001"]
+    assert payload["folders"][0]["cache_ready"] is False
+    assert payload["ready_buffer_count"] == 0
+    assert payload["warming_count"] >= 1
+
+
+def test_queue_prefers_cached_folders_when_available(client):
+    response = client.get("/api/queue?source=video&limit=10")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert [folder["folder_name"] for folder in payload["folders"]] == ["ipc3_table-4_t0001"]
+    assert payload["folders"][0]["cache_ready"] is True
+    assert payload["ready_buffer_count"] == 1
+
+
+def test_cache_status_reports_cache_dir_and_writable(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
+    (tmp_path / "full.jpg").write_bytes(b"full")
+    (tmp_path / "full.thumb.jpg").write_bytes(b"thumb")
+
+    response = client.get("/api/cache/status")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["cache_dir"] == str(tmp_path)
+    assert payload["writable"] is True
+    assert payload["full_res_count"] == 1
+    assert payload["thumb_count"] == 1
+    assert payload["size_mb"] >= 0
+
+
 def test_reolink_label_moves_folder_within_same_site_tree(client, fake_drive):
     queue_response = client.get("/api/queue?source=reolink&site=reolink-matthews-01&limit=10")
     folder = queue_response.get_json()["folders"][0]

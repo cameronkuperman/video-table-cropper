@@ -11,6 +11,7 @@ let readyBufferCount = 0;
 let warmingCount = 0;
 let queueRetryMs = 1000;
 let nextQueueFetchAt = 0;
+let currentImagesReady = false;
 let availableSources = [];
 let reolinkSites = [];
 let activeSource = 'video';
@@ -494,24 +495,83 @@ function warmBuffer() {
 }
 
 function renderFolderCard(folder) {
+    currentImagesReady = false;
     const frameKeys = ['frame_0', 'frame_1', 'frame_2'];
-    const imgHtml = frameKeys.map(key => {
+    const imgHtml = frameKeys.map((key, idx) => {
         const url = folder.preview_urls?.[key];
-        if (!url) return '<div class="img-placeholder">no image</div>';
-        return `<img src="${url}" alt="${key}" loading="eager" decoding="async" />`;
+        if (!url) {
+            return `
+                <div class="image-slot error" data-frame="${key}">
+                    <div class="img-placeholder">no image</div>
+                </div>
+            `;
+        }
+        return `
+            <div class="image-slot" data-frame="${key}">
+                <div class="img-placeholder">loading</div>
+                <img src="${url}" alt="${key}" loading="eager" decoding="async" data-frame-index="${idx}" />
+            </div>
+        `;
     }).join('');
 
     cardEl.innerHTML = `
         <div class="folder-name">${escapeHtml(folder.folder_name)}</div>
         <div class="images">${imgHtml}</div>
+        <div class="image-status" id="image-status">Loading frames...</div>
         <div class="buttons">
-            <button class="btn occupied" onclick="labelCurrent('occupied')">Occupied [1]</button>
-            <button class="btn dirty"    onclick="labelCurrent('dirty')">Dirty [2]</button>
-            <button class="btn clean"    onclick="labelCurrent('clean')">Clean [3]</button>
-            <button class="btn later"    onclick="labelCurrent('label_later')">Label Later [4]</button>
-            <button class="btn skip"     onclick="skipCurrent()">Discard [S / &rarr;]</button>
+            <button class="btn occupied label-action" onclick="labelCurrent('occupied')" disabled>Occupied [1]</button>
+            <button class="btn dirty label-action"    onclick="labelCurrent('dirty')" disabled>Dirty [2]</button>
+            <button class="btn clean label-action"    onclick="labelCurrent('clean')" disabled>Clean [3]</button>
+            <button class="btn later label-action"    onclick="labelCurrent('label_later')" disabled>Label Later [4]</button>
+            <button class="btn skip label-action"     onclick="skipCurrent()" disabled>Discard [S / &rarr;]</button>
         </div>
     `;
+
+    const statusEl = document.getElementById('image-status');
+    const buttons = Array.from(cardEl.querySelectorAll('.label-action'));
+    const images = Array.from(cardEl.querySelectorAll('.image-slot img'));
+    const requiredCount = frameKeys.length;
+    let loadedCount = 0;
+    let failed = images.length !== requiredCount;
+
+    function updateReadyState() {
+        currentImagesReady = !failed && loadedCount === requiredCount;
+        buttons.forEach(button => {
+            button.disabled = !currentImagesReady;
+        });
+        if (!statusEl) return;
+        if (failed) {
+            statusEl.textContent = 'Frame failed to load. Refresh before labeling this triplet.';
+        } else if (currentImagesReady) {
+            statusEl.textContent = '';
+        } else {
+            statusEl.textContent = `Loading frames ${loadedCount}/${requiredCount}`;
+        }
+    }
+
+    images.forEach(img => {
+        const slot = img.closest('.image-slot');
+        const markLoaded = () => {
+            if (slot?.classList.contains('loaded')) return;
+            slot?.classList.add('loaded');
+            loadedCount += 1;
+            updateReadyState();
+        };
+        img.addEventListener('load', markLoaded, { once: true });
+        img.addEventListener('error', () => {
+            failed = true;
+            slot?.classList.add('error');
+            const placeholder = slot?.querySelector('.img-placeholder');
+            if (placeholder) {
+                placeholder.textContent = 'failed';
+            }
+            updateReadyState();
+        }, { once: true });
+        if (img.complete && img.naturalWidth > 0) {
+            markLoaded();
+        }
+    });
+    updateReadyState();
 }
 
 async function refreshStats() {
@@ -632,7 +692,7 @@ async function init(forceRefresh = false) {
     labeling = false;
     showError(null);
     doneEl.style.display = 'none';
-    cardEl.innerHTML = '<p class="loading">Building ready buffer from Drive...</p>';
+    cardEl.innerHTML = '<p class="loading">Loading first triplet...</p>';
 
     if (activeSource === 'reolink' && !activeSiteKey) {
         cardEl.innerHTML = '';
@@ -663,6 +723,7 @@ async function init(forceRefresh = false) {
 }
 
 async function labelCurrent(label) {
+    if (!currentImagesReady) return;
     if (labeling) return;
 
     const folder = folders[currentIndex];
@@ -714,6 +775,7 @@ async function labelCurrent(label) {
 }
 
 function skipCurrent() {
+    if (!currentImagesReady) return;
     labelCurrent('discarded');
 }
 
