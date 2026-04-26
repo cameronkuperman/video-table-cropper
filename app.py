@@ -1280,6 +1280,20 @@ def _find_reolink_reference_frame(
         frame_item = source_files.get("frame_0.jpg")
         if not frame_item or not frame_item.get("id"):
             continue
+        width = 0
+        height = 0
+        try:
+            from PIL import Image
+
+            with tempfile.TemporaryDirectory(prefix="reolink_reference_") as tmpdir:
+                reference_path = Path(tmpdir) / "frame_0.jpg"
+                client.download_file_to_path(str(frame_item["id"]), reference_path)
+                with Image.open(reference_path) as image:
+                    width = image.width
+                    height = image.height
+        except Exception:
+            width = 0
+            height = 0
         reference_payload = {
             "site_key": site_key,
             "site_label": site.display_name,
@@ -1289,6 +1303,8 @@ def _find_reolink_reference_frame(
             "frame_file_id": str(frame_item["id"]),
             "preview_url": f"/api/preview/{frame_item['id']}",
             "source": "unassociated",
+            "width": width,
+            "height": height,
         }
         if all(source_files.get(f"frame_{idx}.jpg") for idx in range(3)):
             return reference_payload
@@ -1466,6 +1482,7 @@ def _prepare_reolink_unlabeled_queue(
     client: DriveClient,
     context: QueueContext,
     target_unlabeled_count: int,
+    current_visible_count: int | None = None,
 ) -> int:
     if context.source != REOLINK_SOURCE or not context.seed_folder_id:
         return 0
@@ -1479,6 +1496,7 @@ def _prepare_reolink_unlabeled_queue(
         )
         existing_names = _existing_generated_folder_names(client, context)
         unlabeled_count = len(unlabeled_folders)
+        visible_count = unlabeled_count if current_visible_count is None else current_visible_count
         generated_any = False
         generated_count = 0
 
@@ -1487,14 +1505,14 @@ def _prepare_reolink_unlabeled_queue(
                 client,
                 context.folder_ids[PROCESSED_RAW_FOLDER_NAME],
             )
-        if unlabeled_count >= target_unlabeled_count:
+        if visible_count >= target_unlabeled_count:
             return 0
 
         raw_folders = _list_reolink_raw_folders(client, context)
         preprocess_state = _load_preprocess_state()
 
         for raw_folder in raw_folders:
-            if unlabeled_count >= target_unlabeled_count:
+            if visible_count >= target_unlabeled_count:
                 break
 
             if _reolink_raw_folder_processed(preprocess_state, context, raw_folder):
@@ -1544,6 +1562,7 @@ def _prepare_reolink_unlabeled_queue(
             for name in generated_names:
                 existing_names.add(name)
                 unlabeled_count += 1
+                visible_count += 1
                 generated_any = True
                 generated_count += 1
                 raw_generated_count += 1
@@ -1606,6 +1625,7 @@ def _run_reolink_preprocess_background(
             drive,
             context,
             target_unlabeled_count=target_unlabeled_count,
+            current_visible_count=None,
         )
         if generated:
             _invalidate_listing_cache(context.queue_key)
@@ -2216,6 +2236,8 @@ def _collect_ready_folders(
     fallback: list[dict] = []
     seen_signatures: set[str] = set()
     nonready = 0
+    hidden_labeled = 0
+    duplicate_signatures = 0
     hydrated_valid = 0
     scanned = 0
     hydrate_ms = 0.0
@@ -2252,6 +2274,7 @@ def _collect_ready_folders(
                 continue
             signature = str(payload.get("frame_signature") or "")
             if signature and signature in seen_signatures:
+                duplicate_signatures += 1
                 continue
             if _label_history_lookup(
                 context,
@@ -2259,6 +2282,7 @@ def _collect_ready_folders(
                 str(payload.get("folder_name") or ""),
                 signature,
             ):
+                hidden_labeled += 1
                 continue
             if signature:
                 seen_signatures.add(signature)
@@ -2297,6 +2321,8 @@ def _collect_ready_folders(
         "folder_prewarm_scheduled": folder_prewarm_scheduled,
         "prewarm_scan_start": prewarm_scan_start,
         "hydrated_valid": hydrated_valid,
+        "hidden_labeled": hidden_labeled,
+        "duplicate_signatures": duplicate_signatures,
         "nonready": nonready,
         "returned_uncached": 0 if ready else len(fallback),
     }
@@ -2689,12 +2715,45 @@ def api_queue():
         list_ms = (time.perf_counter() - list_started) * 1000
         total_unlabeled = len(subfolders)
 
-        if context.source == VIDEO_SOURCE:
-            _maybe_trigger_video_preprocess(context, total_unlabeled)
-        elif context.source == REOLINK_SOURCE:
-            _maybe_trigger_reolink_preprocess(context, total_unlabeled, target_unlabeled_count)
-
         ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit)
+        visible_unlabeled_estimate = max(
+            0,
+            total_unlabeled
+            - int(ready_stats["hidden_labeled"])
+            - int(ready_stats["duplicate_signatures"]),
+        )
+        visible_count_for_refill = (
+            visible_unlabeled_estimate
+            if len(ready_folders) >= limit
+            else len(ready_folders) + int(ready_stats["nonready"])
+        )
+
+        if context.source == VIDEO_SOURCE:
+            _maybe_trigger_video_preprocess(context, visible_count_for_refill)
+        elif context.source == REOLINK_SOURCE:
+            if visible_count_for_refill < target_unlabeled_count:
+                generated = _prepare_reolink_unlabeled_queue(
+                    client,
+                    context,
+                    target_unlabeled_count=target_unlabeled_count,
+                    current_visible_count=visible_count_for_refill,
+                )
+                if generated:
+                    subfolders = _list_source_subfolders(client, context, force_refresh=True)
+                    total_unlabeled = len(subfolders)
+                    ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit)
+                    visible_unlabeled_estimate = max(
+                        0,
+                        total_unlabeled
+                            - int(ready_stats["hidden_labeled"])
+                            - int(ready_stats["duplicate_signatures"]),
+                        )
+                    visible_count_for_refill = (
+                        visible_unlabeled_estimate
+                        if len(ready_folders) >= limit
+                        else len(ready_folders) + int(ready_stats["nonready"])
+                    )
+            _maybe_trigger_reolink_preprocess(context, visible_count_for_refill, target_unlabeled_count)
 
         preview_prewarm_scheduled = _schedule_preview_prewarm(ready_folders)
         ready_buffer_count = sum(1 for folder in ready_folders if folder.get("cache_ready"))
@@ -2706,6 +2765,7 @@ def api_queue():
             "next_cursor": 0,
             "source_context": context.to_payload(),
             "total_unlabeled": total_unlabeled,
+            "visible_unlabeled_estimate": visible_unlabeled_estimate,
             "has_more": total_unlabeled > returned_count,
             "ready_buffer_count": ready_buffer_count,
             "warming_count": warming_count,
@@ -2732,6 +2792,9 @@ def api_queue():
             warming=warming_count,
             scanned=ready_stats["scanned"],
             hydrated_valid=ready_stats["hydrated_valid"],
+            hidden_labeled=ready_stats["hidden_labeled"],
+            duplicate_signatures=ready_stats["duplicate_signatures"],
+            visible_unlabeled=visible_unlabeled_estimate,
             cache_hits=ready_stats["hydrate_cache_hits"],
             cache_misses=ready_stats["hydrate_cache_misses"],
             workers=ready_stats["hydrate_worker_max"],
@@ -3022,10 +3085,19 @@ def api_stats():
         source, site_key = _request_source_args()
         context = _resolve_queue_context(client, source, site_key)
         if context.source == REOLINK_SOURCE:
+            subfolders = _list_source_subfolders(client, context)
+            _ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit=1)
+            visible_unlabeled_estimate = max(
+                0,
+                len(subfolders)
+                - int(ready_stats["hidden_labeled"])
+                - int(ready_stats["duplicate_signatures"]),
+            )
             _prepare_reolink_unlabeled_queue(
                 client,
                 context,
                 target_unlabeled_count=INTERACTIVE_REOLINK_PREWARM_TARGET,
+                current_visible_count=visible_unlabeled_estimate,
             )
         stats = _compute_stats(client, context)
         if context.source == VIDEO_SOURCE:

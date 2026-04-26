@@ -295,7 +295,7 @@ def fake_drive(monkeypatch):
     monkeypatch.setattr(
         label_app,
         "_prepare_reolink_unlabeled_queue",
-        lambda client, context, target_unlabeled_count: _fake_prepare_reolink_unlabeled_queue(
+        lambda client, context, target_unlabeled_count, current_visible_count=None: _fake_prepare_reolink_unlabeled_queue(
             fake,
             context,
             target_unlabeled_count,

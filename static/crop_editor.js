@@ -540,13 +540,19 @@ async function refreshChannelsFromQueueFallback() {
 }
 
 function mapConfigCrops(config) {
+    const configWidth = Number(config?.reference?.width || 0);
+    const configHeight = Number(config?.reference?.height || 0);
+    const targetWidth = Number(state.referenceSize.width || referenceImageEl.naturalWidth || configWidth || 0);
+    const targetHeight = Number(state.referenceSize.height || referenceImageEl.naturalHeight || configHeight || 0);
+    const sx = configWidth > 0 && targetWidth > 0 && configWidth !== targetWidth ? targetWidth / configWidth : 1;
+    const sy = configHeight > 0 && targetHeight > 0 && configHeight !== targetHeight ? targetHeight / configHeight : 1;
     return (config?.crops || []).map((crop, index) => ({
         id: `${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
         name: crop.name || `table_${index + 1}`,
         points: orderQuadrilateralPoints(
             (crop.polygon || []).map(point => ({
-                x: Number(point[0]),
-                y: Number(point[1]),
+                x: Number(point[0]) * sx,
+                y: Number(point[1]) * sy,
             }))
         ),
     }));
@@ -583,10 +589,24 @@ async function loadChannel(channelCode, { preserveMessage = false } = {}) {
         state.selectedCropId = state.crops[0]?.id || null;
 
         referenceImageEl.onload = () => {
+            const previousSize = { ...state.referenceSize };
             state.referenceSize = {
                 width: referenceImageEl.naturalWidth,
                 height: referenceImageEl.naturalHeight,
             };
+            if (
+                previousSize.width
+                && previousSize.height
+                && (previousSize.width !== state.referenceSize.width || previousSize.height !== state.referenceSize.height)
+            ) {
+                state.crops = state.crops.map(crop => ({
+                    ...crop,
+                    points: crop.points.map(point => ({
+                        x: Number(((point.x / previousSize.width) * state.referenceSize.width).toFixed(2)),
+                        y: Number(((point.y / previousSize.height) * state.referenceSize.height).toFixed(2)),
+                    })),
+                }));
+            }
             render();
         };
         referenceImageEl.src = data.reference.preview_url;
