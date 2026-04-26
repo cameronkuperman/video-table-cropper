@@ -101,6 +101,8 @@ LABEL_CACHE_DIR=/data/label_cache
 LABEL_CACHE_MAX_MB=20000
 LABEL_CACHE_TTL_HOURS=336
 PREPROCESS_STATE_DIR=/data/autolabeler
+LABEL_JOB_UNDO_SECONDS=30
+LABEL_JOB_PROCESSING_STALE_SECONDS=300
 LABEL_REOLINK_PREWARM_TARGET=5000
 LABEL_PREWARM_FOLDER_COUNT=60
 LABEL_READY_SCAN_MAX=180
@@ -126,9 +128,9 @@ frame once, writes `{file_id}.jpg` plus `{file_id}.thumb.jpg` into
 `LABEL_CACHE_DIR`, and skips files already present on the volume. If it needs
 to be stopped, call `POST /api/cache/warm/cancel`.
 
-Label clicks are recorded to the volume first, then pushed to Drive by a
-background worker. Use `/api/label/jobs/status` to confirm pending jobs are
-draining after a deploy or browser close.
+Label clicks are recorded to the volume first, held briefly for undo/relabel,
+then pushed to Drive by a background worker. Use `/api/label/jobs/status` to
+confirm pending and delayed jobs are draining after a deploy or browser close.
 
 The default web start command is:
 

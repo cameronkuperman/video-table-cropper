@@ -318,7 +318,7 @@ def fake_drive(monkeypatch, tmp_path):
 
 
 def _drain_label_jobs(fake_drive: FakeDriveClient) -> int:
-    return label_app._drain_label_jobs_once(fake_drive)
+    return label_app._drain_label_jobs_once(fake_drive, force_due=True)
 
 
 def _label_payload(folder: dict, label: str) -> dict:
@@ -689,10 +689,12 @@ def test_label_stamps_metadata_and_rejects_stale_second_move(client, fake_drive)
     payload = _label_payload(folder, "dirty")
 
     first_response = client.post("/api/label", json=payload)
-    second_response = client.post("/api/label", json=payload)
+    replace_response = client.post("/api/label", json=payload)
 
     assert first_response.status_code == 200
+    assert replace_response.status_code == 200
     _drain_label_jobs(fake_drive)
+    second_response = client.post("/api/label", json=payload)
     folder_item = fake_drive.items[folder["folder_id"]]
     assert folder_item["appProperties"]["autolabel_final_label"] == "dirty"
     assert folder_item["appProperties"]["autolabel_source"] == "video"
@@ -727,6 +729,108 @@ def test_label_job_status_is_lightweight(client, fake_drive):
     assert payload["writable"] is True
     assert payload["counts"]["pending"] == 0
     assert str(label_app._label_jobs_path()) == payload["path"]
+    assert "delayed" in payload["counts"]
+    assert payload["undo_seconds"] == label_app.LABEL_JOB_UNDO_SECONDS
+    assert "stale_reset_count" in payload
+
+
+def test_discard_job_waits_until_undo_deadline(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+
+    response = client.post("/api/label", json=_label_payload(folder, "discarded"))
+    assert response.status_code == 200
+
+    assert label_app._drain_label_jobs_once(fake_drive) == 0
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-unlabeled"]
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    job = jobs["jobs"]["video:video-triplet"]
+    assert job["status"] == "pending"
+    assert job["not_before"] == response.get_json()["not_before"]
+
+    assert _drain_label_jobs(fake_drive) == 1
+    discarded_dest = fake_drive.find_file_by_name(
+        "project-root", "discarded", mime_type=label_app.FOLDER_MIME
+    )
+    assert fake_drive.items[folder["folder_id"]]["parents"] == [discarded_dest["id"]]
+
+
+def test_cancel_pending_label_job_removes_history_and_restores_queue(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    payload = _label_payload(folder, "discarded")
+
+    assert client.post("/api/label", json=payload).status_code == 200
+    cancel_response = client.post("/api/label/cancel", json=payload)
+
+    assert cancel_response.status_code == 200
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs["jobs"]["video:video-triplet"]["status"] == "canceled"
+    history = json.loads(label_app._label_history_path().read_text(encoding="utf-8"))
+    assert history["queues"]["video"]["labeled"] == {}
+    repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    assert repeat_response.get_json()["folders"][0]["folder_id"] == folder["folder_id"]
+
+
+def test_relabel_pending_job_replaces_label_without_duplicate_move(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    dirty_payload = _label_payload(folder, "dirty")
+    clean_payload = _label_payload(folder, "clean")
+
+    assert client.post("/api/label", json=dirty_payload).status_code == 200
+    relabel_response = client.post("/api/label", json=clean_payload)
+
+    assert relabel_response.status_code == 200
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs["jobs"]["video:video-triplet"]["label"] == "clean"
+    assert _drain_label_jobs(fake_drive) == 1
+    assert len(fake_drive.moves) == 1
+    folder_item = fake_drive.items[folder["folder_id"]]
+    assert folder_item["appProperties"]["autolabel_final_label"] == "clean"
+
+
+def test_stale_processing_job_recovers_and_pushes_once(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    job = jobs["jobs"]["video:video-triplet"]
+    job["status"] = "processing"
+    job["updated_at"] = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=label_app.LABEL_JOB_PROCESSING_STALE_SECONDS + 5)
+    ).isoformat()
+    job["not_before"] = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=1)
+    ).isoformat()
+    label_app._label_jobs_path().write_text(json.dumps(jobs), encoding="utf-8")
+
+    assert label_app._drain_label_jobs_once(fake_drive) == 1
+    jobs_after = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs_after["jobs"]["video:video-triplet"]["status"] == "succeeded"
+    assert len(fake_drive.moves) == 1
+
+
+def test_already_moved_job_succeeds_without_duplicate_move(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    clean_dest = fake_drive.find_file_by_name(
+        "project-root", "clean", mime_type=label_app.FOLDER_MIME
+    )
+    fake_drive.update_file_metadata(
+        folder["folder_id"],
+        {"appProperties": label_app._label_app_properties("clean", label_app._resolve_queue_context(fake_drive, "video", None))},
+    )
+    fake_drive.move_file(folder["folder_id"], clean_dest["id"], remove_parent_id=folder["parent_id"])
+    fake_drive.moves.clear()
+
+    assert _drain_label_jobs(fake_drive) == 1
+    assert fake_drive.moves == []
 
 
 def test_labeled_content_signature_never_returns_to_queue(client, fake_drive, monkeypatch):

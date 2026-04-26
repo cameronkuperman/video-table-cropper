@@ -21,6 +21,8 @@ let activeSource = 'video';
 let activeSiteKey = null;
 let activePendingLabel = 'unlabeled';
 let activeDisplayName = 'Video';
+let recentLabelUndo = null;
+let recentLabelUndoTimer = null;
 let stats = {
     unlabeled: 0,
     clean: 0,
@@ -42,6 +44,7 @@ const QUEUE_SNAPSHOT_MAX_FOLDERS = 300;
 const SUPPRESSED_QUEUE_MAX = 1000;
 const PENDING_LABELS_KEY = 'autolabeler.pendingLabels.v1';
 const PENDING_LABEL_KEEPALIVE_LIMIT = 20;
+const LABEL_UNDO_SECONDS = 30;
 
 const cardEl = document.getElementById('card');
 const progressEl = document.getElementById('progress');
@@ -49,6 +52,7 @@ const statsEl = document.getElementById('stats');
 const bufferStatusEl = document.getElementById('buffer-status');
 const doneEl = document.getElementById('done');
 const errorEl = document.getElementById('error');
+const undoLabelEl = document.getElementById('undo-label');
 const sourceModeEl = document.getElementById('source-mode');
 const sourceSiteEl = document.getElementById('source-site');
 const siteControlEl = document.getElementById('site-control');
@@ -150,6 +154,21 @@ function rememberSuppressedFolder(folder) {
     }
     while (suppressedContentSignatures.size > SUPPRESSED_QUEUE_MAX) {
         suppressedContentSignatures.delete(suppressedContentSignatures.values().next().value);
+    }
+}
+
+function forgetSuppressedFolder(folder) {
+    const folderId = String(folder?.folder_id || '');
+    const signature = frameSignature(folder);
+    const content = contentSignature(folder);
+    if (folderId) {
+        suppressedFolderIds.delete(folderId);
+    }
+    if (signature) {
+        suppressedFrameSignatures.delete(signature);
+    }
+    if (content) {
+        suppressedContentSignatures.delete(content);
     }
 }
 
@@ -449,22 +468,26 @@ function removePendingLabel(operation) {
     writePendingLabels(readPendingLabels().filter(item => pendingLabelKey(item) !== key));
 }
 
+function operationPayload(operation) {
+    return {
+        folder_id: operation.folder_id,
+        parent_id: operation.parent_id,
+        label: operation.label,
+        source: operation.source,
+        site_key: operation.site_key,
+        folder_name: operation.folder_name,
+        frames: operation.frames,
+        frame_signature: operation.frame_signature,
+        content_signature: operation.content_signature,
+    };
+}
+
 async function sendLabelOperation(operation, { keepalive = true } = {}) {
     const res = await fetch('/api/label', {
         method: 'POST',
         headers: jsonPostHeaders(),
         keepalive,
-        body: JSON.stringify({
-            folder_id: operation.folder_id,
-            parent_id: operation.parent_id,
-            label: operation.label,
-            source: operation.source,
-            site_key: operation.site_key,
-            folder_name: operation.folder_name,
-            frames: operation.frames,
-            frame_signature: operation.frame_signature,
-            content_signature: operation.content_signature,
-        }),
+        body: JSON.stringify(operationPayload(operation)),
     });
     const data = await readApiJson(res, 'Label request');
     if (res.ok && !data.error) {
@@ -478,6 +501,19 @@ async function sendLabelOperation(operation, { keepalive = true } = {}) {
         return data;
     }
     throw new Error(data.error || `Move failed (${res.status})`);
+}
+
+async function cancelLabelOperation(operation) {
+    const res = await fetch('/api/label/cancel', {
+        method: 'POST',
+        headers: jsonPostHeaders(),
+        body: JSON.stringify(operationPayload(operation)),
+    });
+    const data = await readApiJson(res, 'Undo request');
+    if (!res.ok || data.error) {
+        throw new Error(data.error || `Undo failed (${res.status})`);
+    }
+    return data;
 }
 
 function drainPendingLabels({ keepalive = false, limit = Infinity } = {}) {
@@ -956,8 +992,126 @@ function applyOptimisticLabel(label) {
     setStats(stats);
 }
 
+function undoOptimisticLabel(label) {
+    if (typeof stats.unlabeled === 'number') {
+        stats.unlabeled += 1;
+    }
+    if (typeof stats[label] === 'number' && stats[label] > 0) {
+        stats[label] -= 1;
+    }
+    updateProgress();
+    setStats(stats);
+}
+
+function replaceOptimisticLabel(previousLabel, nextLabel) {
+    if (typeof stats[previousLabel] === 'number' && stats[previousLabel] > 0) {
+        stats[previousLabel] -= 1;
+    }
+    if (typeof stats[nextLabel] === 'number') {
+        stats[nextLabel] += 1;
+    }
+    updateProgress();
+    setStats(stats);
+}
+
+function labelText(label) {
+    return {
+        occupied: 'Occupied',
+        dirty: 'Dirty',
+        clean: 'Clean',
+        label_later: 'Label later',
+        discarded: 'Discarded',
+    }[label] || label;
+}
+
+function clearRecentLabelUndo() {
+    if (recentLabelUndoTimer) {
+        window.clearInterval(recentLabelUndoTimer);
+        recentLabelUndoTimer = null;
+    }
+    recentLabelUndo = null;
+    if (undoLabelEl) {
+        undoLabelEl.style.display = 'none';
+        undoLabelEl.innerHTML = '';
+    }
+}
+
+function renderRecentLabelUndo() {
+    if (!undoLabelEl || !recentLabelUndo) return;
+    const remainingMs = recentLabelUndo.expiresAt - Date.now();
+    if (remainingMs <= 0) {
+        clearRecentLabelUndo();
+        return;
+    }
+    const seconds = Math.max(1, Math.ceil(remainingMs / 1000));
+    const folderName = escapeHtml(recentLabelUndo.folder?.folder_name || 'triplet');
+    undoLabelEl.style.display = 'flex';
+    undoLabelEl.innerHTML = `
+        <div class="undo-message">${escapeHtml(labelText(recentLabelUndo.operation.label))} queued for ${folderName}. ${seconds}s to change.</div>
+        <div class="undo-actions">
+            <button class="mini-btn" onclick="undoRecentLabel()">Undo</button>
+            <button class="mini-btn" onclick="relabelRecent('occupied')">Occupied</button>
+            <button class="mini-btn" onclick="relabelRecent('dirty')">Dirty</button>
+            <button class="mini-btn" onclick="relabelRecent('clean')">Clean</button>
+            <button class="mini-btn" onclick="relabelRecent('label_later')">Later</button>
+        </div>
+    `;
+}
+
+function showRecentLabelUndo(folder, operation, response = {}) {
+    clearRecentLabelUndo();
+    const undoExpires = response.undo_expires_at ? Date.parse(response.undo_expires_at) : NaN;
+    recentLabelUndo = {
+        folder,
+        operation: { ...operation },
+        expiresAt: Number.isFinite(undoExpires) ? undoExpires : Date.now() + (LABEL_UNDO_SECONDS * 1000),
+    };
+    renderRecentLabelUndo();
+    recentLabelUndoTimer = window.setInterval(renderRecentLabelUndo, 1000);
+}
+
+async function undoRecentLabel() {
+    if (!recentLabelUndo) return;
+    const undoState = recentLabelUndo;
+    clearRecentLabelUndo();
+    try {
+        await cancelLabelOperation(undoState.operation);
+        forgetSuppressedFolder(undoState.folder);
+        removePendingLabel(undoState.operation);
+        undoOptimisticLabel(undoState.operation.label);
+        folders.splice(currentIndex, 0, undoState.folder);
+        saveQueueSnapshot();
+        await renderCard();
+    } catch (e) {
+        showError(`Could not undo: ${e.message}`);
+    }
+}
+
+async function relabelRecent(nextLabel) {
+    if (!recentLabelUndo) return;
+    const undoState = recentLabelUndo;
+    const previousLabel = undoState.operation.label;
+    if (nextLabel === previousLabel) return;
+    const nextOperation = {
+        ...undoState.operation,
+        label: nextLabel,
+    };
+    enqueuePendingLabel(nextOperation);
+    try {
+        const data = await sendLabelOperation(nextOperation, { keepalive: true });
+        removePendingLabel(undoState.operation);
+        replaceOptimisticLabel(previousLabel, nextLabel);
+        showRecentLabelUndo(undoState.folder, nextOperation, data);
+    } catch (e) {
+        showError(`Could not change label: ${e.message}`);
+    }
+}
+
 async function init(forceRefresh = false) {
     labeling = false;
+    if (forceRefresh) {
+        clearRecentLabelUndo();
+    }
     showError(null);
     doneEl.style.display = 'none';
     cardEl.innerHTML = '<p class="loading">Loading first triplet...</p>';
@@ -1037,7 +1191,8 @@ async function labelCurrent(label) {
     renderCard();
 
     try {
-        await sendLabelOperation(operation, { keepalive: true });
+        const data = await sendLabelOperation(operation, { keepalive: true });
+        showRecentLabelUndo(folder, operation, data);
         logTiming('labelCurrent', {
             ms: (performance.now() - startedAt).toFixed(1),
             label,
@@ -1081,6 +1236,7 @@ function escapeHtml(s) {
 async function handleSourceChange() {
     normalizeSourceSelection({ source: activeSource, site_key: activeSiteKey });
     renderSourceControls();
+    clearRecentLabelUndo();
     clearQueueSnapshot();
     await init(true);
 }

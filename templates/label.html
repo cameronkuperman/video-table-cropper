@@ -103,6 +103,49 @@
     width: 100%;
   }
 
+  #undo-label {
+    display: none;
+    width: 100%;
+    max-width: 960px;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    border: 1px solid #343434;
+    border-radius: 8px;
+    background: #181818;
+    color: #d6d6d6;
+    font-size: 0.86rem;
+  }
+
+  #undo-label .undo-message {
+    flex: 1;
+    min-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  #undo-label .undo-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .mini-btn {
+    padding: 7px 10px;
+    border: none;
+    border-radius: 7px;
+    background: #2c2c2e;
+    color: #f2f2f2;
+    font-size: 0.8rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .mini-btn:hover { opacity: 0.85; }
+
   #card {
     width: 100%;
     max-width: 960px;
@@ -273,6 +316,7 @@
 <div id="error"></div>
 <div id="progress"></div>
 <div id="buffer-status"></div>
+<div id="undo-label"></div>
 <div id="card"></div>
 
 <div id="done">

@@ -16,7 +16,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -124,6 +124,11 @@ LABEL_JOBS_SCHEMA_VERSION = 1
 LABEL_JOBS_FILE_NAME = "label_jobs.json"
 LABEL_JOB_ERROR_LIMIT = max(1, int(os.environ.get("LABEL_JOB_ERROR_LIMIT", "25") or "25"))
 LABEL_JOB_MAX_ATTEMPTS = max(1, int(os.environ.get("LABEL_JOB_MAX_ATTEMPTS", "100") or "100"))
+LABEL_JOB_UNDO_SECONDS = max(0, int(os.environ.get("LABEL_JOB_UNDO_SECONDS", "30") or "30"))
+LABEL_JOB_PROCESSING_STALE_SECONDS = max(
+    30,
+    int(os.environ.get("LABEL_JOB_PROCESSING_STALE_SECONDS", "300") or "300"),
+)
 PROCESSED_RAW_RETENTION_DAYS = max(
     1, int(os.environ.get("PROCESSED_RAW_RETENTION_DAYS", "14") or "14")
 )
@@ -1216,6 +1221,24 @@ def _record_label_history(
         _save_label_history_unlocked(history)
 
 
+def _remove_label_history(
+    context: QueueContext,
+    folder_id: str,
+    folder_name: str,
+    frame_signature: str,
+    content_signature: str = "",
+) -> None:
+    with _label_history_lock:
+        history = _load_label_history_unlocked()
+        queue = (history.get("queues") or {}).get(context.queue_key) or {}
+        labeled = queue.get("labeled")
+        if not isinstance(labeled, dict):
+            return
+        for key in _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature):
+            labeled.pop(key, None)
+        _save_label_history_unlocked(history)
+
+
 def _load_label_jobs_unlocked() -> dict[str, Any]:
     path = _label_jobs_path()
     if not path.exists():
@@ -1251,6 +1274,37 @@ def _label_job_key(context: QueueContext, folder_id: str) -> str:
     return f"{context.queue_key}:{folder_id}"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_iso(dt: datetime | None = None) -> str:
+    return (dt or _utc_now()).isoformat()
+
+
+def _parse_iso_datetime(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _label_job_due_at(label: str) -> datetime:
+    return _utc_now() + timedelta(seconds=LABEL_JOB_UNDO_SECONDS)
+
+
+def _label_job_is_due(job: dict[str, Any], now: datetime | None = None) -> bool:
+    due_at = _parse_iso_datetime(job.get("not_before"))
+    if due_at is None:
+        return True
+    return due_at <= (now or _utc_now())
+
+
 def _enqueue_label_job(
     context: QueueContext,
     *,
@@ -1262,19 +1316,20 @@ def _enqueue_label_job(
     content_signature: str,
     label: str,
 ) -> dict[str, Any]:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _utc_iso()
+    not_before = _utc_iso(_label_job_due_at(label))
     job_id = _label_job_key(context, folder_id)
     with _label_jobs_lock:
         state = _load_label_jobs_unlocked()
         jobs = state.setdefault("jobs", {})
         existing = jobs.get(job_id)
-        if isinstance(existing, dict) and existing.get("status") in {"pending", "processing", "succeeded"}:
-            return dict(existing)
         existing_job = existing if isinstance(existing, dict) else {}
+        if existing_job.get("status") == "succeeded":
+            return dict(existing_job)
         job = {
             "id": job_id,
             "status": "pending",
-            "attempts": int(existing_job.get("attempts") or 0),
+            "attempts": 0,
             "folder_id": folder_id,
             "parent_id": parent_id,
             "folder_name": folder_name,
@@ -1287,6 +1342,8 @@ def _enqueue_label_job(
             "queue_key": context.queue_key,
             "created_at": existing_job.get("created_at", now),
             "updated_at": now,
+            "not_before": not_before,
+            "undo_expires_at": not_before,
             "last_error": None,
         }
         jobs[job_id] = job
@@ -1294,19 +1351,60 @@ def _enqueue_label_job(
         return dict(job)
 
 
+def _get_label_job(job_id: str) -> dict[str, Any] | None:
+    with _label_jobs_lock:
+        state = _load_label_jobs_unlocked()
+        job = (state.get("jobs") or {}).get(job_id)
+        return dict(job) if isinstance(job, dict) else None
+
+
+def _cancel_label_job(
+    context: QueueContext,
+    *,
+    folder_id: str,
+    folder_name: str,
+    frame_signature: str,
+    content_signature: str,
+) -> bool:
+    job_id = _label_job_key(context, folder_id)
+    canceled = False
+    with _label_jobs_lock:
+        state = _load_label_jobs_unlocked()
+        job = (state.get("jobs") or {}).get(job_id)
+        if isinstance(job, dict) and job.get("status") == "pending" and not _label_job_is_due(job):
+            job["status"] = "canceled"
+            job["updated_at"] = _utc_iso()
+            job["last_error"] = None
+            _save_label_jobs_unlocked(state)
+            canceled = True
+    if canceled:
+        _remove_label_history(context, folder_id, folder_name, frame_signature, content_signature)
+        _invalidate_listing_cache(context.queue_key)
+    return canceled
+
+
 def _label_jobs_status_payload() -> dict[str, Any]:
     with _label_jobs_lock:
         state = _load_label_jobs_unlocked()
+        stale_reset_count = _reset_stale_label_jobs_unlocked(state)
         jobs = [job for job in (state.get("jobs") or {}).values() if isinstance(job, dict)]
 
-    counts = {"pending": 0, "processing": 0, "succeeded": 0, "failed": 0}
+    counts = {"pending": 0, "delayed": 0, "processing": 0, "succeeded": 0, "failed": 0, "canceled": 0}
     recent_errors: list[dict[str, Any]] = []
     last_success_at = None
+    now = _utc_now()
+    next_due_at = None
     for job in jobs:
         status = str(job.get("status") or "pending")
         if status not in counts:
             status = "pending"
-        counts[status] += 1
+        if status == "pending" and not _label_job_is_due(job, now):
+            counts["delayed"] += 1
+            due_value = job.get("not_before")
+            if isinstance(due_value, str) and (next_due_at is None or due_value < next_due_at):
+                next_due_at = due_value
+        else:
+            counts[status] += 1
         if status == "succeeded":
             updated_at = job.get("updated_at")
             if isinstance(updated_at, str) and (last_success_at is None or updated_at > last_success_at):
@@ -1339,20 +1437,55 @@ def _label_jobs_status_payload() -> dict[str, Any]:
         "inflight": _label_job_worker_inflight,
         "counts": counts,
         "last_success_at": last_success_at,
+        "next_due_at": next_due_at,
+        "undo_seconds": LABEL_JOB_UNDO_SECONDS,
+        "stale_processing_seconds": LABEL_JOB_PROCESSING_STALE_SECONDS,
+        "stale_reset_count": stale_reset_count,
         "recent_errors": recent_errors,
         "error": error,
     }
 
 
-def _claim_next_label_job_unlocked(state: dict[str, Any]) -> dict[str, Any] | None:
-    now = datetime.now(timezone.utc).isoformat()
+def _reset_stale_label_jobs_unlocked(state: dict[str, Any]) -> int:
+    now = _utc_now()
+    reset_count = 0
+    for job in (state.get("jobs") or {}).values():
+        if not isinstance(job, dict) or job.get("status") != "processing":
+            continue
+        updated_at = _parse_iso_datetime(job.get("updated_at"))
+        if updated_at is None or (now - updated_at).total_seconds() >= LABEL_JOB_PROCESSING_STALE_SECONDS:
+            job["status"] = "pending"
+            job["updated_at"] = _utc_iso(now)
+            job["last_error"] = "Recovered stale processing job after worker restart."
+            reset_count += 1
+    if reset_count:
+        _save_label_jobs_unlocked(state)
+    return reset_count
+
+
+def _next_due_label_job_at_unlocked(state: dict[str, Any]) -> datetime | None:
+    next_due = None
+    for job in (state.get("jobs") or {}).values():
+        if not isinstance(job, dict) or job.get("status") != "pending":
+            continue
+        due_at = _parse_iso_datetime(job.get("not_before")) or _utc_now()
+        if next_due is None or due_at < next_due:
+            next_due = due_at
+    return next_due
+
+
+def _claim_next_label_job_unlocked(state: dict[str, Any], *, force_due: bool = False) -> dict[str, Any] | None:
+    now_dt = _utc_now()
+    now = _utc_iso(now_dt)
     jobs = state.setdefault("jobs", {})
+    _reset_stale_label_jobs_unlocked(state)
     for job in jobs.values():
         if not isinstance(job, dict):
             continue
         status = str(job.get("status") or "pending")
         attempts = int(job.get("attempts") or 0)
-        if status == "pending" or (status == "failed" and attempts < LABEL_JOB_MAX_ATTEMPTS):
+        is_retryable_failed = status == "failed" and attempts < LABEL_JOB_MAX_ATTEMPTS
+        if (status == "pending" or is_retryable_failed) and (force_due or _label_job_is_due(job, now_dt)):
             job["status"] = "processing"
             job["attempts"] = attempts + 1
             job["updated_at"] = now
@@ -1362,7 +1495,7 @@ def _claim_next_label_job_unlocked(state: dict[str, Any]) -> dict[str, Any] | No
 
 
 def _finish_label_job(job_id: str, *, status: str, error: str | None = None) -> None:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _utc_iso()
     with _label_jobs_lock:
         state = _load_label_jobs_unlocked()
         job = (state.get("jobs") or {}).get(job_id)
@@ -1393,12 +1526,18 @@ def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
 
     current = client.get_file(folder_id, fields="id,name,parents,appProperties")
     current_parents = [str(parent) for parent in current.get("parents", []) if parent]
-    if context.input_folder_id not in current_parents:
-        return
 
     label_metadata = dict(current.get("appProperties") or {})
-    if str(label_metadata.get("autolabel_final_label") or ""):
+    existing_final_label = str(label_metadata.get("autolabel_final_label") or "")
+    if existing_final_label == label:
         return
+    if existing_final_label and context.input_folder_id not in current_parents:
+        return
+    if context.input_folder_id not in current_parents:
+        if context.folder_ids.get(label) in current_parents:
+            return
+        raise RuntimeError("folder is no longer in the source or target Drive folder")
+
     label_metadata.update(_label_app_properties(label, context))
     client.update_file_metadata(
         folder_id,
@@ -1411,17 +1550,19 @@ def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
     _remove_folder_from_listing_cache(context.queue_key, folder_id)
 
 
-def _drain_label_jobs_once(client: DriveClient | None = None) -> int:
-    active_client = client or DriveClient()
+def _drain_label_jobs_once(client: DriveClient | None = None, *, force_due: bool = False) -> int:
+    active_client = client
     processed = 0
     while True:
         with _label_jobs_lock:
             state = _load_label_jobs_unlocked()
-            job = _claim_next_label_job_unlocked(state)
+            job = _claim_next_label_job_unlocked(state, force_due=force_due)
         if job is None:
             return processed
         job_id = str(job.get("id") or "")
         try:
+            if active_client is None:
+                active_client = DriveClient()
             _push_label_job_to_drive(active_client, job)
         except Exception as exc:
             _finish_label_job(job_id, status="pending", error=str(exc))
@@ -1430,10 +1571,26 @@ def _drain_label_jobs_once(client: DriveClient | None = None) -> int:
         processed += 1
 
 
+def _next_label_job_delay_seconds() -> float | None:
+    with _label_jobs_lock:
+        state = _load_label_jobs_unlocked()
+        _reset_stale_label_jobs_unlocked(state)
+        next_due = _next_due_label_job_at_unlocked(state)
+    if next_due is None:
+        return None
+    return max(0.0, (next_due - _utc_now()).total_seconds())
+
+
 def _run_label_job_worker() -> None:
     global _label_job_worker_inflight
     try:
-        _drain_label_jobs_once()
+        while True:
+            processed = _drain_label_jobs_once()
+            delay = _next_label_job_delay_seconds()
+            if delay is None:
+                return
+            if processed == 0 and delay > 0:
+                time.sleep(min(delay, 5.0))
     finally:
         with _label_job_worker_lock:
             _label_job_worker_inflight = False
@@ -1447,6 +1604,10 @@ def _schedule_label_job_worker() -> bool:
         _label_job_worker_inflight = True
     _label_job_executor.submit(_run_label_job_worker)
     return True
+
+
+if os.environ.get("LABEL_DRAIN_ON_STARTUP", "1").strip().lower() not in {"0", "false", "no", "off"}:
+    _schedule_label_job_worker()
 
 
 def _load_preprocess_state() -> dict[str, Any]:
@@ -2936,6 +3097,7 @@ def logout():
 
 @app.route("/")
 def index():
+    _schedule_label_job_worker()
     return render_template("label.html")
 
 
@@ -3088,6 +3250,7 @@ def api_folders():
 def api_queue():
     """Return a ready-to-render batch of unlabeled folders whose previews are locally cached."""
     request_started = time.perf_counter()
+    _schedule_label_job_worker()
     try:
         client = get_client()
         source, site_key = _request_source_args()
@@ -3445,7 +3608,14 @@ def api_label():
         if not content_signature and has_complete_frame_ids(frames):
             content_signature = _content_signature_from_frames(frames)
 
-        if _label_history_lookup(context, folder_id, folder_name, frame_signature, content_signature):
+        existing_history = _label_history_lookup(context, folder_id, folder_name, frame_signature, content_signature)
+        existing_job = _get_label_job(_label_job_key(context, folder_id))
+        can_replace_pending = (
+            isinstance(existing_job, dict)
+            and existing_job.get("status") == "pending"
+            and not _label_job_is_due(existing_job)
+        )
+        if existing_history and not can_replace_pending:
             _remove_folder_from_listing_cache(context.queue_key, folder_id)
             return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
 
@@ -3486,10 +3656,48 @@ def api_label():
                 "ok": True,
                 "queued": True,
                 "job_id": job.get("id"),
+                "not_before": job.get("not_before"),
+                "undo_expires_at": job.get("undo_expires_at"),
                 "moved_to": label,
                 "source_context": context.to_payload(),
             }
         )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/label/cancel", methods=["POST"])
+def api_label_cancel():
+    data = request.get_json(force=True)
+    folder_id = data.get("folder_id", "").strip()
+    source, site_key = _payload_source_args(data)
+    if not folder_id:
+        return jsonify({"error": "folder_id required"}), 400
+
+    try:
+        context = _resolve_queue_context(get_client(), source, site_key)
+        raw_frames = data.get("frames") if isinstance(data.get("frames"), dict) else {}
+        frames = {
+            key: str(raw_frames.get(key) or "") or None
+            for key in ("frame_0", "frame_1", "frame_2")
+        }
+        frame_signature = str(data.get("frame_signature") or "").strip()
+        if not frame_signature:
+            frame_signature = _frame_signature_from_frames(frames)
+        folder_name = str(data.get("folder_name") or "").strip()
+        content_signature = str(data.get("content_signature") or "").strip()
+        canceled = _cancel_label_job(
+            context,
+            folder_id=folder_id,
+            folder_name=folder_name,
+            frame_signature=frame_signature,
+            content_signature=content_signature,
+        )
+        if not canceled:
+            return jsonify({"error": "label job is no longer undoable", "code": "not_undoable"}), 409
+        return jsonify({"ok": True, "canceled": True, "source_context": context.to_payload()})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except (DriveClientError, RuntimeError) as e:
