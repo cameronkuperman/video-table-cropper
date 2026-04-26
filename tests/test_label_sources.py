@@ -313,6 +313,11 @@ def fake_drive(monkeypatch, tmp_path):
     label_app._folder_prewarm_inflight.clear()
     label_app._camera_config_cache = None
     label_app._crop_config_cache.clear()
+    label_app._label_job_worker_rerun_requested = False
+    label_app._label_job_last_attempt_at = None
+    label_app._label_job_rate_limit_cooldown_until = None
+    label_app._label_job_rate_limit_cooldown_seconds = label_app.LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS
+    label_app._label_job_last_rate_limit_error = None
 
     return fake
 
@@ -712,6 +717,7 @@ def test_label_route_records_durable_job_before_drive_move(client, fake_drive):
 
     assert response.status_code == 200
     assert response.get_json()["queued"] is True
+    assert response.get_json()["drive_move_status"] == "queued"
     assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-unlabeled"]
     history = json.loads(label_app._label_history_path().read_text(encoding="utf-8"))
     assert "frames:video-frame0|video-frame1|video-frame2" in history["queues"]["video"]["labeled"]
@@ -733,6 +739,9 @@ def test_label_job_status_is_lightweight(client, fake_drive):
     assert payload["undo_seconds"] == label_app.LABEL_JOB_UNDO_SECONDS
     assert "stale_reset_count" in payload
     assert "recoverable_failed_reset_count" in payload
+    assert payload["confirmed_moved"] == 0
+    assert payload["waiting_to_move"] == 0
+    assert "rate_limit_cooldown_seconds" in payload
 
 
 def test_discard_job_waits_until_undo_deadline(client, fake_drive):
@@ -834,6 +843,164 @@ def test_already_moved_job_succeeds_without_duplicate_move(client, fake_drive):
     assert fake_drive.moves == []
 
 
+def test_metadata_only_label_still_requires_drive_move(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    fake_drive.update_file_metadata(
+        folder["folder_id"],
+        {"appProperties": label_app._label_app_properties("clean", label_app._resolve_queue_context(fake_drive, "video", None))},
+    )
+
+    assert _drain_label_jobs(fake_drive) == 1
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-clean"]
+    assert fake_drive.moves == [(folder["folder_id"], "video-clean", folder["parent_id"])]
+
+
+def test_label_retry_moves_after_prior_move_failure_with_metadata_present(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+    fake_drive.update_file_metadata(
+        folder["folder_id"],
+        {"appProperties": label_app._label_app_properties("clean", label_app._resolve_queue_context(fake_drive, "video", None))},
+    )
+
+    original_move_file = fake_drive.move_file
+    failures_remaining = {"count": 1}
+
+    def fail_once_move_file(*args, **kwargs):
+        if failures_remaining["count"]:
+            failures_remaining["count"] -= 1
+            raise RuntimeError("temporary Drive move failure")
+        return original_move_file(*args, **kwargs)
+
+    fake_drive.move_file = fail_once_move_file
+
+    assert _drain_label_jobs(fake_drive) == 0
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs["jobs"]["video:video-triplet"]["status"] == "pending"
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-unlabeled"]
+
+    assert _drain_label_jobs(fake_drive) == 1
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-clean"]
+
+
+def test_wrong_label_destination_is_corrected(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+    fake_drive.move_file(folder["folder_id"], "video-dirty", remove_parent_id=folder["parent_id"])
+    fake_drive.moves.clear()
+
+    assert _drain_label_jobs(fake_drive) == 1
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-clean"]
+    assert fake_drive.moves == [(folder["folder_id"], "video-clean", "video-dirty")]
+    assert fake_drive.items[folder["folder_id"]]["appProperties"]["autolabel_final_label"] == "clean"
+
+
+def test_verify_reopens_succeeded_job_not_in_drive_destination(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    job = jobs["jobs"]["video:video-triplet"]
+    job["status"] = "succeeded"
+    job["updated_at"] = datetime.now(timezone.utc).isoformat()
+    label_app._label_jobs_path().write_text(json.dumps(jobs), encoding="utf-8")
+    fake_drive.update_file_metadata(
+        folder["folder_id"],
+        {"appProperties": label_app._label_app_properties("clean", label_app._resolve_queue_context(fake_drive, "video", None))},
+    )
+
+    response = client.get("/api/label/jobs/status?verify=1")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["verification"]["verified_mismatch_count"] == 1
+    assert payload["verification"]["reopened_count"] == 1
+    assert payload["counts"]["pending"] == 1
+    assert payload["counts"]["succeeded"] == 0
+
+
+def test_label_worker_reruns_when_schedule_requested_while_inflight(monkeypatch):
+    submitted = []
+
+    class FakeExecutor:
+        def submit(self, fn):
+            submitted.append(fn)
+            return None
+
+    monkeypatch.setattr(label_app, "_label_job_executor", FakeExecutor())
+    monkeypatch.setattr(label_app, "_drain_label_jobs_once", lambda: 0)
+    monkeypatch.setattr(label_app, "_next_label_job_delay_seconds", lambda: None)
+
+    label_app._label_job_worker_inflight = True
+    label_app._label_job_worker_rerun_requested = False
+    try:
+        assert label_app._schedule_label_job_worker() is False
+        assert label_app._label_job_worker_rerun_requested is True
+
+        label_app._run_label_job_worker()
+
+        assert submitted == [label_app._run_label_job_worker]
+        assert label_app._label_job_worker_inflight is True
+        assert label_app._label_job_worker_rerun_requested is False
+    finally:
+        label_app._label_job_worker_inflight = False
+        label_app._label_job_worker_rerun_requested = False
+
+
+def test_rate_limit_cooldown_grows_until_success(monkeypatch):
+    monkeypatch.setattr(label_app, "LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS", 1.0)
+    monkeypatch.setattr(label_app, "LABEL_JOB_RATE_LIMIT_MAX_COOLDOWN_SECONDS", 8.0)
+    label_app._label_job_rate_limit_cooldown_until = None
+    label_app._label_job_rate_limit_cooldown_seconds = 1.0
+    label_app._label_job_last_rate_limit_error = None
+
+    label_app._record_label_job_rate_limit(RuntimeError("429 too many requests"))
+    assert label_app._label_job_rate_limit_cooldown_seconds == 2.0
+
+    label_app._label_job_rate_limit_cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    label_app._clear_label_job_rate_limit_cooldown()
+    assert label_app._label_job_rate_limit_cooldown_seconds == 2.0
+
+    label_app._record_label_job_rate_limit(RuntimeError("quota exceeded"))
+    assert label_app._label_job_rate_limit_cooldown_seconds == 4.0
+
+    label_app._record_label_job_success()
+    assert label_app._label_job_rate_limit_cooldown_until is None
+    assert label_app._label_job_rate_limit_cooldown_seconds == 1.0
+    assert label_app._label_job_last_rate_limit_error is None
+
+
+def test_due_label_jobs_drain_one_at_a_time(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+    fake_drive._add_folder("video-triplet-2", "ipc3_table-5_t0002", "video-unlabeled")
+    fake_drive._add_triplet_files("video-triplet-2", "video2")
+
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    second_job = dict(jobs["jobs"]["video:video-triplet"])
+    second_job["id"] = "video:video-triplet-2"
+    second_job["folder_id"] = "video-triplet-2"
+    second_job["folder_name"] = "ipc3_table-5_t0002"
+    jobs["jobs"]["video:video-triplet-2"] = second_job
+    label_app._label_jobs_path().write_text(json.dumps(jobs), encoding="utf-8")
+
+    assert _drain_label_jobs(fake_drive) == 1
+    jobs_after_first = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs_after_first["jobs"]["video:video-triplet"]["status"] == "succeeded"
+    assert jobs_after_first["jobs"]["video:video-triplet-2"]["status"] == "pending"
+
+    assert _drain_label_jobs(fake_drive) == 1
+    jobs_after_second = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs_after_second["jobs"]["video:video-triplet-2"]["status"] == "succeeded"
+
+
 def test_background_label_push_does_not_need_request_context(client, fake_drive):
     queue_response = client.get("/api/queue?source=video&limit=10")
     folder = queue_response.get_json()["folders"][0]
@@ -866,6 +1033,36 @@ def test_recoverable_failed_jobs_reset_for_retry(client, fake_drive):
     assert label_app._drain_label_jobs_once(fake_drive) == 1
     jobs_after = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
     assert jobs_after["jobs"]["video:video-triplet"]["status"] == "succeeded"
+
+
+def test_recoverable_failed_jobs_are_retried_one_per_worker_run(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    fake_drive._add_folder("video-triplet-2", "ipc3_table-5_t0002", "video-unlabeled")
+    fake_drive._add_triplet_files("video-triplet-2", "video2")
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    first_job = jobs["jobs"]["video:video-triplet"]
+    second_job = dict(first_job)
+    second_job["id"] = "video:video-triplet-2"
+    second_job["folder_id"] = "video-triplet-2"
+    second_job["folder_name"] = "ipc3_table-5_t0002"
+    jobs["jobs"]["video:video-triplet-2"] = second_job
+    for job in jobs["jobs"].values():
+        job["status"] = "failed"
+        job["attempts"] = label_app.LABEL_JOB_MAX_ATTEMPTS
+        job["last_error"] = "Working outside of request context."
+        job["not_before"] = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=1)
+        ).isoformat()
+    label_app._label_jobs_path().write_text(json.dumps(jobs), encoding="utf-8")
+
+    assert label_app._drain_label_jobs_once(fake_drive) == 1
+    jobs_after = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs_after["jobs"]["video:video-triplet"]["status"] == "succeeded"
+    assert jobs_after["jobs"]["video:video-triplet-2"]["status"] == "failed"
 
 
 def test_missing_drive_folder_failure_stays_failed(client, fake_drive):

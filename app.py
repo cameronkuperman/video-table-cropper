@@ -9,6 +9,7 @@ import json
 import hashlib
 import math
 import os
+import random
 import re
 import hmac
 import secrets
@@ -123,9 +124,20 @@ LABEL_HISTORY_SCHEMA_VERSION = 1
 LABEL_HISTORY_FILE_NAME = "label_history.json"
 LABEL_JOBS_SCHEMA_VERSION = 1
 LABEL_JOBS_FILE_NAME = "label_jobs.json"
+LABEL_JOB_RECOVERED_ERROR = "Recovered after label worker fix; retrying Drive push."
 LABEL_JOB_ERROR_LIMIT = max(1, int(os.environ.get("LABEL_JOB_ERROR_LIMIT", "25") or "25"))
 LABEL_JOB_MAX_ATTEMPTS = max(1, int(os.environ.get("LABEL_JOB_MAX_ATTEMPTS", "100") or "100"))
 LABEL_JOB_UNDO_SECONDS = max(0, int(os.environ.get("LABEL_JOB_UNDO_SECONDS", "30") or "30"))
+LABEL_JOB_MIN_INTERVAL_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_MIN_INTERVAL_SECONDS", "2.0") or "2.0"))
+LABEL_JOB_JITTER_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_JITTER_SECONDS", "0.5") or "0.5"))
+LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS = max(
+    1.0,
+    float(os.environ.get("LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS", "120") or "120"),
+)
+LABEL_JOB_RATE_LIMIT_MAX_COOLDOWN_SECONDS = max(
+    LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS,
+    float(os.environ.get("LABEL_JOB_RATE_LIMIT_MAX_COOLDOWN_SECONDS", "900") or "900"),
+)
 LABEL_JOB_PROCESSING_STALE_SECONDS = max(
     30,
     int(os.environ.get("LABEL_JOB_PROCESSING_STALE_SECONDS", "300") or "300"),
@@ -335,6 +347,12 @@ _label_history_lock = Lock()
 _label_jobs_lock = Lock()
 _label_job_worker_lock = Lock()
 _label_job_worker_inflight = False
+_label_job_worker_rerun_requested = False
+_label_job_rate_limit_lock = Lock()
+_label_job_last_attempt_at: datetime | None = None
+_label_job_rate_limit_cooldown_until: datetime | None = None
+_label_job_rate_limit_cooldown_seconds = LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS
+_label_job_last_rate_limit_error: str | None = None
 _listing_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
 _listing_lock = Lock()
 _listing_refresh_executor = ThreadPoolExecutor(max_workers=1)
@@ -1387,7 +1405,175 @@ def _cancel_label_job(
     return canceled
 
 
-def _label_jobs_status_payload() -> dict[str, Any]:
+def _label_job_rate_limit_snapshot() -> dict[str, Any]:
+    with _label_job_rate_limit_lock:
+        cooldown_until = _label_job_rate_limit_cooldown_until
+        cooldown_seconds = 0.0
+        if cooldown_until is not None:
+            cooldown_seconds = max(0.0, (cooldown_until - _utc_now()).total_seconds())
+        return {
+            "rate_limit_cooldown_until": _utc_iso(cooldown_until) if cooldown_until else None,
+            "rate_limit_cooldown_seconds": cooldown_seconds,
+            "last_rate_limit_error": _label_job_last_rate_limit_error,
+            "last_move_attempt_at": _utc_iso(_label_job_last_attempt_at) if _label_job_last_attempt_at else None,
+            "label_job_min_interval_seconds": LABEL_JOB_MIN_INTERVAL_SECONDS,
+        }
+
+
+def _label_job_rate_limit_delay_seconds() -> float:
+    with _label_job_rate_limit_lock:
+        if _label_job_rate_limit_cooldown_until is None:
+            return 0.0
+        return max(0.0, (_label_job_rate_limit_cooldown_until - _utc_now()).total_seconds())
+
+
+def _mark_label_job_attempt() -> None:
+    global _label_job_last_attempt_at
+    with _label_job_rate_limit_lock:
+        _label_job_last_attempt_at = _utc_now()
+
+
+def _clear_label_job_rate_limit_cooldown() -> None:
+    global _label_job_rate_limit_cooldown_until
+    with _label_job_rate_limit_lock:
+        if _label_job_rate_limit_cooldown_until and _label_job_rate_limit_cooldown_until <= _utc_now():
+            _label_job_rate_limit_cooldown_until = None
+
+
+def _looks_like_drive_rate_limit_error(error: object) -> bool:
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "429",
+            "too many requests",
+            "ratelimitexceeded",
+            "user rate limit exceeded",
+            "userratelimitexceeded",
+            "quota",
+        )
+    )
+
+
+def _record_label_job_rate_limit(error: object) -> None:
+    global _label_job_rate_limit_cooldown_until, _label_job_rate_limit_cooldown_seconds
+    global _label_job_last_rate_limit_error
+    message = str(error or "Drive rate limit")
+    with _label_job_rate_limit_lock:
+        now = _utc_now()
+        cooldown = _label_job_rate_limit_cooldown_seconds
+        _label_job_rate_limit_cooldown_until = now + timedelta(seconds=cooldown)
+        _label_job_last_rate_limit_error = message[:1200]
+        _label_job_rate_limit_cooldown_seconds = min(
+            LABEL_JOB_RATE_LIMIT_MAX_COOLDOWN_SECONDS,
+            max(LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS, cooldown * 2),
+        )
+
+
+def _record_label_job_success() -> None:
+    global _label_job_rate_limit_cooldown_until, _label_job_rate_limit_cooldown_seconds
+    global _label_job_last_rate_limit_error
+    with _label_job_rate_limit_lock:
+        _label_job_rate_limit_cooldown_until = None
+        _label_job_rate_limit_cooldown_seconds = LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS
+        _label_job_last_rate_limit_error = None
+
+
+def _label_job_pace_delay_seconds() -> float:
+    with _label_job_rate_limit_lock:
+        last_attempt_at = _label_job_last_attempt_at
+    if last_attempt_at is None or LABEL_JOB_MIN_INTERVAL_SECONDS <= 0:
+        return 0.0
+    elapsed = (_utc_now() - last_attempt_at).total_seconds()
+    return max(0.0, LABEL_JOB_MIN_INTERVAL_SECONDS - elapsed)
+
+
+def _label_job_destination_context(
+    client: DriveClient,
+    job: dict[str, Any],
+) -> tuple[QueueContext, str, str, str]:
+    source = str(job.get("source") or VIDEO_SOURCE)
+    site_key = str(job.get("site_key") or "").strip() or None
+    context = _resolve_queue_context(client, source, site_key)
+    folder_id = str(job.get("folder_id") or "")
+    label = str(job.get("label") or "").lower()
+    destination_id = context.folder_ids.get(label, "")
+    if not folder_id or label not in LABEL_DESTINATIONS or not destination_id:
+        raise ValueError("label job is missing folder_id or label destination")
+    return context, folder_id, label, destination_id
+
+
+def _verify_succeeded_label_jobs(client: DriveClient) -> dict[str, Any]:
+    with _label_jobs_lock:
+        state = _load_label_jobs_unlocked()
+        succeeded_jobs = [
+            dict(job)
+            for job in (state.get("jobs") or {}).values()
+            if isinstance(job, dict) and job.get("status") == "succeeded"
+        ]
+
+    checked = 0
+    mismatch_count = 0
+    reopened_count = 0
+    errors: list[dict[str, Any]] = []
+    for job in succeeded_jobs:
+        checked += 1
+        job_id = str(job.get("id") or "")
+        try:
+            context, folder_id, label, destination_id = _label_job_destination_context(client, job)
+            current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+            current_parents = [str(parent) for parent in current.get("parents", []) if parent]
+            label_parent_ids = {
+                destination_id
+                for destination_label, destination_id in context.folder_ids.items()
+                if destination_label in LABEL_DESTINATIONS
+            }
+            is_mismatch = (
+                destination_id not in current_parents
+                and (
+                    context.input_folder_id in current_parents
+                    or any(parent in label_parent_ids for parent in current_parents)
+                )
+            )
+        except Exception as exc:
+            errors.append({"id": job_id, "error": str(exc)})
+            continue
+        if not is_mismatch:
+            continue
+        mismatch_count += 1
+        with _label_jobs_lock:
+            state = _load_label_jobs_unlocked()
+            live_job = (state.get("jobs") or {}).get(job_id)
+            if isinstance(live_job, dict) and live_job.get("status") == "succeeded":
+                now = _utc_iso()
+                live_job["status"] = "pending"
+                live_job["updated_at"] = now
+                live_job["not_before"] = now
+                live_job["undo_expires_at"] = now
+                live_job["last_error"] = (
+                    f"Verification reopened job: Drive folder is not in '{label}' destination."
+                )
+                _save_label_jobs_unlocked(state)
+                reopened_count += 1
+    if reopened_count:
+        _schedule_label_job_worker()
+    return {
+        "checked": checked,
+        "verified_mismatch_count": mismatch_count,
+        "reopened_count": reopened_count,
+        "errors": errors[:LABEL_JOB_ERROR_LIMIT],
+    }
+
+
+def _label_jobs_status_payload(
+    *,
+    verify: bool = False,
+    client: DriveClient | None = None,
+) -> dict[str, Any]:
+    verification = None
+    if verify:
+        verification = _verify_succeeded_label_jobs(client or DriveClient())
+
     with _label_jobs_lock:
         state = _load_label_jobs_unlocked()
         stale_reset_count = _reset_stale_label_jobs_unlocked(state)
@@ -1441,6 +1627,9 @@ def _label_jobs_status_payload() -> dict[str, Any]:
         "writable": writable,
         "inflight": _label_job_worker_inflight,
         "counts": counts,
+        "confirmed_moved": counts["succeeded"],
+        "waiting_to_move": counts["pending"] + counts["delayed"] + counts["processing"],
+        "active_move_attempts": counts["processing"],
         "last_success_at": last_success_at,
         "next_due_at": next_due_at,
         "undo_seconds": LABEL_JOB_UNDO_SECONDS,
@@ -1448,6 +1637,8 @@ def _label_jobs_status_payload() -> dict[str, Any]:
         "stale_reset_count": stale_reset_count,
         "recoverable_failed_reset_count": recoverable_failed_reset_count,
         "recent_errors": recent_errors,
+        "verification": verification,
+        **_label_job_rate_limit_snapshot(),
         "error": error,
     }
 
@@ -1474,9 +1665,15 @@ def _recoverable_label_job_error(message: object) -> bool:
     return "Working outside of request context" in text
 
 
-def _reset_recoverable_failed_label_jobs_unlocked(state: dict[str, Any]) -> int:
+def _reset_recoverable_failed_label_jobs_unlocked(
+    state: dict[str, Any],
+    *,
+    limit: int | None = None,
+) -> int:
     reset_count = 0
     for job in (state.get("jobs") or {}).values():
+        if limit is not None and reset_count >= limit:
+            break
         if not isinstance(job, dict) or job.get("status") != "failed":
             continue
         if not _recoverable_label_job_error(job.get("last_error")):
@@ -1484,7 +1681,7 @@ def _reset_recoverable_failed_label_jobs_unlocked(state: dict[str, Any]) -> int:
         job["status"] = "pending"
         job["attempts"] = 0
         job["updated_at"] = _utc_iso()
-        job["last_error"] = "Recovered after label worker fix; retrying Drive push."
+        job["last_error"] = LABEL_JOB_RECOVERED_ERROR
         reset_count += 1
     if reset_count:
         _save_label_jobs_unlocked(state)
@@ -1507,7 +1704,7 @@ def _claim_next_label_job_unlocked(state: dict[str, Any], *, force_due: bool = F
     now = _utc_iso(now_dt)
     jobs = state.setdefault("jobs", {})
     _reset_stale_label_jobs_unlocked(state)
-    _reset_recoverable_failed_label_jobs_unlocked(state)
+    _reset_recoverable_failed_label_jobs_unlocked(state, limit=1)
     for job in jobs.values():
         if not isinstance(job, dict):
             continue
@@ -1542,13 +1739,9 @@ def _finish_label_job(job_id: str, *, status: str, error: str | None = None) -> 
 
 
 def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
-    source = str(job.get("source") or VIDEO_SOURCE)
-    site_key = str(job.get("site_key") or "").strip() or None
-    context = _resolve_queue_context(client, source, site_key)
-    folder_id = str(job.get("folder_id") or "")
+    context, folder_id, label, destination_id = _label_job_destination_context(client, job)
     parent_id = str(job.get("parent_id") or "")
-    label = str(job.get("label") or "").lower()
-    if not folder_id or not parent_id or label not in LABEL_DESTINATIONS:
+    if not folder_id or not parent_id:
         raise ValueError("label job is missing folder_id, parent_id, or label")
     if parent_id != context.input_folder_id:
         raise ValueError("label job parent_id does not match the active queue")
@@ -1565,38 +1758,24 @@ def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
         None,
     )
 
-    label_metadata = dict(current.get("appProperties") or {})
-    existing_final_label = str(label_metadata.get("autolabel_final_label") or "")
-    if existing_final_label == label:
-        return
-    if existing_final_label and context.input_folder_id not in current_parents:
-        return
-    if context.input_folder_id not in current_parents:
-        if context.folder_ids.get(label) in current_parents:
-            return
-        if current_label_parent:
-            label_metadata.update(_label_app_properties(label, context, labeler_name=str(job.get("labeler_name") or "background")))
-            client.update_file_metadata(
-                folder_id,
-                {"appProperties": label_metadata},
-                fields="id,name,mimeType,parents,appProperties",
-            )
-            if current_label_parent != context.folder_ids[label]:
-                client.move_file(
-                    folder_id,
-                    new_parent_id=context.folder_ids[label],
-                    remove_parent_id=current_label_parent,
-                )
-            return
+    if destination_id in current_parents:
+        pass
+    elif context.input_folder_id in current_parents:
+        client.move_file(folder_id, new_parent_id=destination_id, remove_parent_id=parent_id)
+    elif current_label_parent:
+        client.move_file(folder_id, new_parent_id=destination_id, remove_parent_id=current_label_parent)
+    else:
         raise RuntimeError("folder is no longer in the source or target Drive folder")
 
-    label_metadata.update(_label_app_properties(label, context, labeler_name=str(job.get("labeler_name") or "background")))
+    label_metadata = dict(current.get("appProperties") or {})
+    label_metadata.update(
+        _label_app_properties(label, context, labeler_name=str(job.get("labeler_name") or "background"))
+    )
     client.update_file_metadata(
         folder_id,
         {"appProperties": label_metadata},
         fields="id,name,mimeType,parents,appProperties",
     )
-    client.move_file(folder_id, new_parent_id=context.folder_ids[label], remove_parent_id=parent_id)
     with _hydrated_folder_cache_lock:
         _hydrated_folder_cache.pop(_hydrated_cache_key(context.queue_key, folder_id), None)
     _remove_folder_from_listing_cache(context.queue_key, folder_id)
@@ -1604,26 +1783,38 @@ def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
 
 def _drain_label_jobs_once(client: DriveClient | None = None, *, force_due: bool = False) -> int:
     active_client = client
-    processed = 0
-    while True:
-        with _label_jobs_lock:
-            state = _load_label_jobs_unlocked()
-            job = _claim_next_label_job_unlocked(state, force_due=force_due)
-        if job is None:
-            return processed
-        job_id = str(job.get("id") or "")
-        try:
-            if active_client is None:
-                active_client = DriveClient()
-            _push_label_job_to_drive(active_client, job)
-        except Exception as exc:
-            _finish_label_job(job_id, status="pending", error=str(exc))
-            return processed
-        _finish_label_job(job_id, status="succeeded")
-        processed += 1
+    if not force_due:
+        _clear_label_job_rate_limit_cooldown()
+        if _label_job_rate_limit_delay_seconds() > 0:
+            return 0
+    with _label_jobs_lock:
+        state = _load_label_jobs_unlocked()
+        job = _claim_next_label_job_unlocked(state, force_due=force_due)
+    if job is None:
+        return 0
+    job_id = str(job.get("id") or "")
+    try:
+        if active_client is None:
+            active_client = DriveClient()
+        _mark_label_job_attempt()
+        _push_label_job_to_drive(active_client, job)
+    except Exception as exc:
+        if _looks_like_drive_rate_limit_error(exc):
+            _record_label_job_rate_limit(exc)
+        _finish_label_job(job_id, status="pending", error=str(exc))
+        return 0
+    _record_label_job_success()
+    _finish_label_job(job_id, status="succeeded")
+    return 1
 
 
 def _next_label_job_delay_seconds() -> float | None:
+    rate_limit_delay = _label_job_rate_limit_delay_seconds()
+    if rate_limit_delay > 0:
+        return rate_limit_delay
+    pace_delay = _label_job_pace_delay_seconds()
+    if pace_delay > 0:
+        return pace_delay + (random.uniform(0.0, LABEL_JOB_JITTER_SECONDS) if LABEL_JOB_JITTER_SECONDS > 0 else 0.0)
     with _label_jobs_lock:
         state = _load_label_jobs_unlocked()
         _reset_stale_label_jobs_unlocked(state)
@@ -1634,24 +1825,32 @@ def _next_label_job_delay_seconds() -> float | None:
 
 
 def _run_label_job_worker() -> None:
-    global _label_job_worker_inflight
+    global _label_job_worker_inflight, _label_job_worker_rerun_requested
     try:
         while True:
             processed = _drain_label_jobs_once()
             delay = _next_label_job_delay_seconds()
             if delay is None:
                 return
-            if processed == 0 and delay > 0:
+            if delay > 0:
                 time.sleep(min(delay, 5.0))
     finally:
+        should_rerun = False
         with _label_job_worker_lock:
-            _label_job_worker_inflight = False
+            if _label_job_worker_rerun_requested:
+                _label_job_worker_rerun_requested = False
+                should_rerun = True
+            else:
+                _label_job_worker_inflight = False
+        if should_rerun:
+            _label_job_executor.submit(_run_label_job_worker)
 
 
 def _schedule_label_job_worker() -> bool:
-    global _label_job_worker_inflight
+    global _label_job_worker_inflight, _label_job_worker_rerun_requested
     with _label_job_worker_lock:
         if _label_job_worker_inflight:
+            _label_job_worker_rerun_requested = True
             return False
         _label_job_worker_inflight = True
     _label_job_executor.submit(_run_label_job_worker)
@@ -3542,7 +3741,8 @@ def api_cache_warm_cancel():
 @app.route("/api/label/jobs/status")
 def api_label_jobs_status():
     _schedule_label_job_worker()
-    return jsonify(_label_jobs_status_payload())
+    verify = str(request.args.get("verify") or "").strip().lower() in {"1", "true", "yes", "on"}
+    return jsonify(_label_jobs_status_payload(verify=verify, client=get_client() if verify else None))
 
 
 @app.route("/api/preview/<file_id>")
@@ -3710,7 +3910,8 @@ def api_label():
                 "job_id": job.get("id"),
                 "not_before": job.get("not_before"),
                 "undo_expires_at": job.get("undo_expires_at"),
-                "moved_to": label,
+                "queued_label": label,
+                "drive_move_status": "queued",
                 "source_context": context.to_payload(),
             }
         )
