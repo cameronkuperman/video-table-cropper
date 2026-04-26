@@ -868,6 +868,29 @@ def test_recoverable_failed_jobs_reset_for_retry(client, fake_drive):
     assert jobs_after["jobs"]["video:video-triplet"]["status"] == "succeeded"
 
 
+def test_missing_drive_folder_failure_stays_failed(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    job = jobs["jobs"]["video:video-triplet"]
+    job["status"] = "failed"
+    job["attempts"] = label_app.LABEL_JOB_MAX_ATTEMPTS
+    job["last_error"] = "folder is no longer in the source or target Drive folder"
+    job["not_before"] = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=1)
+    ).isoformat()
+    label_app._label_jobs_path().write_text(json.dumps(jobs), encoding="utf-8")
+
+    assert label_app._drain_label_jobs_once(fake_drive) == 0
+    jobs_after = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    job_after = jobs_after["jobs"]["video:video-triplet"]
+    assert job_after["status"] == "failed"
+    assert job_after["attempts"] == label_app.LABEL_JOB_MAX_ATTEMPTS
+
+
 def test_labeled_content_signature_never_returns_to_queue(client, fake_drive, monkeypatch):
     monkeypatch.setattr(label_app, "_content_signature_from_frames", lambda frames: "same-thumb-content")
     queue_response = client.get("/api/queue?source=video&limit=10&refresh=1")

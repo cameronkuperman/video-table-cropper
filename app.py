@@ -1471,10 +1471,7 @@ def _reset_stale_label_jobs_unlocked(state: dict[str, Any]) -> int:
 
 def _recoverable_label_job_error(message: object) -> bool:
     text = str(message or "")
-    return (
-        "Working outside of request context" in text
-        or "folder is no longer in the source or target Drive folder" in text
-    )
+    return "Working outside of request context" in text
 
 
 def _reset_recoverable_failed_label_jobs_unlocked(state: dict[str, Any]) -> int:
