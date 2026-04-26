@@ -26,6 +26,7 @@ from flask import (
     Flask,
     abort,
     g,
+    has_request_context,
     jsonify,
     redirect,
     render_template,
@@ -770,14 +771,16 @@ def _payload_source_args(data: dict[str, Any]) -> tuple[str, str | None]:
 
 
 def _labeler_name() -> str:
+    if not has_request_context():
+        return "background"
     return str(session.get("labeler_name") or "local")
 
 
-def _label_app_properties(label: str, context: QueueContext) -> dict[str, str]:
+def _label_app_properties(label: str, context: QueueContext, labeler_name: str | None = None) -> dict[str, str]:
     properties = {
         "autolabel_final_label": label,
         "autolabel_labeled_at": datetime.now(timezone.utc).isoformat(),
-        "autolabel_labeled_by": _labeler_name(),
+        "autolabel_labeled_by": labeler_name or _labeler_name(),
         "autolabel_source": context.source,
         "autolabel_queue_key": context.queue_key,
     }
@@ -1340,6 +1343,7 @@ def _enqueue_label_job(
             "source": context.source,
             "site_key": context.site_key,
             "queue_key": context.queue_key,
+            "labeler_name": _labeler_name(),
             "created_at": existing_job.get("created_at", now),
             "updated_at": now,
             "not_before": not_before,
@@ -1387,6 +1391,7 @@ def _label_jobs_status_payload() -> dict[str, Any]:
     with _label_jobs_lock:
         state = _load_label_jobs_unlocked()
         stale_reset_count = _reset_stale_label_jobs_unlocked(state)
+        recoverable_failed_reset_count = _reset_recoverable_failed_label_jobs_unlocked(state)
         jobs = [job for job in (state.get("jobs") or {}).values() if isinstance(job, dict)]
 
     counts = {"pending": 0, "delayed": 0, "processing": 0, "succeeded": 0, "failed": 0, "canceled": 0}
@@ -1441,6 +1446,7 @@ def _label_jobs_status_payload() -> dict[str, Any]:
         "undo_seconds": LABEL_JOB_UNDO_SECONDS,
         "stale_processing_seconds": LABEL_JOB_PROCESSING_STALE_SECONDS,
         "stale_reset_count": stale_reset_count,
+        "recoverable_failed_reset_count": recoverable_failed_reset_count,
         "recent_errors": recent_errors,
         "error": error,
     }
@@ -1463,6 +1469,31 @@ def _reset_stale_label_jobs_unlocked(state: dict[str, Any]) -> int:
     return reset_count
 
 
+def _recoverable_label_job_error(message: object) -> bool:
+    text = str(message or "")
+    return (
+        "Working outside of request context" in text
+        or "folder is no longer in the source or target Drive folder" in text
+    )
+
+
+def _reset_recoverable_failed_label_jobs_unlocked(state: dict[str, Any]) -> int:
+    reset_count = 0
+    for job in (state.get("jobs") or {}).values():
+        if not isinstance(job, dict) or job.get("status") != "failed":
+            continue
+        if not _recoverable_label_job_error(job.get("last_error")):
+            continue
+        job["status"] = "pending"
+        job["attempts"] = 0
+        job["updated_at"] = _utc_iso()
+        job["last_error"] = "Recovered after label worker fix; retrying Drive push."
+        reset_count += 1
+    if reset_count:
+        _save_label_jobs_unlocked(state)
+    return reset_count
+
+
 def _next_due_label_job_at_unlocked(state: dict[str, Any]) -> datetime | None:
     next_due = None
     for job in (state.get("jobs") or {}).values():
@@ -1479,6 +1510,7 @@ def _claim_next_label_job_unlocked(state: dict[str, Any], *, force_due: bool = F
     now = _utc_iso(now_dt)
     jobs = state.setdefault("jobs", {})
     _reset_stale_label_jobs_unlocked(state)
+    _reset_recoverable_failed_label_jobs_unlocked(state)
     for job in jobs.values():
         if not isinstance(job, dict):
             continue
@@ -1526,6 +1558,15 @@ def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
 
     current = client.get_file(folder_id, fields="id,name,parents,appProperties")
     current_parents = [str(parent) for parent in current.get("parents", []) if parent]
+    label_parent_ids = {
+        destination_label: destination_id
+        for destination_label, destination_id in context.folder_ids.items()
+        if destination_label in LABEL_DESTINATIONS
+    }
+    current_label_parent = next(
+        (parent for parent in current_parents if parent in label_parent_ids.values()),
+        None,
+    )
 
     label_metadata = dict(current.get("appProperties") or {})
     existing_final_label = str(label_metadata.get("autolabel_final_label") or "")
@@ -1536,9 +1577,23 @@ def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
     if context.input_folder_id not in current_parents:
         if context.folder_ids.get(label) in current_parents:
             return
+        if current_label_parent:
+            label_metadata.update(_label_app_properties(label, context, labeler_name=str(job.get("labeler_name") or "background")))
+            client.update_file_metadata(
+                folder_id,
+                {"appProperties": label_metadata},
+                fields="id,name,mimeType,parents,appProperties",
+            )
+            if current_label_parent != context.folder_ids[label]:
+                client.move_file(
+                    folder_id,
+                    new_parent_id=context.folder_ids[label],
+                    remove_parent_id=current_label_parent,
+                )
+            return
         raise RuntimeError("folder is no longer in the source or target Drive folder")
 
-    label_metadata.update(_label_app_properties(label, context))
+    label_metadata.update(_label_app_properties(label, context, labeler_name=str(job.get("labeler_name") or "background")))
     client.update_file_metadata(
         folder_id,
         {"appProperties": label_metadata},

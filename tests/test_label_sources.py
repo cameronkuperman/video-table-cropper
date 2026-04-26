@@ -732,6 +732,7 @@ def test_label_job_status_is_lightweight(client, fake_drive):
     assert "delayed" in payload["counts"]
     assert payload["undo_seconds"] == label_app.LABEL_JOB_UNDO_SECONDS
     assert "stale_reset_count" in payload
+    assert "recoverable_failed_reset_count" in payload
 
 
 def test_discard_job_waits_until_undo_deadline(client, fake_drive):
@@ -831,6 +832,40 @@ def test_already_moved_job_succeeds_without_duplicate_move(client, fake_drive):
 
     assert _drain_label_jobs(fake_drive) == 1
     assert fake_drive.moves == []
+
+
+def test_background_label_push_does_not_need_request_context(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    with label_app.app.app_context():
+        assert _drain_label_jobs(fake_drive) == 1
+    folder_item = fake_drive.items[folder["folder_id"]]
+    assert folder_item["appProperties"]["autolabel_final_label"] == "clean"
+    assert folder_item["appProperties"]["autolabel_labeled_by"] == "local"
+
+
+def test_recoverable_failed_jobs_reset_for_retry(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    job = jobs["jobs"]["video:video-triplet"]
+    job["status"] = "failed"
+    job["attempts"] = label_app.LABEL_JOB_MAX_ATTEMPTS
+    job["last_error"] = "Working outside of request context."
+    job["not_before"] = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=1)
+    ).isoformat()
+    label_app._label_jobs_path().write_text(json.dumps(jobs), encoding="utf-8")
+
+    assert label_app._drain_label_jobs_once(fake_drive) == 1
+    jobs_after = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs_after["jobs"]["video:video-triplet"]["status"] == "succeeded"
 
 
 def test_labeled_content_signature_never_returns_to_queue(client, fake_drive, monkeypatch):
