@@ -701,6 +701,48 @@ def test_label_stamps_metadata_and_rejects_stale_second_move(client, fake_drive)
     assert second_response.get_json()["code"] == "already_labeled"
 
 
+def test_labeled_frame_signature_never_returns_to_queue_across_sessions(client, fake_drive, tmp_path, monkeypatch):
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    queue_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    folder = queue_response.get_json()["folders"][0]
+
+    label_response = client.post(
+        "/api/label",
+        json={
+            "folder_id": folder["folder_id"],
+            "parent_id": folder["parent_id"],
+            "label": "clean",
+            "source": folder["source"],
+            "site_key": folder["site_key"],
+        },
+    )
+    assert label_response.status_code == 200
+
+    fake_drive._add_folder("video-triplet-rerun", "ipc3_table-4_t0001_rerun", "video-unlabeled")
+    fake_drive.update_file_metadata(
+        "video-triplet-rerun",
+        {
+            "appProperties": label_app.build_folder_app_properties(
+                {
+                    "frame_0": "video-frame0",
+                    "frame_1": "video-frame1",
+                    "frame_2": "video-frame2",
+                }
+            )
+        },
+    )
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    repeat_payload = repeat_response.get_json()
+
+    assert repeat_response.status_code == 200
+    assert repeat_payload["folders"] == []
+    history = json.loads((tmp_path / label_app.LABEL_HISTORY_FILE_NAME).read_text())
+    assert "frames:video-frame0|video-frame1|video-frame2" in history["queues"]["video"]["labeled"]
+
+
 def test_cache_dir_reuses_existing_repo_cache(monkeypatch, tmp_path):
     fake_repo = tmp_path / "repo"
     repo_cache = fake_repo / "label_cache"

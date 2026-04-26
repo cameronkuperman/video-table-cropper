@@ -117,6 +117,8 @@ CROP_CONFIGS_FOLDER_NAME = "crop_configs"
 PROCESSED_RAW_FOLDER_NAME = "processed_raw"
 PREPROCESS_STATE_SCHEMA_VERSION = 1
 PREPROCESS_STATE_FILE_NAME = "preprocess_state.json"
+LABEL_HISTORY_SCHEMA_VERSION = 1
+LABEL_HISTORY_FILE_NAME = "label_history.json"
 PROCESSED_RAW_RETENTION_DAYS = max(
     1, int(os.environ.get("PROCESSED_RAW_RETENTION_DAYS", "14") or "14")
 )
@@ -318,6 +320,7 @@ _source_folder_ids_cache: dict[str, dict[str, str]] = {}
 _source_folder_ids_lock = Lock()
 _cache_cleanup_lock = Lock()
 _last_cache_cleanup_monotonic = 0.0
+_label_history_lock = Lock()
 _listing_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
 _listing_lock = Lock()
 _listing_refresh_executor = ThreadPoolExecutor(max_workers=1)
@@ -1013,6 +1016,118 @@ def _preprocess_state_path() -> Path:
     return _preprocess_state_dir() / PREPROCESS_STATE_FILE_NAME
 
 
+def _label_history_path() -> Path:
+    return _preprocess_state_dir() / LABEL_HISTORY_FILE_NAME
+
+
+def _label_history_empty() -> dict[str, Any]:
+    return {
+        "schema_version": LABEL_HISTORY_SCHEMA_VERSION,
+        "queues": {},
+    }
+
+
+def _load_label_history_unlocked() -> dict[str, Any]:
+    path = _label_history_path()
+    if not path.exists():
+        return _label_history_empty()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _label_history_empty()
+    if not isinstance(data, dict):
+        return _label_history_empty()
+    queues = data.get("queues")
+    if not isinstance(queues, dict):
+        queues = {}
+    return {
+        "schema_version": LABEL_HISTORY_SCHEMA_VERSION,
+        "queues": queues,
+    }
+
+
+def _save_label_history_unlocked(history: dict[str, Any]) -> None:
+    path = _label_history_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": LABEL_HISTORY_SCHEMA_VERSION,
+        "queues": history.get("queues") or {},
+    }
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _frame_signature_from_frames(frames: dict[str, str | None]) -> str:
+    return "|".join(str(frames.get(key) or "") for key in ("frame_0", "frame_1", "frame_2"))
+
+
+def _label_history_keys(
+    context: QueueContext,
+    folder_id: str,
+    folder_name: str,
+    frame_signature: str,
+) -> list[str]:
+    keys = [
+        f"id:{folder_id}",
+        f"name:{folder_name}",
+    ]
+    if frame_signature:
+        keys.append(f"frames:{frame_signature}")
+    return keys
+
+
+def _label_history_queue(history: dict[str, Any], queue_key: str) -> dict[str, Any]:
+    queues = history.setdefault("queues", {})
+    queue = queues.setdefault(queue_key, {})
+    if not isinstance(queue, dict):
+        queue = {}
+        queues[queue_key] = queue
+    labeled = queue.setdefault("labeled", {})
+    if not isinstance(labeled, dict):
+        queue["labeled"] = {}
+    return queue
+
+
+def _label_history_lookup(context: QueueContext, folder_id: str, folder_name: str, frame_signature: str) -> dict[str, Any] | None:
+    with _label_history_lock:
+        history = _load_label_history_unlocked()
+        queue = (history.get("queues") or {}).get(context.queue_key) or {}
+        labeled = queue.get("labeled") or {}
+        for key in _label_history_keys(context, folder_id, folder_name, frame_signature):
+            record = labeled.get(key)
+            if isinstance(record, dict):
+                return record
+    return None
+
+
+def _record_label_history(
+    context: QueueContext,
+    folder_id: str,
+    folder_name: str,
+    frame_signature: str,
+    label: str,
+) -> None:
+    record = {
+        "label": label,
+        "folder_id": folder_id,
+        "folder_name": folder_name,
+        "frame_signature": frame_signature,
+        "queue_key": context.queue_key,
+        "source": context.source,
+        "site_key": context.site_key,
+        "labeled_at": datetime.now(timezone.utc).isoformat(),
+        "labeled_by": _labeler_name(),
+    }
+    with _label_history_lock:
+        history = _load_label_history_unlocked()
+        queue = _label_history_queue(history, context.queue_key)
+        labeled = queue.setdefault("labeled", {})
+        for key in _label_history_keys(context, folder_id, folder_name, frame_signature):
+            labeled[key] = record
+        _save_label_history_unlocked(history)
+
+
 def _load_preprocess_state() -> dict[str, Any]:
     path = _preprocess_state_path()
     if not path.exists():
@@ -1619,7 +1734,7 @@ def _build_folder_payload(
     context: QueueContext,
     frames: dict[str, str | None],
 ) -> dict:
-    frame_signature = "|".join(str(frames.get(key) or "") for key in ("frame_0", "frame_1", "frame_2"))
+    frame_signature = _frame_signature_from_frames(frames)
     preview_urls = {
         key: f"/api/preview/{file_id}"
         for key, file_id in frames.items()
@@ -2137,6 +2252,13 @@ def _collect_ready_folders(
                 continue
             signature = str(payload.get("frame_signature") or "")
             if signature and signature in seen_signatures:
+                continue
+            if _label_history_lookup(
+                context,
+                str(payload.get("folder_id") or ""),
+                str(payload.get("folder_name") or ""),
+                signature,
+            ):
                 continue
             if signature:
                 seen_signatures.add(signature)
@@ -2844,6 +2966,15 @@ def api_label():
             return jsonify({"error": "parent_id does not match the active queue"}), 400
 
         current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+        frames = _frame_payload_from_folder(current)
+        if not has_complete_frame_ids(frames):
+            frames = _frame_payload_from_files(client.list_files(folder_id))
+        frame_signature = _frame_signature_from_frames(frames)
+        folder_name = str(current.get("name") or "")
+        if _label_history_lookup(context, folder_id, folder_name, frame_signature):
+            _remove_folder_from_listing_cache(context.queue_key, folder_id)
+            return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
+
         current_parents = [str(parent) for parent in current.get("parents", []) if parent]
         if context.input_folder_id not in current_parents:
             return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
@@ -2859,6 +2990,7 @@ def api_label():
             {"appProperties": label_metadata},
             fields="id,name,mimeType,parents,appProperties",
         )
+        _record_label_history(context, folder_id, folder_name, frame_signature, label)
         move_started = time.perf_counter()
         client.move_file(folder_id, new_parent_id=dest_id, remove_parent_id=parent_id)
         move_ms = (time.perf_counter() - move_started) * 1000
