@@ -35,9 +35,12 @@ const WARM_BUFFER_SIZE = 144;
 const LOW_WATERMARK = 160;
 const TIMING_LOGS_ENABLED = true;
 const QUEUE_SNAPSHOT_PREFIX = 'autolabeler.queueSnapshot.';
+const QUEUE_SNAPSHOT_SCHEMA_VERSION = 2;
 const QUEUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
 const QUEUE_SNAPSHOT_MAX_FOLDERS = 300;
 const SUPPRESSED_QUEUE_MAX = 1000;
+const PENDING_LABELS_KEY = 'autolabeler.pendingLabels.v1';
+const PENDING_LABEL_KEEPALIVE_LIMIT = 20;
 
 const cardEl = document.getElementById('card');
 const progressEl = document.getElementById('progress');
@@ -154,6 +157,7 @@ function saveQueueSnapshot() {
         window.localStorage.setItem(
             queueSnapshotKey(),
             JSON.stringify({
+                schemaVersion: QUEUE_SNAPSHOT_SCHEMA_VERSION,
                 savedAt: Date.now(),
                 queueKey: activeQueueKey(),
                 source: activeSource,
@@ -187,6 +191,10 @@ function restoreQueueSnapshot() {
         }
         const snapshot = JSON.parse(raw);
         if (!snapshot || snapshot.queueKey !== activeQueueKey()) {
+            return false;
+        }
+        if (Number(snapshot.schemaVersion || 0) !== QUEUE_SNAPSHOT_SCHEMA_VERSION) {
+            clearQueueSnapshot();
             return false;
         }
         if ((Date.now() - Number(snapshot.savedAt || 0)) > QUEUE_SNAPSHOT_TTL_MS) {
@@ -323,10 +331,12 @@ function updateBufferStatus() {
         return;
     }
 
+    const pendingCount = readPendingLabels().length;
+    const pendingSuffix = pendingCount > 0 ? ` · ${pendingCount} Drive move${pendingCount === 1 ? '' : 's'} pending` : '';
     const localReady = localReadyCount();
     if (localReady > 0) {
         const warmingSuffix = warmingCount > 0 ? ` · warming ${warmingCount}` : '';
-        bufferStatusEl.textContent = `Ready buffer: ${localReady} triplets${warmingSuffix}`;
+        bufferStatusEl.textContent = `Ready buffer: ${localReady} triplets${warmingSuffix}${pendingSuffix}`;
         return;
     }
 
@@ -336,11 +346,11 @@ function updateBufferStatus() {
     }
 
     if (warmingCount > 0 || hasMore) {
-        bufferStatusEl.textContent = 'Warming next triplets from Drive...';
+        bufferStatusEl.textContent = `Warming next triplets from Drive...${pendingSuffix}`;
         return;
     }
 
-    bufferStatusEl.textContent = '';
+    bufferStatusEl.textContent = pendingSuffix ? pendingSuffix.slice(3) : '';
 }
 
 function updateProgress() {
@@ -378,6 +388,97 @@ function jsonPostHeaders() {
         headers['X-CSRF-Token'] = csrfToken;
     }
     return headers;
+}
+
+function readPendingLabels() {
+    try {
+        const raw = window.localStorage.getItem(PENDING_LABELS_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (_error) {
+        return [];
+    }
+}
+
+function writePendingLabels(pending) {
+    try {
+        window.localStorage.setItem(PENDING_LABELS_KEY, JSON.stringify(pending));
+    } catch (_error) {}
+}
+
+function pendingLabelKey(operation) {
+    return [
+        operation.source || '',
+        operation.site_key || '',
+        operation.folder_id || '',
+        operation.label || '',
+    ].join('|');
+}
+
+function enqueuePendingLabel(operation) {
+    const pending = readPendingLabels();
+    const key = pendingLabelKey(operation);
+    const next = pending.filter(item => pendingLabelKey(item) !== key);
+    next.push({
+        ...operation,
+        pending_key: key,
+        queued_at: Date.now(),
+        attempts: Number(operation.attempts || 0),
+    });
+    writePendingLabels(next);
+}
+
+function removePendingLabel(operation) {
+    const key = pendingLabelKey(operation);
+    writePendingLabels(readPendingLabels().filter(item => pendingLabelKey(item) !== key));
+}
+
+async function sendLabelOperation(operation, { keepalive = true } = {}) {
+    const res = await fetch('/api/label', {
+        method: 'POST',
+        headers: jsonPostHeaders(),
+        keepalive,
+        body: JSON.stringify({
+            folder_id: operation.folder_id,
+            parent_id: operation.parent_id,
+            label: operation.label,
+            source: operation.source,
+            site_key: operation.site_key,
+        }),
+    });
+    const data = await readApiJson(res, 'Label request');
+    if (res.ok && !data.error) {
+        removePendingLabel(operation);
+        updateBufferStatus();
+        return data;
+    }
+    if (res.status === 409 && data.code === 'already_labeled') {
+        removePendingLabel(operation);
+        updateBufferStatus();
+        return data;
+    }
+    throw new Error(data.error || `Move failed (${res.status})`);
+}
+
+function drainPendingLabels({ keepalive = false, limit = Infinity } = {}) {
+    const pending = readPendingLabels().slice(0, limit);
+    for (const operation of pending) {
+        const nextOperation = {
+            ...operation,
+            attempts: Number(operation.attempts || 0) + 1,
+            last_attempt_at: Date.now(),
+        };
+        enqueuePendingLabel(nextOperation);
+        sendLabelOperation(nextOperation, { keepalive }).catch(error => {
+            const stillPending = readPendingLabels();
+            const key = pendingLabelKey(nextOperation);
+            writePendingLabels(stillPending.map(item => (
+                pendingLabelKey(item) === key
+                    ? { ...item, last_error: error.message, attempts: nextOperation.attempts }
+                    : item
+            )));
+        });
+    }
 }
 
 async function fetchSources() {
@@ -841,6 +942,7 @@ async function init(forceRefresh = false) {
     }
 
     try {
+        drainPendingLabels({ keepalive: false });
         const restored = !forceRefresh && restoreQueueSnapshot();
         if (restored) {
             await renderCard();
@@ -888,6 +990,17 @@ async function labelCurrent(label) {
     const startedAt = performance.now();
     labeling = true;
     rememberSuppressedFolder(folder);
+    const operation = {
+        folder_id: folder.folder_id,
+        parent_id: folder.parent_id,
+        label: label,
+        source: folder.source,
+        site_key: folder.site_key,
+        queue_key: folder.queue_key,
+        folder_name: folder.folder_name,
+        frame_signature: frameSignature(folder),
+    };
+    enqueuePendingLabel(operation);
     folders.splice(currentIndex, 1);
     saveQueueSnapshot();
 
@@ -895,25 +1008,7 @@ async function labelCurrent(label) {
     renderCard();
 
     try {
-        const res = await fetch('/api/label', {
-            method: 'POST',
-            headers: jsonPostHeaders(),
-            body: JSON.stringify({
-                folder_id: folder.folder_id,
-                parent_id: folder.parent_id,
-                label: label,
-                source: folder.source,
-                site_key: folder.site_key,
-            }),
-        });
-        const data = await readApiJson(res, 'Label request');
-        if (!res.ok || data.error) {
-            if (res.status === 409 && data.code === 'already_labeled') {
-                refreshStats();
-                return;
-            }
-            throw new Error(data.error || `Move failed (${res.status})`);
-        }
+        await sendLabelOperation(operation, { keepalive: true });
         logTiming('labelCurrent', {
             ms: (performance.now() - startedAt).toFixed(1),
             label,
@@ -922,7 +1017,7 @@ async function labelCurrent(label) {
             queueKey: folder.queue_key,
         });
     } catch (e) {
-        showError(`Move failed for ${folder.folder_name}: ${e.message}`);
+        showError(`Move queued for retry: ${folder.folder_name}: ${e.message}`);
     } finally {
         labeling = false;
         warmBuffer();
@@ -972,6 +1067,24 @@ sourceModeEl?.addEventListener('change', () => {
 sourceSiteEl?.addEventListener('change', () => {
     activeSiteKey = sourceSiteEl.value || null;
     handleSourceChange();
+});
+
+window.addEventListener('pagehide', () => {
+    drainPendingLabels({
+        keepalive: true,
+        limit: PENDING_LABEL_KEEPALIVE_LIMIT,
+    });
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        drainPendingLabels({
+            keepalive: true,
+            limit: PENDING_LABEL_KEEPALIVE_LIMIT,
+        });
+    } else {
+        drainPendingLabels({ keepalive: false });
+    }
 });
 
 document.addEventListener('keydown', e => {
