@@ -21,7 +21,7 @@ let activeSource = 'video';
 let activeSiteKey = null;
 let activePendingLabel = 'unlabeled';
 let activeDisplayName = 'Video';
-let recentLabelUndo = null;
+let recentLabelUndos = [];
 let recentLabelUndoTimer = null;
 let stats = {
     unlabeled: 0,
@@ -1029,27 +1029,55 @@ function clearRecentLabelUndo() {
         window.clearInterval(recentLabelUndoTimer);
         recentLabelUndoTimer = null;
     }
-    recentLabelUndo = null;
+    recentLabelUndos = [];
     if (undoLabelEl) {
         undoLabelEl.style.display = 'none';
         undoLabelEl.innerHTML = '';
     }
 }
 
+function pruneRecentLabelUndos() {
+    const now = Date.now();
+    recentLabelUndos = recentLabelUndos.filter(item => item.expiresAt > now);
+}
+
+function latestRecentLabelUndo() {
+    pruneRecentLabelUndos();
+    return recentLabelUndos[recentLabelUndos.length - 1] || null;
+}
+
+function removeRecentLabelUndo(operation) {
+    const key = pendingLabelKey(operation);
+    recentLabelUndos = recentLabelUndos.filter(item => pendingLabelKey(item.operation) !== key);
+}
+
+function ensureRecentLabelUndoTimer() {
+    if (!recentLabelUndoTimer) {
+        recentLabelUndoTimer = window.setInterval(renderRecentLabelUndo, 1000);
+    }
+}
+
 function renderRecentLabelUndo() {
-    if (!undoLabelEl || !recentLabelUndo) return;
-    const remainingMs = recentLabelUndo.expiresAt - Date.now();
-    if (remainingMs <= 0) {
-        clearRecentLabelUndo();
+    if (!undoLabelEl) return;
+    const undoState = latestRecentLabelUndo();
+    if (!undoState) {
+        if (recentLabelUndoTimer) {
+            window.clearInterval(recentLabelUndoTimer);
+            recentLabelUndoTimer = null;
+        }
+        undoLabelEl.style.display = 'none';
+        undoLabelEl.innerHTML = '';
         return;
     }
+    const remainingMs = undoState.expiresAt - Date.now();
     const seconds = Math.max(1, Math.ceil(remainingMs / 1000));
-    const folderName = escapeHtml(recentLabelUndo.folder?.folder_name || 'triplet');
+    const folderName = escapeHtml(undoState.folder?.folder_name || 'triplet');
+    const countText = recentLabelUndos.length > 1 ? ` (${recentLabelUndos.length} recent)` : '';
     undoLabelEl.style.display = 'flex';
     undoLabelEl.innerHTML = `
-        <div class="undo-message">${escapeHtml(labelText(recentLabelUndo.operation.label))} queued for ${folderName}. ${seconds}s to change.</div>
+        <div class="undo-message">${escapeHtml(labelText(undoState.operation.label))} queued for ${folderName}. ${seconds}s to change${countText}.</div>
         <div class="undo-actions">
-            <button class="mini-btn" onclick="undoRecentLabel()">Undo</button>
+            <button class="mini-btn" onclick="undoRecentLabel()">Back</button>
             <button class="mini-btn" onclick="relabelRecent('occupied')">Occupied</button>
             <button class="mini-btn" onclick="relabelRecent('dirty')">Dirty</button>
             <button class="mini-btn" onclick="relabelRecent('clean')">Clean</button>
@@ -1059,21 +1087,22 @@ function renderRecentLabelUndo() {
 }
 
 function showRecentLabelUndo(folder, operation, response = {}) {
-    clearRecentLabelUndo();
     const undoExpires = response.undo_expires_at ? Date.parse(response.undo_expires_at) : NaN;
-    recentLabelUndo = {
+    removeRecentLabelUndo(operation);
+    recentLabelUndos.push({
         folder,
         operation: { ...operation },
         expiresAt: Number.isFinite(undoExpires) ? undoExpires : Date.now() + (LABEL_UNDO_SECONDS * 1000),
-    };
+    });
     renderRecentLabelUndo();
-    recentLabelUndoTimer = window.setInterval(renderRecentLabelUndo, 1000);
+    ensureRecentLabelUndoTimer();
 }
 
 async function undoRecentLabel() {
-    if (!recentLabelUndo) return;
-    const undoState = recentLabelUndo;
-    clearRecentLabelUndo();
+    const undoState = latestRecentLabelUndo();
+    if (!undoState) return;
+    removeRecentLabelUndo(undoState.operation);
+    renderRecentLabelUndo();
     try {
         await cancelLabelOperation(undoState.operation);
         forgetSuppressedFolder(undoState.folder);
@@ -1088,8 +1117,8 @@ async function undoRecentLabel() {
 }
 
 async function relabelRecent(nextLabel) {
-    if (!recentLabelUndo) return;
-    const undoState = recentLabelUndo;
+    const undoState = latestRecentLabelUndo();
+    if (!undoState) return;
     const previousLabel = undoState.operation.label;
     if (nextLabel === previousLabel) return;
     const nextOperation = {
@@ -1101,6 +1130,7 @@ async function relabelRecent(nextLabel) {
         const data = await sendLabelOperation(nextOperation, { keepalive: true });
         removePendingLabel(undoState.operation);
         replaceOptimisticLabel(previousLabel, nextLabel);
+        removeRecentLabelUndo(undoState.operation);
         showRecentLabelUndo(undoState.folder, nextOperation, data);
     } catch (e) {
         showError(`Could not change label: ${e.message}`);
@@ -1273,6 +1303,11 @@ document.addEventListener('visibilitychange', () => {
 });
 
 document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        undoRecentLabel();
+        return;
+    }
     if (folders.length === 0) return;
     if (e.key === '1') labelCurrent('occupied');
     else if (e.key === '2') labelCurrent('dirty');
