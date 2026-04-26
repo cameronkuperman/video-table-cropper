@@ -100,13 +100,16 @@ FLASK_SECRET_KEY=...
 LABEL_CACHE_DIR=/data/label_cache
 LABEL_CACHE_MAX_MB=20000
 LABEL_CACHE_TTL_HOURS=336
+PREPROCESS_STATE_DIR=/data/autolabeler
 LABEL_REOLINK_PREWARM_TARGET=5000
 LABEL_PREWARM_FOLDER_COUNT=60
 LABEL_READY_SCAN_MAX=180
 ```
 
 Mount a Railway volume on the web service at `/data` when using
-`LABEL_CACHE_DIR=/data/label_cache`.
+`LABEL_CACHE_DIR=/data/label_cache`. Label history, pending Drive label moves,
+and Reolink preprocess state live under `PREPROCESS_STATE_DIR`; on Railway that
+should be `/data/autolabeler`.
 
 To fill the persistent image cache after deploys or new queue generation:
 
@@ -115,12 +118,17 @@ curl -X POST https://YOUR_DEPLOYMENT/api/cache/warm
 curl https://YOUR_DEPLOYMENT/api/cache/warm/status
 curl https://YOUR_DEPLOYMENT/api/cache/status
 curl https://YOUR_DEPLOYMENT/api/cache/status?scan=1
+curl https://YOUR_DEPLOYMENT/api/label/jobs/status
 ```
 
 The warmer walks the current unlabeled queues, downloads each missing Drive
 frame once, writes `{file_id}.jpg` plus `{file_id}.thumb.jpg` into
 `LABEL_CACHE_DIR`, and skips files already present on the volume. If it needs
 to be stopped, call `POST /api/cache/warm/cancel`.
+
+Label clicks are recorded to the volume first, then pushed to Drive by a
+background worker. Use `/api/label/jobs/status` to confirm pending jobs are
+draining after a deploy or browser close.
 
 The default web start command is:
 

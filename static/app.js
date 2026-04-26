@@ -5,6 +5,7 @@ let currentIndex = 0;
 let labeling = false;
 let suppressedFolderIds = new Set();
 let suppressedFrameSignatures = new Set();
+let suppressedContentSignatures = new Set();
 let hasMore = true;
 let queueRequest = null;
 let renderToken = 0;
@@ -35,7 +36,7 @@ const WARM_BUFFER_SIZE = 144;
 const LOW_WATERMARK = 160;
 const TIMING_LOGS_ENABLED = true;
 const QUEUE_SNAPSHOT_PREFIX = 'autolabeler.queueSnapshot.';
-const QUEUE_SNAPSHOT_SCHEMA_VERSION = 2;
+const QUEUE_SNAPSHOT_SCHEMA_VERSION = 3;
 const QUEUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
 const QUEUE_SNAPSHOT_MAX_FOLDERS = 300;
 const SUPPRESSED_QUEUE_MAX = 1000;
@@ -115,27 +116,40 @@ function frameSignature(folder) {
         .join('|');
 }
 
+function contentSignature(folder) {
+    return String(folder?.content_signature || '');
+}
+
 function isSuppressedFolder(folder) {
     const folderId = String(folder?.folder_id || '');
     const signature = frameSignature(folder);
+    const content = contentSignature(folder);
     return (folderId && suppressedFolderIds.has(folderId))
-        || (signature && suppressedFrameSignatures.has(signature));
+        || (signature && suppressedFrameSignatures.has(signature))
+        || (content && suppressedContentSignatures.has(content));
 }
 
 function rememberSuppressedFolder(folder) {
     const folderId = String(folder?.folder_id || '');
     const signature = frameSignature(folder);
+    const content = contentSignature(folder);
     if (folderId) {
         suppressedFolderIds.add(folderId);
     }
     if (signature) {
         suppressedFrameSignatures.add(signature);
     }
+    if (content) {
+        suppressedContentSignatures.add(content);
+    }
     while (suppressedFolderIds.size > SUPPRESSED_QUEUE_MAX) {
         suppressedFolderIds.delete(suppressedFolderIds.values().next().value);
     }
     while (suppressedFrameSignatures.size > SUPPRESSED_QUEUE_MAX) {
         suppressedFrameSignatures.delete(suppressedFrameSignatures.values().next().value);
+    }
+    while (suppressedContentSignatures.size > SUPPRESSED_QUEUE_MAX) {
+        suppressedContentSignatures.delete(suppressedContentSignatures.values().next().value);
     }
 }
 
@@ -172,6 +186,7 @@ function saveQueueSnapshot() {
                 stats,
                 suppressedFolderIds: Array.from(suppressedFolderIds).slice(-SUPPRESSED_QUEUE_MAX),
                 suppressedFrameSignatures: Array.from(suppressedFrameSignatures).slice(-SUPPRESSED_QUEUE_MAX),
+                suppressedContentSignatures: Array.from(suppressedContentSignatures).slice(-SUPPRESSED_QUEUE_MAX),
             }),
         );
     } catch (_error) {}
@@ -213,6 +228,7 @@ function restoreQueueSnapshot() {
         warmingCount = Number(snapshot.warmingCount || 0);
         suppressedFolderIds = new Set((snapshot.suppressedFolderIds || []).map(String));
         suppressedFrameSignatures = new Set((snapshot.suppressedFrameSignatures || []).map(String));
+        suppressedContentSignatures = new Set((snapshot.suppressedContentSignatures || []).map(String));
         activeDisplayName = snapshot.displayName || activeDisplayName;
         activePendingLabel = snapshot.pendingLabel || activePendingLabel;
         if (snapshot.stats) {
@@ -444,6 +460,10 @@ async function sendLabelOperation(operation, { keepalive = true } = {}) {
             label: operation.label,
             source: operation.source,
             site_key: operation.site_key,
+            folder_name: operation.folder_name,
+            frames: operation.frames,
+            frame_signature: operation.frame_signature,
+            content_signature: operation.content_signature,
         }),
     });
     const data = await readApiJson(res, 'Label request');
@@ -511,6 +531,7 @@ async function fetchQueue({
                 folders = [];
                 suppressedFolderIds = new Set();
                 suppressedFrameSignatures = new Set();
+                suppressedContentSignatures = new Set();
                 currentIndex = 0;
                 hasMore = true;
                 queueRequest = null;
@@ -585,18 +606,24 @@ async function fetchQueue({
 
             const existingIds = new Set(folders.map(folder => folder.folder_id));
             const existingSignatures = new Set(folders.map(frameSignature).filter(Boolean));
+            const existingContentSignatures = new Set(folders.map(contentSignature).filter(Boolean));
             let added = 0;
             for (const folder of data.folders || []) {
                 const signature = frameSignature(folder);
+                const content = contentSignature(folder);
                 if (
                     !isSuppressedFolder(folder)
                     && !existingIds.has(folder.folder_id)
                     && (!signature || !existingSignatures.has(signature))
+                    && (!content || !existingContentSignatures.has(content))
                 ) {
                     folders.push(folder);
                     existingIds.add(folder.folder_id);
                     if (signature) {
                         existingSignatures.add(signature);
+                    }
+                    if (content) {
+                        existingContentSignatures.add(content);
                     }
                     added += 1;
                 }
@@ -998,7 +1025,9 @@ async function labelCurrent(label) {
         site_key: folder.site_key,
         queue_key: folder.queue_key,
         folder_name: folder.folder_name,
+        frames: folder.frames || {},
         frame_signature: frameSignature(folder),
+        content_signature: contentSignature(folder),
     };
     enqueuePendingLabel(operation);
     folders.splice(currentIndex, 1);

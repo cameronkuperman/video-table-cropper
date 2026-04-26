@@ -275,10 +275,11 @@ def _fake_prepare_reolink_unlabeled_queue(fake: FakeDriveClient, context, target
 
 
 @pytest.fixture()
-def fake_drive(monkeypatch):
+def fake_drive(monkeypatch, tmp_path):
     fake = FakeDriveClient()
 
     monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(label_app, "DriveClient", lambda: fake)
     monkeypatch.setattr(label_app, "get_client", lambda: fake)
     monkeypatch.setattr(
@@ -302,6 +303,7 @@ def fake_drive(monkeypatch):
         ),
     )
     monkeypatch.setattr(label_app, "_maybe_trigger_video_preprocess", lambda context, unlabeled_count: None)
+    monkeypatch.setattr(label_app, "_schedule_label_job_worker", lambda: False)
 
     label_app._source_folder_ids_cache.clear()
     label_app._listing_cache.clear()
@@ -313,6 +315,24 @@ def fake_drive(monkeypatch):
     label_app._crop_config_cache.clear()
 
     return fake
+
+
+def _drain_label_jobs(fake_drive: FakeDriveClient) -> int:
+    return label_app._drain_label_jobs_once(fake_drive)
+
+
+def _label_payload(folder: dict, label: str) -> dict:
+    return {
+        "folder_id": folder["folder_id"],
+        "parent_id": folder["parent_id"],
+        "label": label,
+        "source": folder["source"],
+        "site_key": folder["site_key"],
+        "folder_name": folder.get("folder_name"),
+        "frames": folder.get("frames"),
+        "frame_signature": folder.get("frame_signature"),
+        "content_signature": folder.get("content_signature"),
+    }
 
 
 @pytest.fixture()
@@ -553,16 +573,12 @@ def test_reolink_label_moves_folder_within_same_site_tree(client, fake_drive):
 
     label_response = client.post(
         "/api/label",
-        json={
-            "folder_id": folder["folder_id"],
-            "parent_id": folder["parent_id"],
-            "label": "clean",
-            "source": folder["source"],
-            "site_key": folder["site_key"],
-        },
+        json=_label_payload(folder, "clean"),
     )
 
     assert label_response.status_code == 200
+    assert label_response.get_json()["queued"] is True
+    _drain_label_jobs(fake_drive)
     shared_clean_id = fake_drive.find_file_by_name(
         "project-root",
         "clean",
@@ -614,16 +630,11 @@ def test_label_discarded_route(client, fake_drive):
 
     discarded_response = client.post(
         "/api/label",
-        json={
-            "folder_id": folder["folder_id"],
-            "parent_id": folder["parent_id"],
-            "label": "discarded",
-            "source": folder["source"],
-            "site_key": folder["site_key"],
-        },
+        json=_label_payload(folder, "discarded"),
     )
 
     assert discarded_response.status_code == 200
+    _drain_label_jobs(fake_drive)
     discarded_dest = fake_drive.find_file_by_name(
         "project-root", "discarded", mime_type=label_app.FOLDER_MIME
     )
@@ -637,16 +648,11 @@ def test_mimosas_photos_label_routes_to_shared_clean(client, fake_drive):
 
     label_response = client.post(
         "/api/label",
-        json={
-            "folder_id": folder["folder_id"],
-            "parent_id": folder["parent_id"],
-            "label": "clean",
-            "source": folder["source"],
-            "site_key": folder["site_key"],
-        },
+        json=_label_payload(folder, "clean"),
     )
 
     assert label_response.status_code == 200
+    _drain_label_jobs(fake_drive)
     shared_clean = fake_drive.find_file_by_name(
         "project-root", "clean", mime_type=label_app.FOLDER_MIME
     )
@@ -680,18 +686,13 @@ def test_label_route_rejects_unknown_label(client):
 def test_label_stamps_metadata_and_rejects_stale_second_move(client, fake_drive):
     queue_response = client.get("/api/queue?source=video&limit=10")
     folder = queue_response.get_json()["folders"][0]
-    payload = {
-        "folder_id": folder["folder_id"],
-        "parent_id": folder["parent_id"],
-        "label": "dirty",
-        "source": folder["source"],
-        "site_key": folder["site_key"],
-    }
+    payload = _label_payload(folder, "dirty")
 
     first_response = client.post("/api/label", json=payload)
     second_response = client.post("/api/label", json=payload)
 
     assert first_response.status_code == 200
+    _drain_label_jobs(fake_drive)
     folder_item = fake_drive.items[folder["folder_id"]]
     assert folder_item["appProperties"]["autolabel_final_label"] == "dirty"
     assert folder_item["appProperties"]["autolabel_source"] == "video"
@@ -701,6 +702,60 @@ def test_label_stamps_metadata_and_rejects_stale_second_move(client, fake_drive)
     assert second_response.get_json()["code"] == "already_labeled"
 
 
+def test_label_route_records_durable_job_before_drive_move(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+
+    response = client.post("/api/label", json=_label_payload(folder, "clean"))
+
+    assert response.status_code == 200
+    assert response.get_json()["queued"] is True
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-unlabeled"]
+    history = json.loads(label_app._label_history_path().read_text(encoding="utf-8"))
+    assert "frames:video-frame0|video-frame1|video-frame2" in history["queues"]["video"]["labeled"]
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    job = jobs["jobs"]["video:video-triplet"]
+    assert job["status"] == "pending"
+    assert job["label"] == "clean"
+
+
+def test_label_job_status_is_lightweight(client, fake_drive):
+    response = client.get("/api/label/jobs/status")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["writable"] is True
+    assert payload["counts"]["pending"] == 0
+    assert str(label_app._label_jobs_path()) == payload["path"]
+
+
+def test_labeled_content_signature_never_returns_to_queue(client, fake_drive, monkeypatch):
+    monkeypatch.setattr(label_app, "_content_signature_from_frames", lambda frames: "same-thumb-content")
+    queue_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    folder = queue_response.get_json()["folders"][0]
+    payload = _label_payload(folder, "clean")
+
+    label_response = client.post("/api/label", json=payload)
+    assert label_response.status_code == 200
+
+    fake_drive._add_folder("video-triplet-visual-rerun", "different_name_same_pixels", "video-unlabeled")
+    fake_drive.update_file_metadata(
+        "video-triplet-visual-rerun",
+        {
+            "appProperties": label_app.build_folder_app_properties(
+                {
+                    "frame_0": "new-frame0",
+                    "frame_1": "new-frame1",
+                    "frame_2": "new-frame2",
+                }
+            )
+        },
+    )
+
+    repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    assert repeat_response.get_json()["folders"] == []
+
+
 def test_labeled_frame_signature_never_returns_to_queue_across_sessions(client, fake_drive, tmp_path, monkeypatch):
     monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
     queue_response = client.get("/api/queue?source=video&limit=10&refresh=1")
@@ -708,13 +763,7 @@ def test_labeled_frame_signature_never_returns_to_queue_across_sessions(client, 
 
     label_response = client.post(
         "/api/label",
-        json={
-            "folder_id": folder["folder_id"],
-            "parent_id": folder["parent_id"],
-            "label": "clean",
-            "source": folder["source"],
-            "site_key": folder["site_key"],
-        },
+        json=_label_payload(folder, "clean"),
     )
     assert label_response.status_code == 200
 
@@ -1010,7 +1059,8 @@ def test_reolink_preprocess_records_raw_folder_in_local_state_and_skips_rerun(mo
     record = state["reolink_processed"]["restaurant-pi-1:r-ready"]
     assert record["status"] == "complete"
     assert record["generated"] == first_count
-    assert fake.items["r-ready"]["appProperties"] == {}
+    assert fake.items["r-ready"]["appProperties"]["autolabel_preprocess_status"] == "complete"
+    assert fake.items["r-ready"]["appProperties"]["autolabel_preprocess_site_key"] == "restaurant-pi-1"
     assert fake.items["r-ready"]["parents"] == ["site-restaurant:processed_raw"]
 
 
@@ -1048,6 +1098,7 @@ def test_reolink_preprocess_skips_raw_folder_already_in_local_state(monkeypatch,
     )
 
     assert generated == 0
+    assert fake.items["r-ready"]["appProperties"]["autolabel_preprocess_status"] == "complete"
 
 
 def test_reolink_preprocess_records_existing_drive_folders_in_local_state(monkeypatch, tmp_path):
@@ -1098,6 +1149,7 @@ def test_reolink_preprocess_failed_materialization_does_not_mark_state(monkeypat
         )
 
     assert not (tmp_path / label_app.PREPROCESS_STATE_FILE_NAME).exists()
+    assert fake.items["r-ready"]["appProperties"]["autolabel_preprocess_status"] == "in_progress"
     assert fake.items["r-ready"]["parents"] == ["r-unassociated"]
 
 

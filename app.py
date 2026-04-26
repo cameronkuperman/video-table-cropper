@@ -6,6 +6,7 @@ shows 3 images per folder, and moves the folder on Drive when labeled.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -119,6 +120,10 @@ PREPROCESS_STATE_SCHEMA_VERSION = 1
 PREPROCESS_STATE_FILE_NAME = "preprocess_state.json"
 LABEL_HISTORY_SCHEMA_VERSION = 1
 LABEL_HISTORY_FILE_NAME = "label_history.json"
+LABEL_JOBS_SCHEMA_VERSION = 1
+LABEL_JOBS_FILE_NAME = "label_jobs.json"
+LABEL_JOB_ERROR_LIMIT = max(1, int(os.environ.get("LABEL_JOB_ERROR_LIMIT", "25") or "25"))
+LABEL_JOB_MAX_ATTEMPTS = max(1, int(os.environ.get("LABEL_JOB_MAX_ATTEMPTS", "100") or "100"))
 PROCESSED_RAW_RETENTION_DAYS = max(
     1, int(os.environ.get("PROCESSED_RAW_RETENTION_DAYS", "14") or "14")
 )
@@ -321,6 +326,9 @@ _source_folder_ids_lock = Lock()
 _cache_cleanup_lock = Lock()
 _last_cache_cleanup_monotonic = 0.0
 _label_history_lock = Lock()
+_label_jobs_lock = Lock()
+_label_job_worker_lock = Lock()
+_label_job_worker_inflight = False
 _listing_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
 _listing_lock = Lock()
 _listing_refresh_executor = ThreadPoolExecutor(max_workers=1)
@@ -329,6 +337,7 @@ _preview_prewarm_executor = ThreadPoolExecutor(max_workers=PREVIEW_PREWARM_MAX_W
 _preview_prewarm_inflight: set[str] = set()
 _preview_prewarm_lock = Lock()
 _cache_warm_executor = ThreadPoolExecutor(max_workers=1)
+_label_job_executor = ThreadPoolExecutor(max_workers=1)
 _cache_warm_lock = Lock()
 _cache_warm_state: dict[str, Any] = {
     "inflight": False,
@@ -353,6 +362,9 @@ _cache_warm_state: dict[str, Any] = {
 _folder_prewarm_executor = ThreadPoolExecutor(max_workers=FOLDER_PREWARM_MAX_WORKERS)
 _folder_prewarm_inflight: set[tuple[str, str]] = set()
 _folder_prewarm_lock = Lock()
+_duplicate_cleanup_executor = ThreadPoolExecutor(max_workers=1)
+_duplicate_cleanup_inflight: set[tuple[str, str]] = set()
+_duplicate_cleanup_lock = Lock()
 _hydrated_folder_cache: dict[tuple[str, str], tuple[float, dict | None]] = {}
 _hydrated_folder_cache_lock = Lock()
 _reolink_generation_lock = Lock()
@@ -1003,6 +1015,42 @@ def _move_reolink_raw_to_processed(
     raw_folder["parents"] = [processed_id]
 
 
+def _reolink_raw_drive_preprocess_status(raw_folder: dict[str, Any]) -> str:
+    return str((raw_folder.get("appProperties") or {}).get("autolabel_preprocess_status") or "")
+
+
+def _stamp_reolink_raw_preprocess_status(
+    client: DriveClient,
+    context: QueueContext,
+    raw_folder: dict[str, Any],
+    *,
+    status: str,
+    generated: int = 0,
+    reason: str = "",
+) -> None:
+    metadata = dict(raw_folder.get("appProperties") or {})
+    metadata.update(
+        {
+            "autolabel_preprocess_status": status,
+            "autolabel_preprocess_site_key": context.site_key or "",
+            "autolabel_preprocess_queue_key": context.queue_key,
+            "autolabel_preprocess_generated": str(int(generated)),
+            "autolabel_preprocess_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    if reason:
+        metadata["autolabel_preprocess_reason"] = reason[:1200]
+    try:
+        updated = client.update_file_metadata(
+            str(raw_folder["id"]),
+            {"appProperties": metadata},
+            fields="id,name,mimeType,parents,appProperties",
+        )
+        raw_folder["appProperties"] = dict(updated.get("appProperties") or metadata)
+    except DriveClientError:
+        return
+
+
 def _preprocess_state_dir() -> Path:
     configured = os.environ.get("PREPROCESS_STATE_DIR", "").strip()
     if configured:
@@ -1020,10 +1068,21 @@ def _label_history_path() -> Path:
     return _preprocess_state_dir() / LABEL_HISTORY_FILE_NAME
 
 
+def _label_jobs_path() -> Path:
+    return _preprocess_state_dir() / LABEL_JOBS_FILE_NAME
+
+
 def _label_history_empty() -> dict[str, Any]:
     return {
         "schema_version": LABEL_HISTORY_SCHEMA_VERSION,
         "queues": {},
+    }
+
+
+def _label_jobs_empty() -> dict[str, Any]:
+    return {
+        "schema_version": LABEL_JOBS_SCHEMA_VERSION,
+        "jobs": {},
     }
 
 
@@ -1062,18 +1121,39 @@ def _frame_signature_from_frames(frames: dict[str, str | None]) -> str:
     return "|".join(str(frames.get(key) or "") for key in ("frame_0", "frame_1", "frame_2"))
 
 
+def _content_signature_from_frames(frames: dict[str, str | None]) -> str:
+    parts: list[str] = []
+    for key in ("frame_0", "frame_1", "frame_2"):
+        file_id = frames.get(key)
+        if not file_id:
+            return ""
+        thumb_path = _thumb_path_for_file(str(file_id))
+        if not thumb_path.exists():
+            return ""
+        try:
+            digest = hashlib.sha256(thumb_path.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+        parts.append(digest)
+    return "|".join(parts)
+
+
 def _label_history_keys(
     context: QueueContext,
     folder_id: str,
     folder_name: str,
     frame_signature: str,
+    content_signature: str = "",
 ) -> list[str]:
-    keys = [
-        f"id:{folder_id}",
-        f"name:{folder_name}",
-    ]
+    keys = []
+    if folder_id:
+        keys.append(f"id:{folder_id}")
+    if folder_name:
+        keys.append(f"name:{folder_name}")
     if frame_signature:
         keys.append(f"frames:{frame_signature}")
+    if content_signature:
+        keys.append(f"thumbs:{content_signature}")
     return keys
 
 
@@ -1089,12 +1169,18 @@ def _label_history_queue(history: dict[str, Any], queue_key: str) -> dict[str, A
     return queue
 
 
-def _label_history_lookup(context: QueueContext, folder_id: str, folder_name: str, frame_signature: str) -> dict[str, Any] | None:
+def _label_history_lookup(
+    context: QueueContext,
+    folder_id: str,
+    folder_name: str,
+    frame_signature: str,
+    content_signature: str = "",
+) -> dict[str, Any] | None:
     with _label_history_lock:
         history = _load_label_history_unlocked()
         queue = (history.get("queues") or {}).get(context.queue_key) or {}
         labeled = queue.get("labeled") or {}
-        for key in _label_history_keys(context, folder_id, folder_name, frame_signature):
+        for key in _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature):
             record = labeled.get(key)
             if isinstance(record, dict):
                 return record
@@ -1107,12 +1193,14 @@ def _record_label_history(
     folder_name: str,
     frame_signature: str,
     label: str,
+    content_signature: str = "",
 ) -> None:
     record = {
         "label": label,
         "folder_id": folder_id,
         "folder_name": folder_name,
         "frame_signature": frame_signature,
+        "content_signature": content_signature,
         "queue_key": context.queue_key,
         "source": context.source,
         "site_key": context.site_key,
@@ -1123,9 +1211,242 @@ def _record_label_history(
         history = _load_label_history_unlocked()
         queue = _label_history_queue(history, context.queue_key)
         labeled = queue.setdefault("labeled", {})
-        for key in _label_history_keys(context, folder_id, folder_name, frame_signature):
+        for key in _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature):
             labeled[key] = record
         _save_label_history_unlocked(history)
+
+
+def _load_label_jobs_unlocked() -> dict[str, Any]:
+    path = _label_jobs_path()
+    if not path.exists():
+        return _label_jobs_empty()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _label_jobs_empty()
+    if not isinstance(data, dict):
+        return _label_jobs_empty()
+    jobs = data.get("jobs")
+    if not isinstance(jobs, dict):
+        jobs = {}
+    return {
+        "schema_version": LABEL_JOBS_SCHEMA_VERSION,
+        "jobs": jobs,
+    }
+
+
+def _save_label_jobs_unlocked(state: dict[str, Any]) -> None:
+    path = _label_jobs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": LABEL_JOBS_SCHEMA_VERSION,
+        "jobs": state.get("jobs") or {},
+    }
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _label_job_key(context: QueueContext, folder_id: str) -> str:
+    return f"{context.queue_key}:{folder_id}"
+
+
+def _enqueue_label_job(
+    context: QueueContext,
+    *,
+    folder_id: str,
+    parent_id: str,
+    folder_name: str,
+    frames: dict[str, str | None],
+    frame_signature: str,
+    content_signature: str,
+    label: str,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    job_id = _label_job_key(context, folder_id)
+    with _label_jobs_lock:
+        state = _load_label_jobs_unlocked()
+        jobs = state.setdefault("jobs", {})
+        existing = jobs.get(job_id)
+        if isinstance(existing, dict) and existing.get("status") in {"pending", "processing", "succeeded"}:
+            return dict(existing)
+        existing_job = existing if isinstance(existing, dict) else {}
+        job = {
+            "id": job_id,
+            "status": "pending",
+            "attempts": int(existing_job.get("attempts") or 0),
+            "folder_id": folder_id,
+            "parent_id": parent_id,
+            "folder_name": folder_name,
+            "frames": frames,
+            "frame_signature": frame_signature,
+            "content_signature": content_signature,
+            "label": label,
+            "source": context.source,
+            "site_key": context.site_key,
+            "queue_key": context.queue_key,
+            "created_at": existing_job.get("created_at", now),
+            "updated_at": now,
+            "last_error": None,
+        }
+        jobs[job_id] = job
+        _save_label_jobs_unlocked(state)
+        return dict(job)
+
+
+def _label_jobs_status_payload() -> dict[str, Any]:
+    with _label_jobs_lock:
+        state = _load_label_jobs_unlocked()
+        jobs = [job for job in (state.get("jobs") or {}).values() if isinstance(job, dict)]
+
+    counts = {"pending": 0, "processing": 0, "succeeded": 0, "failed": 0}
+    recent_errors: list[dict[str, Any]] = []
+    last_success_at = None
+    for job in jobs:
+        status = str(job.get("status") or "pending")
+        if status not in counts:
+            status = "pending"
+        counts[status] += 1
+        if status == "succeeded":
+            updated_at = job.get("updated_at")
+            if isinstance(updated_at, str) and (last_success_at is None or updated_at > last_success_at):
+                last_success_at = updated_at
+        if job.get("last_error") and len(recent_errors) < LABEL_JOB_ERROR_LIMIT:
+            recent_errors.append(
+                {
+                    "id": job.get("id"),
+                    "folder_name": job.get("folder_name"),
+                    "attempts": job.get("attempts"),
+                    "error": job.get("last_error"),
+                }
+            )
+
+    path = _label_jobs_path()
+    writable = False
+    error = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        probe = path.parent / ".label_jobs_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        writable = True
+    except OSError as exc:
+        error = str(exc)
+
+    return {
+        "path": str(path),
+        "writable": writable,
+        "inflight": _label_job_worker_inflight,
+        "counts": counts,
+        "last_success_at": last_success_at,
+        "recent_errors": recent_errors,
+        "error": error,
+    }
+
+
+def _claim_next_label_job_unlocked(state: dict[str, Any]) -> dict[str, Any] | None:
+    now = datetime.now(timezone.utc).isoformat()
+    jobs = state.setdefault("jobs", {})
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        status = str(job.get("status") or "pending")
+        attempts = int(job.get("attempts") or 0)
+        if status == "pending" or (status == "failed" and attempts < LABEL_JOB_MAX_ATTEMPTS):
+            job["status"] = "processing"
+            job["attempts"] = attempts + 1
+            job["updated_at"] = now
+            _save_label_jobs_unlocked(state)
+            return dict(job)
+    return None
+
+
+def _finish_label_job(job_id: str, *, status: str, error: str | None = None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _label_jobs_lock:
+        state = _load_label_jobs_unlocked()
+        job = (state.get("jobs") or {}).get(job_id)
+        if not isinstance(job, dict):
+            return
+        attempts = int(job.get("attempts") or 0)
+        job["status"] = status
+        job["updated_at"] = now
+        job["last_error"] = error
+        if error and attempts >= LABEL_JOB_MAX_ATTEMPTS:
+            job["status"] = "failed"
+        elif error:
+            job["status"] = "pending"
+        _save_label_jobs_unlocked(state)
+
+
+def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
+    source = str(job.get("source") or VIDEO_SOURCE)
+    site_key = str(job.get("site_key") or "").strip() or None
+    context = _resolve_queue_context(client, source, site_key)
+    folder_id = str(job.get("folder_id") or "")
+    parent_id = str(job.get("parent_id") or "")
+    label = str(job.get("label") or "").lower()
+    if not folder_id or not parent_id or label not in LABEL_DESTINATIONS:
+        raise ValueError("label job is missing folder_id, parent_id, or label")
+    if parent_id != context.input_folder_id:
+        raise ValueError("label job parent_id does not match the active queue")
+
+    current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+    current_parents = [str(parent) for parent in current.get("parents", []) if parent]
+    if context.input_folder_id not in current_parents:
+        return
+
+    label_metadata = dict(current.get("appProperties") or {})
+    if str(label_metadata.get("autolabel_final_label") or ""):
+        return
+    label_metadata.update(_label_app_properties(label, context))
+    client.update_file_metadata(
+        folder_id,
+        {"appProperties": label_metadata},
+        fields="id,name,mimeType,parents,appProperties",
+    )
+    client.move_file(folder_id, new_parent_id=context.folder_ids[label], remove_parent_id=parent_id)
+    with _hydrated_folder_cache_lock:
+        _hydrated_folder_cache.pop(_hydrated_cache_key(context.queue_key, folder_id), None)
+    _remove_folder_from_listing_cache(context.queue_key, folder_id)
+
+
+def _drain_label_jobs_once(client: DriveClient | None = None) -> int:
+    active_client = client or DriveClient()
+    processed = 0
+    while True:
+        with _label_jobs_lock:
+            state = _load_label_jobs_unlocked()
+            job = _claim_next_label_job_unlocked(state)
+        if job is None:
+            return processed
+        job_id = str(job.get("id") or "")
+        try:
+            _push_label_job_to_drive(active_client, job)
+        except Exception as exc:
+            _finish_label_job(job_id, status="pending", error=str(exc))
+            return processed
+        _finish_label_job(job_id, status="succeeded")
+        processed += 1
+
+
+def _run_label_job_worker() -> None:
+    global _label_job_worker_inflight
+    try:
+        _drain_label_jobs_once()
+    finally:
+        with _label_job_worker_lock:
+            _label_job_worker_inflight = False
+
+
+def _schedule_label_job_worker() -> bool:
+    global _label_job_worker_inflight
+    with _label_job_worker_lock:
+        if _label_job_worker_inflight:
+            return False
+        _label_job_worker_inflight = True
+    _label_job_executor.submit(_run_label_job_worker)
+    return True
 
 
 def _load_preprocess_state() -> dict[str, Any]:
@@ -1186,9 +1507,11 @@ def _reolink_raw_folder_processed(
     raw_folder: dict[str, Any],
 ) -> bool:
     processed = state.get("reolink_processed") or {}
+    drive_status = _reolink_raw_drive_preprocess_status(raw_folder)
     return (
         _reolink_state_key(context, raw_folder) in processed
         or _reolink_state_name_key(context, raw_folder) in processed
+        or drive_status == "complete"
     )
 
 
@@ -1516,6 +1839,13 @@ def _prepare_reolink_unlabeled_queue(
                 break
 
             if _reolink_raw_folder_processed(preprocess_state, context, raw_folder):
+                if _reolink_raw_drive_preprocess_status(raw_folder) != "complete":
+                    _stamp_reolink_raw_preprocess_status(
+                        client,
+                        context,
+                        raw_folder,
+                        status="complete",
+                    )
                 _move_reolink_raw_to_processed(client, context, raw_folder)
                 continue
 
@@ -1549,9 +1879,22 @@ def _prepare_reolink_unlabeled_queue(
                     status="complete",
                     generated=0,
                 )
+                _stamp_reolink_raw_preprocess_status(
+                    client,
+                    context,
+                    raw_folder,
+                    status="complete",
+                    generated=0,
+                )
                 _move_reolink_raw_to_processed(client, context, raw_folder)
                 continue
 
+            _stamp_reolink_raw_preprocess_status(
+                client,
+                context,
+                raw_folder,
+                status="in_progress",
+            )
             generated_names = _materialize_reolink_table_crops(
                 client,
                 context,
@@ -1570,6 +1913,13 @@ def _prepare_reolink_unlabeled_queue(
             if raw_generated_count > 0:
                 _mark_reolink_raw_folder_processed(
                     preprocess_state,
+                    context,
+                    raw_folder,
+                    status="complete",
+                    generated=raw_generated_count,
+                )
+                _stamp_reolink_raw_preprocess_status(
+                    client,
                     context,
                     raw_folder,
                     status="complete",
@@ -1755,6 +2105,7 @@ def _build_folder_payload(
     frames: dict[str, str | None],
 ) -> dict:
     frame_signature = _frame_signature_from_frames(frames)
+    content_signature = _content_signature_from_frames(frames)
     preview_urls = {
         key: f"/api/preview/{file_id}"
         for key, file_id in frames.items()
@@ -1774,6 +2125,7 @@ def _build_folder_payload(
         "queue_key": context.queue_key,
         "frames": frames,
         "frame_signature": frame_signature,
+        "content_signature": content_signature,
         "preview_urls": preview_urls,
         "thumb_urls": thumb_urls,
         "cache_ready": _thumbs_cache_ready(frames),
@@ -1945,6 +2297,43 @@ def _schedule_preview_prewarm(hydrated_folders: list[dict]) -> int:
             _preview_prewarm_executor.submit(_warm_thumb, file_id)
             scheduled += 1
     return scheduled
+
+
+def _cleanup_hidden_folder(context: QueueContext, folder_id: str) -> None:
+    try:
+        client = DriveClient()
+        current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+        parents = [str(parent) for parent in current.get("parents", []) if parent]
+        if context.input_folder_id not in parents:
+            return
+        metadata = dict(current.get("appProperties") or {})
+        metadata.setdefault("autolabel_duplicate_cleanup", datetime.now(timezone.utc).isoformat())
+        client.update_file_metadata(
+            folder_id,
+            {"appProperties": metadata},
+            fields="id,name,mimeType,parents,appProperties",
+        )
+        client.move_file(
+            folder_id,
+            new_parent_id=context.folder_ids["discarded"],
+            remove_parent_id=context.input_folder_id,
+        )
+        _remove_folder_from_listing_cache(context.queue_key, folder_id)
+    except Exception:
+        return
+    finally:
+        with _duplicate_cleanup_lock:
+            _duplicate_cleanup_inflight.discard((context.queue_key, folder_id))
+
+
+def _schedule_hidden_folder_cleanup(context: QueueContext, folder_id: str) -> bool:
+    key = (context.queue_key, folder_id)
+    with _duplicate_cleanup_lock:
+        if key in _duplicate_cleanup_inflight:
+            return False
+        _duplicate_cleanup_inflight.add(key)
+    _duplicate_cleanup_executor.submit(_cleanup_hidden_folder, context, folder_id)
+    return True
 
 
 def _cache_warm_state_snapshot() -> dict[str, Any]:
@@ -2276,13 +2665,16 @@ def _collect_ready_folders(
             if signature and signature in seen_signatures:
                 duplicate_signatures += 1
                 continue
-            if _label_history_lookup(
+            history_record = _label_history_lookup(
                 context,
                 str(payload.get("folder_id") or ""),
                 str(payload.get("folder_name") or ""),
                 signature,
-            ):
+                str(payload.get("content_signature") or ""),
+            )
+            if history_record:
                 hidden_labeled += 1
+                _schedule_hidden_folder_cleanup(context, str(payload.get("folder_id") or ""))
                 continue
             if signature:
                 seen_signatures.add(signature)
@@ -2868,6 +3260,7 @@ def api_cache_status():
     configured_cache = os.environ.get("LABEL_CACHE_DIR", "").strip()
     uses_temp_cache = str(resolved_cache_dir).startswith(str(temp_root))
     expected_volume_path = "/data/label_cache"
+    preprocess_dir = _preprocess_state_dir()
     production_warning = None
     if railway_env and not str(resolved_cache_dir).startswith("/data/"):
         production_warning = "Railway cache is not under /data; cached images may not survive redeploys."
@@ -2880,6 +3273,10 @@ def api_cache_status():
             "writable": writable,
             "configured_cache_dir": configured_cache or None,
             "expected_volume_cache_dir": expected_volume_path,
+            "preprocess_state_dir": str(preprocess_dir),
+            "label_history_path": str(_label_history_path()),
+            "label_jobs_path": str(_label_jobs_path()),
+            "label_jobs": _label_jobs_status_payload(),
             "railway_environment": railway_env,
             "uses_temp_cache": uses_temp_cache,
             "cache_max_mb": CACHE_MAX_MB,
@@ -2925,6 +3322,12 @@ def api_cache_warm_status():
 @app.route("/api/cache/warm/cancel", methods=["POST"])
 def api_cache_warm_cancel():
     return jsonify({"stop_requested": True, "state": _request_cache_warm_stop()})
+
+
+@app.route("/api/label/jobs/status")
+def api_label_jobs_status():
+    _schedule_label_job_worker()
+    return jsonify(_label_jobs_status_payload())
 
 
 @app.route("/api/preview/<file_id>")
@@ -3009,7 +3412,7 @@ def api_thumb(file_id: str):
 
 @app.route("/api/label", methods=["POST"])
 def api_label():
-    """Move a folder from unlabeled/ to a label destination."""
+    """Record a label intent durably, then move the folder on Drive in the background."""
     request_started = time.perf_counter()
     data = request.get_json(force=True)
     folder_id = data.get("folder_id", "").strip()
@@ -3023,53 +3426,70 @@ def api_label():
         return jsonify({"error": f"label must be one of {', '.join(LABEL_DESTINATIONS)}"}), 400
 
     try:
-        client = get_client()
-        context = _resolve_queue_context(client, source, site_key)
+        context = _resolve_queue_context(get_client(), source, site_key)
         if parent_id != context.input_folder_id:
             return jsonify({"error": "parent_id does not match the active queue"}), 400
 
-        current = client.get_file(folder_id, fields="id,name,parents,appProperties")
-        frames = _frame_payload_from_folder(current)
+        raw_frames = data.get("frames") if isinstance(data.get("frames"), dict) else {}
+        frames = {
+            key: str(raw_frames.get(key) or "") or None
+            for key in ("frame_0", "frame_1", "frame_2")
+        }
+        frame_signature = str(data.get("frame_signature") or "").strip()
+        if not frame_signature:
+            frame_signature = _frame_signature_from_frames(frames)
         if not has_complete_frame_ids(frames):
-            frames = _frame_payload_from_files(client.list_files(folder_id))
-        frame_signature = _frame_signature_from_frames(frames)
-        folder_name = str(current.get("name") or "")
-        if _label_history_lookup(context, folder_id, folder_name, frame_signature):
+            frames = {"frame_0": None, "frame_1": None, "frame_2": None}
+        folder_name = str(data.get("folder_name") or "").strip()
+        content_signature = str(data.get("content_signature") or "").strip()
+        if not content_signature and has_complete_frame_ids(frames):
+            content_signature = _content_signature_from_frames(frames)
+
+        if _label_history_lookup(context, folder_id, folder_name, frame_signature, content_signature):
             _remove_folder_from_listing_cache(context.queue_key, folder_id)
             return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
 
-        current_parents = [str(parent) for parent in current.get("parents", []) if parent]
-        if context.input_folder_id not in current_parents:
-            return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
-        if str(current.get("appProperties", {}).get("autolabel_final_label") or ""):
-            _remove_folder_from_listing_cache(context.queue_key, folder_id)
-            return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
-
-        dest_id = context.folder_ids[label]
-        label_metadata = dict(current.get("appProperties") or {})
-        label_metadata.update(_label_app_properties(label, context))
-        client.update_file_metadata(
+        _record_label_history(
+            context,
             folder_id,
-            {"appProperties": label_metadata},
-            fields="id,name,mimeType,parents,appProperties",
+            folder_name,
+            frame_signature,
+            label,
+            content_signature,
         )
-        _record_label_history(context, folder_id, folder_name, frame_signature, label)
-        move_started = time.perf_counter()
-        client.move_file(folder_id, new_parent_id=dest_id, remove_parent_id=parent_id)
-        move_ms = (time.perf_counter() - move_started) * 1000
+        job = _enqueue_label_job(
+            context,
+            folder_id=folder_id,
+            parent_id=parent_id,
+            folder_name=folder_name,
+            frames=frames,
+            frame_signature=frame_signature,
+            content_signature=content_signature,
+            label=label,
+        )
         with _hydrated_folder_cache_lock:
             _hydrated_folder_cache.pop(_hydrated_cache_key(context.queue_key, folder_id), None)
         _remove_folder_from_listing_cache(context.queue_key, folder_id)
+        worker_started = _schedule_label_job_worker()
         total_ms = (time.perf_counter() - request_started) * 1000
         _log_timing(
             "api_label",
             total_ms=f"{total_ms:.1f}",
-            move_ms=f"{move_ms:.1f}",
             label=label,
             folder_id=folder_id,
             queue=context.queue_key,
+            job=str(job.get("id") or ""),
+            worker_started=worker_started,
         )
-        return jsonify({"ok": True, "moved_to": label, "source_context": context.to_payload()})
+        return jsonify(
+            {
+                "ok": True,
+                "queued": True,
+                "job_id": job.get("id"),
+                "moved_to": label,
+                "source_context": context.to_payload(),
+            }
+        )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except (DriveClientError, RuntimeError) as e:
