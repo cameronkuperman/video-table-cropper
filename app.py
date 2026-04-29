@@ -77,11 +77,11 @@ PREWARM_FOLDER_COUNT = min(
 )
 REOLINK_PREWARM_TARGET = max(
     PREWARM_FOLDER_COUNT,
-    int(os.environ.get("LABEL_REOLINK_PREWARM_TARGET", "200") or "200"),
+    int(os.environ.get("LABEL_REOLINK_PREWARM_TARGET", "1000") or "1000"),
 )
-INTERACTIVE_REOLINK_PREWARM_TARGET = min(REOLINK_PREWARM_TARGET, INTERACTIVE_READY_SCAN_CAP)
+INTERACTIVE_REOLINK_PREWARM_TARGET = REOLINK_PREWARM_TARGET
 AUTOLABEL_VIDEO_LOW_WATERMARK = max(
-    0, int(os.environ.get("AUTOLABEL_VIDEO_LOW_WATERMARK", "50") or "50")
+    0, int(os.environ.get("AUTOLABEL_VIDEO_LOW_WATERMARK", "1000") or "1000")
 )
 AUTOLABEL_VIDEO_BATCH_SIZE = max(
     1, int(os.environ.get("AUTOLABEL_VIDEO_BATCH_SIZE", "3") or "3")
@@ -405,6 +405,19 @@ _video_preprocess_state: dict[str, Any] = {
 _reolink_preprocess_executor = ThreadPoolExecutor(max_workers=1)
 _reolink_preprocess_lock = Lock()
 _reolink_preprocess_inflight: set[str] = set()
+_ready_maintainer_executor = ThreadPoolExecutor(max_workers=1)
+_ready_maintainer_lock = Lock()
+_ready_maintainer_started = False
+_READY_MAINTAINER_INTERVAL_SECONDS = 15
+_ready_maintainer_state: dict[str, Any] = {
+    "inflight": False,
+    "started": False,
+    "current_queue": None,
+    "last_run_at": None,
+    "generated": 0,
+    "cache_warming": False,
+    "last_error": None,
+}
 _yolo_model: Any | None = None
 _camera_config_cache: dict[int, dict[str, Any]] | None = None
 _camera_config_lock = Lock()
@@ -436,6 +449,9 @@ def _auth_public_endpoint() -> bool:
 
 @app.before_request
 def _require_auth_and_csrf() -> Any | None:
+    if request.endpoint != "static":
+        _ensure_ready_maintainer_started()
+
     if request.method == "OPTIONS" or _auth_public_endpoint():
         return None
 
@@ -2932,6 +2948,91 @@ def _start_cache_warm(source: str | None, site_key: str | None, limit: int | Non
     return True, _cache_warm_state_snapshot()
 
 
+def _set_ready_maintainer_state(**updates: Any) -> None:
+    with _ready_maintainer_lock:
+        _ready_maintainer_state.update(updates)
+
+
+def _ready_maintainer_state_snapshot() -> dict[str, Any]:
+    with _ready_maintainer_lock:
+        state = dict(_ready_maintainer_state)
+    with _cache_warm_lock:
+        state["cache_warming"] = bool(_cache_warm_state.get("inflight"))
+    return state
+
+
+def _run_ready_maintainer_once() -> None:
+    client = DriveClient()
+    generated_total = 0
+    last_error = None
+    for label_source in LABEL_SOURCES:
+        _set_ready_maintainer_state(current_queue=label_source.queue_key)
+        try:
+            context = _resolve_queue_context(
+                client,
+                label_source.source,
+                label_source.site_key,
+            )
+            subfolders = _list_source_subfolders(client, context)
+            _ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit=1)
+            visible_count = max(
+                0,
+                len(subfolders)
+                - int(ready_stats["hidden_labeled"])
+                - int(ready_stats["duplicate_signatures"]),
+            )
+            if context.source == VIDEO_SOURCE:
+                _maybe_trigger_video_preprocess(context, visible_count)
+            elif context.source == REOLINK_SOURCE:
+                generated = _prepare_reolink_unlabeled_queue(
+                    client,
+                    context,
+                    target_unlabeled_count=REOLINK_PREWARM_TARGET,
+                    current_visible_count=visible_count,
+                )
+                generated_total += generated
+                if generated:
+                    _invalidate_listing_cache(context.queue_key)
+        except CropSetupRequiredError as exc:
+            last_error = str(exc)
+        except Exception as exc:
+            last_error = f"{label_source.queue_key}: {exc}"
+
+    _start_cache_warm(None, None, REOLINK_PREWARM_TARGET)
+    _set_ready_maintainer_state(
+        current_queue=None,
+        last_run_at=time.time(),
+        generated=generated_total,
+        last_error=last_error,
+    )
+
+
+def _run_ready_maintainer_loop() -> None:
+    while True:
+        _set_ready_maintainer_state(inflight=True, started=True)
+        try:
+            _run_ready_maintainer_once()
+        except Exception as exc:
+            _set_ready_maintainer_state(last_error=str(exc), current_queue=None)
+            print(f"[ready-maintainer] run failed: {exc}")
+        finally:
+            _set_ready_maintainer_state(inflight=False)
+        time.sleep(_READY_MAINTAINER_INTERVAL_SECONDS)
+
+
+def _ensure_ready_maintainer_started() -> bool:
+    global _ready_maintainer_started
+    if app.testing:
+        return False
+    with _ready_maintainer_lock:
+        if _ready_maintainer_started:
+            return False
+        _ready_maintainer_started = True
+        _ready_maintainer_state["started"] = True
+    _ready_maintainer_executor.submit(_run_ready_maintainer_loop)
+    return True
+
+
 def _hydrate_folder_with_fresh_client(
     context: QueueContext,
     folder: dict[str, str],
@@ -3511,11 +3612,6 @@ def api_queue():
         limit = max(1, min(limit, QUEUE_BATCH_MAX))
         include_stats = request.args.get("include_stats", "0") == "1"
         force_refresh = request.args.get("refresh", "0") == "1"
-        target_unlabeled_count = min(
-            READY_SCAN_MAX,
-            max(limit * READY_SCAN_MULTIPLIER, INTERACTIVE_REOLINK_PREWARM_TARGET),
-        )
-
         list_started = time.perf_counter()
         subfolders = _list_source_subfolders(client, context, force_refresh=force_refresh)
         list_ms = (time.perf_counter() - list_started) * 1000
@@ -3537,29 +3633,11 @@ def api_queue():
         if context.source == VIDEO_SOURCE:
             _maybe_trigger_video_preprocess(context, visible_count_for_refill)
         elif context.source == REOLINK_SOURCE:
-            if visible_count_for_refill < target_unlabeled_count:
-                generated = _prepare_reolink_unlabeled_queue(
-                    client,
-                    context,
-                    target_unlabeled_count=target_unlabeled_count,
-                    current_visible_count=visible_count_for_refill,
-                )
-                if generated:
-                    subfolders = _list_source_subfolders(client, context, force_refresh=True)
-                    total_unlabeled = len(subfolders)
-                    ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit)
-                    visible_unlabeled_estimate = max(
-                        0,
-                        total_unlabeled
-                            - int(ready_stats["hidden_labeled"])
-                            - int(ready_stats["duplicate_signatures"]),
-                        )
-                    visible_count_for_refill = (
-                        visible_unlabeled_estimate
-                        if len(ready_folders) >= limit
-                        else len(ready_folders) + int(ready_stats["nonready"])
-                    )
-            _maybe_trigger_reolink_preprocess(context, visible_count_for_refill, target_unlabeled_count)
+            _maybe_trigger_reolink_preprocess(
+                context,
+                visible_count_for_refill,
+                INTERACTIVE_REOLINK_PREWARM_TARGET,
+            )
 
         preview_prewarm_scheduled = _schedule_preview_prewarm(ready_folders)
         ready_buffer_count = sum(1 for folder in ready_folders if folder.get("cache_ready"))
@@ -3572,6 +3650,7 @@ def api_queue():
             "source_context": context.to_payload(),
             "total_unlabeled": total_unlabeled,
             "visible_unlabeled_estimate": visible_unlabeled_estimate,
+            "ready_target": REOLINK_PREWARM_TARGET,
             "has_more": total_unlabeled > returned_count,
             "ready_buffer_count": ready_buffer_count,
             "warming_count": warming_count,
@@ -3965,24 +4044,15 @@ def api_stats():
         client = get_client()
         source, site_key = _request_source_args()
         context = _resolve_queue_context(client, source, site_key)
-        if context.source == REOLINK_SOURCE:
-            subfolders = _list_source_subfolders(client, context)
-            _ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit=1)
-            visible_unlabeled_estimate = max(
-                0,
-                len(subfolders)
-                - int(ready_stats["hidden_labeled"])
-                - int(ready_stats["duplicate_signatures"]),
-            )
-            _prepare_reolink_unlabeled_queue(
-                client,
-                context,
-                target_unlabeled_count=INTERACTIVE_REOLINK_PREWARM_TARGET,
-                current_visible_count=visible_unlabeled_estimate,
-            )
         stats = _compute_stats(client, context)
         if context.source == VIDEO_SOURCE:
             _maybe_trigger_video_preprocess(context, stats.get("unlabeled", 0))
+        elif context.source == REOLINK_SOURCE:
+            _maybe_trigger_reolink_preprocess(
+                context,
+                stats.get("unlabeled", 0),
+                INTERACTIVE_REOLINK_PREWARM_TARGET,
+            )
         total_ms = (time.perf_counter() - request_started) * 1000
         _log_timing("api_stats", total_ms=f"{total_ms:.1f}", queue=context.queue_key, **stats)
         return jsonify({**stats, "source_context": context.to_payload()})
@@ -4051,8 +4121,12 @@ def _maybe_trigger_video_preprocess(context: QueueContext, unlabeled_count: int)
 @app.route("/api/preprocess/status")
 def api_preprocess_status():
     """Expose whether a background preprocess run is in flight (useful for UI badges)."""
+    _ensure_ready_maintainer_started()
     with _video_preprocess_lock:
         video_state = dict(_video_preprocess_state)
+    with _reolink_preprocess_lock:
+        reolink_inflight = sorted(_reolink_preprocess_inflight)
+    maintainer_state = _ready_maintainer_state_snapshot()
     return jsonify(
         {
             "video": {
@@ -4067,6 +4141,17 @@ def api_preprocess_status():
             "reolink": {
                 "prewarm_target": REOLINK_PREWARM_TARGET,
                 "sites": [site.site_key for site in REOLINK_SITES],
+                "inflight": bool(reolink_inflight),
+                "inflight_queues": reolink_inflight,
+            },
+            "maintainer": {
+                "inflight": bool(maintainer_state["inflight"]),
+                "started": bool(maintainer_state["started"]),
+                "current_queue": maintainer_state["current_queue"],
+                "last_run_at": maintainer_state["last_run_at"],
+                "generated": int(maintainer_state.get("generated") or 0),
+                "cache_warming": bool(maintainer_state["cache_warming"]),
+                "last_error": maintainer_state["last_error"],
             },
         }
     )
@@ -4075,6 +4160,7 @@ def api_preprocess_status():
 def run_label_ui(port: int = 8080) -> None:
     print(f"Starting label UI at http://localhost:{port}")
     _cleanup_cache_if_needed(force=True)
+    _ensure_ready_maintainer_started()
     print(f"Preview cache: {CACHE_DIR}")
     print(
         "Timing logs: "
