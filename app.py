@@ -54,17 +54,17 @@ QUEUE_BATCH_DEFAULT = max(36, int(os.environ.get("LABEL_QUEUE_BATCH_DEFAULT", "7
 QUEUE_BATCH_MAX = max(QUEUE_BATCH_DEFAULT, int(os.environ.get("LABEL_QUEUE_BATCH_MAX", "300") or "300"))
 CACHE_CLEANUP_INTERVAL_SECONDS = 300
 INTERACTIVE_PREWARM_FOLDER_CAP = max(
-    12, int(os.environ.get("LABEL_INTERACTIVE_PREWARM_FOLDER_CAP", "96") or "96")
+    12, int(os.environ.get("LABEL_INTERACTIVE_PREWARM_FOLDER_CAP", "400") or "400")
 )
 INTERACTIVE_READY_SCAN_CAP = max(
-    100, int(os.environ.get("LABEL_INTERACTIVE_READY_SCAN_CAP", "240") or "240")
+    100, int(os.environ.get("LABEL_INTERACTIVE_READY_SCAN_CAP", "500") or "500")
 )
 UNLABELED_LIST_CACHE_SECONDS = max(
     15, int(os.environ.get("LABEL_UNLABELED_CACHE_SECONDS", "300") or "300")
 )
 HYDRATE_MAX_WORKERS = max(2, int(os.environ.get("LABEL_QUEUE_HYDRATE_WORKERS", "12") or "12"))
 PREVIEW_PREWARM_MAX_WORKERS = max(
-    2, min(12, int(os.environ.get("LABEL_PREVIEW_PREWARM_WORKERS", "8") or "8"))
+    2, int(os.environ.get("LABEL_PREVIEW_PREWARM_WORKERS", "24") or "24")
 )
 THUMB_WIDTH = max(128, int(os.environ.get("LABEL_THUMB_WIDTH", "512") or "512"))
 THUMB_QUALITY = max(40, min(95, int(os.environ.get("LABEL_THUMB_QUALITY", "82") or "82")))
@@ -73,7 +73,7 @@ FOLDER_PREWARM_MAX_WORKERS = max(
 )
 PREWARM_FOLDER_COUNT = min(
     INTERACTIVE_PREWARM_FOLDER_CAP,
-    max(12, int(os.environ.get("LABEL_PREWARM_FOLDER_COUNT", "60") or "60")),
+    max(12, int(os.environ.get("LABEL_PREWARM_FOLDER_COUNT", "400") or "400")),
 )
 REOLINK_PREWARM_TARGET = max(
     PREWARM_FOLDER_COUNT,
@@ -2845,29 +2845,72 @@ def _warm_cache_for_context(client: DriveClient, context: QueueContext, limit: i
         if _cache_warm_stop_requested():
             break
         folder_batch = subfolders[batch_start:batch_start + CACHE_WARM_BATCH_SIZE]
+        # Hydrate folders in this batch in parallel using the shared prewarm pool.
+        futures = []
         for folder in folder_batch:
             if _cache_warm_stop_requested():
                 break
+            fut = _preview_prewarm_executor.submit(_warm_cache_folder_parallel, context, folder)
+            futures.append(fut)
+        for fut in futures:
+            if _cache_warm_stop_requested():
+                break
             try:
-                payload = _hydrate_folder(client, context, folder)
-                if payload is None:
-                    continue
-                _increment_cache_warm_state(folders_hydrated=1)
-                frames = payload.get("frames", {})
-                for key in ("frame_0", "frame_1", "frame_2"):
-                    if _cache_warm_stop_requested():
-                        break
-                    file_id = frames.get(key)
-                    if not file_id:
-                        continue
-                    _warm_cache_file_once(client, str(file_id))
-            except Exception as exc:
-                folder_name = str(folder.get("name") or folder.get("id") or "unknown")
-                _append_cache_warm_error(f"{context.queue_key}/{folder_name}: {exc}")
+                fut.result()
+            except Exception:
+                pass
         if CACHE_WARM_BATCH_PAUSE_SECONDS > 0:
             time.sleep(CACHE_WARM_BATCH_PAUSE_SECONDS)
 
     _increment_cache_warm_state(queues_completed=1)
+
+
+def _warm_cache_folder_parallel(context: QueueContext, folder: dict[str, str]) -> None:
+    """Hydrate a single folder and download all its thumbs. Runs inside _preview_prewarm_executor."""
+    try:
+        payload = _hydrate_folder_with_fresh_client(context, folder)
+        if payload is None:
+            return
+        _increment_cache_warm_state(folders_hydrated=1)
+        frames = payload.get("frames", {})
+        file_futures = []
+        for key in ("frame_0", "frame_1", "frame_2"):
+            if _cache_warm_stop_requested():
+                break
+            file_id = frames.get(key)
+            if not file_id:
+                continue
+            fut = _preview_prewarm_executor.submit(_warm_cache_file_parallel, str(file_id))
+            file_futures.append(fut)
+        for fut in file_futures:
+            try:
+                fut.result()
+            except Exception:
+                pass
+    except Exception as exc:
+        folder_name = str(folder.get("name") or folder.get("id") or "unknown")
+        _append_cache_warm_error(f"{context.queue_key}/{folder_name}: {exc}")
+
+
+def _warm_cache_file_parallel(file_id: str) -> None:
+    """Download and thumbnail a single file. Increments cache warm state counters."""
+    if _cache_warm_stop_requested():
+        return
+    cache_path = _cache_path_for_file(file_id)
+    thumb_path = _thumb_path_for_file(file_id)
+    full_existed = cache_path.exists()
+    thumb_existed = thumb_path.exists()
+    _ensure_thumb_for_file(file_id)
+    increments: dict[str, int] = {"frames_seen": 1}
+    if full_existed:
+        increments["skipped_full_res"] = 1
+    elif cache_path.exists():
+        increments["full_res_cached"] = 1
+    if thumb_existed:
+        increments["skipped_thumbs"] = 1
+    elif thumb_path.exists():
+        increments["thumbs_cached"] = 1
+    _increment_cache_warm_state(**increments)
 
 
 def _run_cache_warm_background(source: str | None, site_key: str | None, limit: int | None) -> None:
@@ -2930,6 +2973,13 @@ def _start_cache_warm(source: str | None, site_key: str | None, limit: int | Non
 
     _cache_warm_executor.submit(_run_cache_warm_background, source, site_key, limit)
     return True, _cache_warm_state_snapshot()
+
+
+# Auto-warm thumbnails on Railway startup so "loaded" count climbs immediately
+# without waiting for the user to hit /api/queue.
+# Disable by setting LABEL_WARM_ON_STARTUP=0 in Railway env vars.
+if _RAILWAY_ENV and os.environ.get("LABEL_WARM_ON_STARTUP", "1").strip().lower() not in {"0", "false", "no", "off"}:
+    _start_cache_warm(None, None, None)
 
 
 def _hydrate_folder_with_fresh_client(
