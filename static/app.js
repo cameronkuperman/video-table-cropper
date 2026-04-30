@@ -12,6 +12,7 @@ let renderToken = 0;
 let initialTotalUnlabeled = 0;
 let readyBufferCount = 0;
 let warmingCount = 0;
+let readyTarget = 1000;
 let queueRetryMs = 1000;
 let nextQueueFetchAt = 0;
 let currentImagesReady = false;
@@ -23,6 +24,9 @@ let activePendingLabel = 'unlabeled';
 let activeDisplayName = 'Video';
 let recentLabelUndos = [];
 let recentLabelUndoTimer = null;
+let preprocessStatus = null;
+let preprocessStatusRequest = null;
+let lastPreprocessStatusAt = 0;
 let stats = {
     unlabeled: 0,
     clean: 0,
@@ -33,9 +37,9 @@ let stats = {
 };
 
 const INITIAL_QUEUE_BATCH_SIZE = 12;
-const REFILL_QUEUE_BATCH_SIZE = 120;
-const WARM_BUFFER_SIZE = 144;
-const LOW_WATERMARK = 160;
+const REFILL_QUEUE_BATCH_SIZE = 300;
+const WARM_BUFFER_SIZE = 180;
+const LOW_WATERMARK = 220;
 const TIMING_LOGS_ENABLED = true;
 const QUEUE_SNAPSHOT_PREFIX = 'autolabeler.queueSnapshot.';
 const QUEUE_SNAPSHOT_SCHEMA_VERSION = 3;
@@ -45,6 +49,7 @@ const SUPPRESSED_QUEUE_MAX = 1000;
 const PENDING_LABELS_KEY = 'autolabeler.pendingLabels.v1';
 const PENDING_LABEL_KEEPALIVE_LIMIT = 20;
 const LABEL_UNDO_SECONDS = 30;
+const PREPROCESS_STATUS_TTL_MS = 2500;
 
 const cardEl = document.getElementById('card');
 const progressEl = document.getElementById('progress');
@@ -202,6 +207,7 @@ function saveQueueSnapshot() {
                 initialTotalUnlabeled,
                 readyBufferCount,
                 warmingCount,
+                readyTarget,
                 stats,
                 suppressedFolderIds: Array.from(suppressedFolderIds).slice(-SUPPRESSED_QUEUE_MAX),
                 suppressedFrameSignatures: Array.from(suppressedFrameSignatures).slice(-SUPPRESSED_QUEUE_MAX),
@@ -245,6 +251,7 @@ function restoreQueueSnapshot() {
         initialTotalUnlabeled = Number(snapshot.initialTotalUnlabeled || restoredFolders.length);
         readyBufferCount = Number(snapshot.readyBufferCount || 0);
         warmingCount = Number(snapshot.warmingCount || 0);
+        readyTarget = Number(snapshot.readyTarget || readyTarget);
         suppressedFolderIds = new Set((snapshot.suppressedFolderIds || []).map(String));
         suppressedFrameSignatures = new Set((snapshot.suppressedFrameSignatures || []).map(String));
         suppressedContentSignatures = new Set((snapshot.suppressedContentSignatures || []).map(String));
@@ -361,6 +368,50 @@ function localReadyCount() {
     return Math.max(0, folders.length - currentIndex);
 }
 
+function formatCount(value) {
+    return Number(value || 0).toLocaleString();
+}
+
+function preprocessIsActive(status = preprocessStatus) {
+    if (!status) {
+        return false;
+    }
+    return Boolean(
+        status.maintainer?.inflight
+        || status.maintainer?.cache_warming
+        || status.video?.inflight
+        || status.reolink?.inflight
+    );
+}
+
+async function refreshPreprocessStatus({ force = false } = {}) {
+    const now = performance.now();
+    if (!force && preprocessStatus && (now - lastPreprocessStatusAt) < PREPROCESS_STATUS_TTL_MS) {
+        return preprocessStatus;
+    }
+    if (preprocessStatusRequest) {
+        return preprocessStatusRequest;
+    }
+
+    preprocessStatusRequest = fetch('/api/preprocess/status')
+        .then(async res => {
+            const data = await readApiJson(res, 'Preprocess status request');
+            if (!res.ok || data.error) {
+                throw new Error(data.error || `Preprocess status failed (${res.status})`);
+            }
+            preprocessStatus = data;
+            readyTarget = Number(data.reolink?.prewarm_target || data.video?.low_watermark || readyTarget);
+            lastPreprocessStatusAt = performance.now();
+            updateBufferStatus();
+            return data;
+        })
+        .catch(() => preprocessStatus)
+        .finally(() => {
+            preprocessStatusRequest = null;
+        });
+    return preprocessStatusRequest;
+}
+
 function updateBufferStatus() {
     if (!bufferStatusEl) {
         return;
@@ -369,19 +420,19 @@ function updateBufferStatus() {
     const pendingCount = readPendingLabels().length;
     const pendingSuffix = pendingCount > 0 ? ` · ${pendingCount} Drive move${pendingCount === 1 ? '' : 's'} pending` : '';
     const localReady = localReadyCount();
+    const targetSuffix = readyTarget > 0 ? ` · target ${formatCount(readyTarget)}` : '';
     if (localReady > 0) {
-        const warmingSuffix = warmingCount > 0 ? ` · warming ${warmingCount}` : '';
-        bufferStatusEl.textContent = `Ready buffer: ${localReady} triplets${warmingSuffix}${pendingSuffix}`;
+        bufferStatusEl.textContent = `Ready: ${localReady} loaded${targetSuffix}${pendingSuffix}`;
         return;
     }
 
-    if (stats.unlabeled <= 0 && !hasMore) {
+    if (stats.unlabeled <= 0 && !hasMore && !preprocessIsActive()) {
         bufferStatusEl.textContent = '';
         return;
     }
 
-    if (warmingCount > 0 || hasMore) {
-        bufferStatusEl.textContent = `Warming next triplets from Drive...${pendingSuffix}`;
+    if (warmingCount > 0 || hasMore || preprocessIsActive()) {
+        bufferStatusEl.textContent = `Preparing next triplets${targetSuffix}...${pendingSuffix}`;
         return;
     }
 
@@ -574,6 +625,7 @@ async function fetchQueue({
         initialTotalUnlabeled = 0;
         readyBufferCount = 0;
         warmingCount = 0;
+        readyTarget = 1000;
         queueRetryMs = 1000;
         nextQueueFetchAt = 0;
     }
@@ -582,7 +634,7 @@ async function fetchQueue({
         return { folders: [] };
     }
 
-    if (!hasMore && !reset) {
+    if (!hasMore && !reset && !forceRefresh) {
         return { folders: [] };
     }
 
@@ -599,6 +651,7 @@ async function fetchQueue({
             total_unlabeled: initialTotalUnlabeled,
             ready_buffer_count: readyBufferCount,
             warming_count: warmingCount,
+            ready_target: readyTarget,
         };
     }
 
@@ -631,6 +684,7 @@ async function fetchQueue({
             hasMore = Boolean(data.has_more);
             readyBufferCount = data.ready_buffer_count || 0;
             warmingCount = data.warming_count || 0;
+            readyTarget = Number(data.ready_target || readyTarget);
             queueRetryMs = data.retry_ms || queueRetryMs;
 
             if (includeStats && data.stats) {
@@ -764,15 +818,18 @@ function sleep(ms) {
 
 async function ensureCurrentFolder() {
     while (currentIndex >= folders.length) {
-        if (!hasMore) {
+        const status = await refreshPreprocessStatus();
+        const backgroundActive = preprocessIsActive(status);
+        if (!hasMore && !backgroundActive && warmingCount <= 0) {
             return null;
         }
 
-        const data = await fetchQueue();
+        const data = await fetchQueue({ forceRefresh: !hasMore && backgroundActive });
         if (currentIndex < folders.length) {
             return folders[currentIndex];
         }
-        if (!data.has_more) {
+        const nextStatus = await refreshPreprocessStatus({ force: !data.has_more });
+        if (!data.has_more && !preprocessIsActive(nextStatus) && warmingCount <= 0) {
             return null;
         }
 
@@ -942,7 +999,7 @@ async function renderCard() {
         return;
     }
 
-    cardEl.innerHTML = '<p class="loading">Warming next images from Drive...</p>';
+    cardEl.innerHTML = '<p class="loading">Preparing next triplets...</p>';
 
     let folder;
     try {
@@ -956,6 +1013,16 @@ async function renderCard() {
     if (token !== renderToken) return;
 
     if (!folder) {
+        const status = await refreshPreprocessStatus({ force: true });
+        if (preprocessIsActive(status)) {
+            cardEl.innerHTML = '<p class="loading">Preparing next triplets...</p>';
+            doneEl.style.display = 'none';
+            await sleep(queueRetryMs);
+            if (token === renderToken) {
+                renderCard();
+            }
+            return;
+        }
         cardEl.innerHTML = '';
         doneEl.style.display = 'block';
         updateProgress();
@@ -1166,6 +1233,7 @@ async function init(forceRefresh = false) {
                 updateProgress();
                 warmBuffer();
             }).catch(() => {});
+            refreshPreprocessStatus({ force: true });
             return;
         }
 
@@ -1175,7 +1243,8 @@ async function init(forceRefresh = false) {
             limit: INITIAL_QUEUE_BATCH_SIZE,
             forceRefresh,
         });
-        if (folders.length === 0 && !hasMore) {
+        const status = await refreshPreprocessStatus({ force: true });
+        if (folders.length === 0 && !hasMore && !preprocessIsActive(status)) {
             cardEl.innerHTML = '';
             doneEl.style.display = 'block';
             updateProgress();
@@ -1302,6 +1371,12 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 
+window.setInterval(() => {
+    if (document.visibilityState !== 'hidden') {
+        refreshPreprocessStatus().catch(() => {});
+    }
+}, 5000);
+
 document.addEventListener('keydown', e => {
     if (e.key === 'ArrowLeft') {
         e.preventDefault();
@@ -1322,6 +1397,7 @@ document.addEventListener('keydown', e => {
 async function bootstrap() {
     try {
         await fetchSources();
+        refreshPreprocessStatus({ force: true }).catch(() => {});
         await init(true);
     } catch (e) {
         const errorContent = formatErrorContent('Failed to load sources: ', e);
