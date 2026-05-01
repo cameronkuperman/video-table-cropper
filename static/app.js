@@ -8,7 +8,9 @@ let suppressedFrameSignatures = new Set();
 let suppressedContentSignatures = new Set();
 let hasMore = true;
 let queueRequest = null;
+let queueRequestKey = null;
 let renderToken = 0;
+let sourceLoadToken = 0;
 let initialTotalUnlabeled = 0;
 let readyBufferCount = 0;
 let warmingCount = 0;
@@ -113,6 +115,16 @@ function activeQueueKey() {
     return activeSource === 'reolink'
         ? `reolink:${activeSiteKey || ''}`
         : 'video';
+}
+
+function bumpSourceLoadToken() {
+    sourceLoadToken += 1;
+    renderToken += 1;
+    return sourceLoadToken;
+}
+
+function isCurrentLoad(loadToken) {
+    return loadToken === sourceLoadToken;
 }
 
 function frameSignature(folder) {
@@ -613,6 +625,7 @@ async function fetchQueue({
     includeStats = false,
     limit = REFILL_QUEUE_BATCH_SIZE,
     forceRefresh = false,
+    loadToken = sourceLoadToken,
 } = {}) {
     const startedAt = performance.now();
     const requestSource = activeSource;
@@ -621,14 +634,15 @@ async function fetchQueue({
         ? `reolink:${requestSiteKey || ''}`
         : 'video';
 
-            if (reset) {
-                folders = [];
-                suppressedFolderIds = new Set();
-                suppressedFrameSignatures = new Set();
-                suppressedContentSignatures = new Set();
-                currentIndex = 0;
-                hasMore = true;
-                queueRequest = null;
+    if (reset && isCurrentLoad(loadToken)) {
+        folders = [];
+        suppressedFolderIds = new Set();
+        suppressedFrameSignatures = new Set();
+        suppressedContentSignatures = new Set();
+        currentIndex = 0;
+        hasMore = true;
+        queueRequest = null;
+        queueRequestKey = null;
         initialTotalUnlabeled = 0;
         readyBufferCount = 0;
         warmingCount = 0;
@@ -645,7 +659,7 @@ async function fetchQueue({
         return { folders: [] };
     }
 
-    if (queueRequest) {
+    if (queueRequest && queueRequestKey === requestQueueKey) {
         return queueRequest;
     }
 
@@ -671,7 +685,7 @@ async function fetchQueue({
         params.set('refresh', '1');
     }
 
-    queueRequest = fetch(`/api/queue?${params.toString()}`)
+    const activeRequest = fetch(`/api/queue?${params.toString()}`)
         .then(async res => {
             const data = await readApiJson(res, 'Queue request');
             if (!res.ok || data.error) {
@@ -680,6 +694,9 @@ async function fetchQueue({
             return data;
         })
         .then(data => {
+            if (!isCurrentLoad(loadToken)) {
+                return data;
+            }
             if (data.source_context?.queue_key && data.source_context.queue_key !== requestQueueKey) {
                 return data;
             }
@@ -752,9 +769,14 @@ async function fetchQueue({
             return data;
         })
         .finally(() => {
-            queueRequest = null;
+            if (queueRequest === activeRequest) {
+                queueRequest = null;
+                queueRequestKey = null;
+            }
         });
 
+    queueRequest = activeRequest;
+    queueRequestKey = requestQueueKey;
     return queueRequest;
 }
 
@@ -823,19 +845,22 @@ function sleep(ms) {
     return new Promise(resolve => window.setTimeout(resolve, ms));
 }
 
-async function ensureCurrentFolder() {
+async function ensureCurrentFolder(loadToken = sourceLoadToken) {
     while (currentIndex >= folders.length) {
         const status = await refreshPreprocessStatus();
+        if (!isCurrentLoad(loadToken)) return null;
         const backgroundActive = preprocessIsActive(status);
         if (!hasMore && !backgroundActive && warmingCount <= 0) {
             return null;
         }
 
-        const data = await fetchQueue({ forceRefresh: !hasMore && backgroundActive });
+        const data = await fetchQueue({ forceRefresh: !hasMore && backgroundActive, loadToken });
+        if (!isCurrentLoad(loadToken)) return null;
         if (currentIndex < folders.length) {
             return folders[currentIndex];
         }
         const nextStatus = await refreshPreprocessStatus({ force: !data.has_more });
+        if (!isCurrentLoad(loadToken)) return null;
         if (!data.has_more && !preprocessIsActive(nextStatus) && warmingCount <= 0) {
             return null;
         }
@@ -845,14 +870,16 @@ async function ensureCurrentFolder() {
     return folders[currentIndex] || null;
 }
 
-function warmBuffer() {
+function warmBuffer(loadToken = sourceLoadToken) {
+    if (!isCurrentLoad(loadToken)) return;
     for (let idx = currentIndex; idx < Math.min(folders.length, currentIndex + WARM_BUFFER_SIZE); idx++) {
         preloadFolder(folders[idx]).catch(() => {});
     }
 
     if (hasMore && localReadyCount() < LOW_WATERMARK) {
-        fetchQueue({ limit: REFILL_QUEUE_BATCH_SIZE })
+        fetchQueue({ limit: REFILL_QUEUE_BATCH_SIZE, loadToken })
             .then(() => {
+                if (!isCurrentLoad(loadToken)) return;
                 for (let idx = currentIndex; idx < Math.min(folders.length, currentIndex + WARM_BUFFER_SIZE); idx++) {
                     preloadFolder(folders[idx]).catch(() => {});
                 }
@@ -942,7 +969,7 @@ function renderFolderCard(folder) {
     updateReadyState();
 }
 
-async function refreshStats() {
+async function refreshStats(loadToken = sourceLoadToken) {
     const startedAt = performance.now();
     const requestSource = activeSource;
     const requestSiteKey = activeSiteKey;
@@ -961,6 +988,9 @@ async function refreshStats() {
         const data = await readApiJson(res, 'Stats request');
         if (!res.ok || data.error) {
             throw buildApiError(data, res, 'Stats request');
+        }
+        if (!isCurrentLoad(loadToken)) {
+            return;
         }
         if (data.source_context?.queue_key && data.source_context.queue_key !== requestQueueKey) {
             return;
@@ -983,11 +1013,12 @@ async function refreshStats() {
     } catch (_) {}
 }
 
-async function renderCard() {
+async function renderCard(loadToken = sourceLoadToken) {
     const startedAt = performance.now();
     const token = ++renderToken;
     showError(null);
 
+    if (!isCurrentLoad(loadToken)) return;
     const immediateFolder = folders[currentIndex] || null;
     if (immediateFolder) {
         doneEl.style.display = 'none';
@@ -1002,7 +1033,7 @@ async function renderCard() {
             queueKey: activeQueueKey(),
             immediate: 1,
         });
-        warmBuffer();
+        warmBuffer(loadToken);
         return;
     }
 
@@ -1010,23 +1041,25 @@ async function renderCard() {
 
     let folder;
     try {
-        folder = await ensureCurrentFolder();
+        folder = await ensureCurrentFolder(loadToken);
     } catch (e) {
+        if (!isCurrentLoad(loadToken)) return;
         const errorContent = formatErrorContent('Failed to load queue: ', e);
         showError(errorContent.body, errorContent.isHtml);
         return;
     }
 
-    if (token !== renderToken) return;
+    if (token !== renderToken || !isCurrentLoad(loadToken)) return;
 
     if (!folder) {
         const status = await refreshPreprocessStatus({ force: true });
+        if (!isCurrentLoad(loadToken)) return;
         if (preprocessIsActive(status)) {
             cardEl.innerHTML = '<p class="loading">Preparing next triplets...</p>';
             doneEl.style.display = 'none';
             await sleep(queueRetryMs);
-            if (token === renderToken) {
-                renderCard();
+            if (token === renderToken && isCurrentLoad(loadToken)) {
+                renderCard(loadToken);
             }
             return;
         }
@@ -1039,7 +1072,7 @@ async function renderCard() {
     doneEl.style.display = 'none';
     updateProgress();
 
-    if (token !== renderToken) return;
+    if (token !== renderToken || !isCurrentLoad(loadToken)) return;
 
     renderFolderCard(folder);
 
@@ -1052,7 +1085,7 @@ async function renderCard() {
         queueKey: activeQueueKey(),
         immediate: 0,
     });
-    warmBuffer();
+    warmBuffer(loadToken);
 }
 
 function applyOptimisticLabel(label) {
@@ -1211,7 +1244,10 @@ async function relabelRecent(nextLabel) {
     }
 }
 
-async function init(forceRefresh = false) {
+async function init(forceRefresh = false, loadToken = null) {
+    if (loadToken === null) {
+        loadToken = forceRefresh ? bumpSourceLoadToken() : sourceLoadToken;
+    }
     labeling = false;
     if (forceRefresh) {
         clearRecentLabelUndo();
@@ -1230,15 +1266,18 @@ async function init(forceRefresh = false) {
         drainPendingLabels({ keepalive: false });
         const restored = !forceRefresh && restoreQueueSnapshot();
         if (restored) {
-            await renderCard();
-            refreshStats();
+            if (!isCurrentLoad(loadToken)) return;
+            await renderCard(loadToken);
+            refreshStats(loadToken);
             fetchQueue({
                 reset: false,
                 includeStats: false,
                 limit: REFILL_QUEUE_BATCH_SIZE,
+                loadToken,
             }).then(() => {
+                if (!isCurrentLoad(loadToken)) return;
                 updateProgress();
-                warmBuffer();
+                warmBuffer(loadToken);
             }).catch(() => {});
             refreshPreprocessStatus({ force: true });
             return;
@@ -1249,19 +1288,23 @@ async function init(forceRefresh = false) {
             includeStats: false,
             limit: INITIAL_QUEUE_BATCH_SIZE,
             forceRefresh,
+            loadToken,
         });
+        if (!isCurrentLoad(loadToken)) return;
         const status = await refreshPreprocessStatus({ force: true });
+        if (!isCurrentLoad(loadToken)) return;
         if (folders.length === 0 && !hasMore && !preprocessIsActive(status)) {
             cardEl.innerHTML = '';
             doneEl.style.display = 'block';
             updateProgress();
-            refreshStats();
+            refreshStats(loadToken);
             clearQueueSnapshot();
             return;
         }
-        await renderCard();
-        refreshStats();
+        await renderCard(loadToken);
+        refreshStats(loadToken);
     } catch (e) {
+        if (!isCurrentLoad(loadToken)) return;
         const errorContent = formatErrorContent('Failed to connect: ', e);
         showError(errorContent.body, errorContent.isHtml);
     }
@@ -1294,7 +1337,8 @@ async function labelCurrent(label) {
     saveQueueSnapshot();
 
     applyOptimisticLabel(label);
-    renderCard();
+    const loadToken = sourceLoadToken;
+    renderCard(loadToken);
 
     try {
         const data = await sendLabelOperation(operation, { keepalive: true });
@@ -1310,7 +1354,7 @@ async function labelCurrent(label) {
         showError(`Move queued for retry: ${folder.folder_name}: ${e.message}`);
     } finally {
         labeling = false;
-        warmBuffer();
+        warmBuffer(loadToken);
     }
 }
 
@@ -1340,11 +1384,22 @@ function escapeHtml(s) {
 }
 
 async function handleSourceChange() {
+    const loadToken = bumpSourceLoadToken();
     normalizeSourceSelection({ source: activeSource, site_key: activeSiteKey });
     renderSourceControls();
+    if (sourceModeEl) sourceModeEl.disabled = true;
+    if (sourceSiteEl) sourceSiteEl.disabled = true;
     clearRecentLabelUndo();
     clearQueueSnapshot();
-    await init(true);
+    queueRequest = null;
+    queueRequestKey = null;
+    try {
+        await init(true, loadToken);
+    } finally {
+        if (isCurrentLoad(loadToken)) {
+            renderSourceControls();
+        }
+    }
 }
 
 sourceModeEl?.addEventListener('change', () => {

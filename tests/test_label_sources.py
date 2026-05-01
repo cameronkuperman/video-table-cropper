@@ -762,6 +762,30 @@ def test_label_route_records_durable_job_before_drive_move(client, fake_drive):
     assert job["label"] == "clean"
 
 
+def test_label_route_returns_json_when_state_write_fails(client, monkeypatch):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+
+    def fail_record_history(*_args, **_kwargs):
+        raise OSError("state volume unavailable")
+
+    monkeypatch.setattr(label_app, "_record_label_history", fail_record_history)
+
+    response = client.post("/api/label", json=_label_payload(folder, "clean"))
+    payload = response.get_json()
+
+    assert response.status_code == 500
+    assert response.content_type.startswith("application/json")
+    assert payload["code"] == "label_queue_failed"
+    assert "state volume unavailable" in payload["error"]
+
+
+def test_state_tmp_paths_are_unique(tmp_path):
+    target = tmp_path / "label_jobs.json"
+
+    assert label_app._state_tmp_path(target) != label_app._state_tmp_path(target)
+
+
 def test_label_job_status_is_lightweight(client, fake_drive):
     response = client.get("/api/label/jobs/status")
     payload = response.get_json()
