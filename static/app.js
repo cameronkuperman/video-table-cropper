@@ -400,7 +400,14 @@ async function refreshPreprocessStatus({ force = false } = {}) {
                 throw new Error(data.error || `Preprocess status failed (${res.status})`);
             }
             preprocessStatus = data;
-            readyTarget = Number(data.reolink?.prewarm_target || data.video?.low_watermark || readyTarget);
+            readyTarget = Number(
+                data.ready_target
+                || data.reolink?.ready_target
+                || data.reolink?.prewarm_target
+                || data.video?.ready_target
+                || data.video?.low_watermark
+                || readyTarget,
+            );
             lastPreprocessStatusAt = performance.now();
             updateBufferStatus();
             return data;

@@ -105,9 +105,7 @@ LABEL_JOB_UNDO_SECONDS=30
 LABEL_JOB_PROCESSING_STALE_SECONDS=300
 LABEL_JOB_MIN_INTERVAL_SECONDS=2.0
 LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS=120
-LABEL_REOLINK_PREWARM_TARGET=5000
-LABEL_PREWARM_FOLDER_COUNT=60
-LABEL_READY_SCAN_MAX=180
+LABEL_READY_TARGET=359
 ```
 
 Mount a Railway volume on the web service at `/data` when using
@@ -129,6 +127,10 @@ The warmer walks the current unlabeled queues, downloads each missing Drive
 frame once, writes `{file_id}.jpg` plus `{file_id}.thumb.jpg` into
 `LABEL_CACHE_DIR`, and skips files already present on the volume. If it needs
 to be stopped, call `POST /api/cache/warm/cancel`.
+
+`LABEL_READY_TARGET` is the only queue-size tuning variable most deployments
+need. When set, it overrides the older per-path target variables for Reolink
+generation, video low-watermark refills, interactive prewarm, and ready scans.
 
 Label clicks are recorded to the volume first, held briefly for undo/relabel,
 then pushed to Drive by a background worker. Use `/api/label/jobs/status` to

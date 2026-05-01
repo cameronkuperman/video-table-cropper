@@ -50,6 +50,24 @@ load_local_env()
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "autolabeler-dev-secret-change-me")
 
+
+def _read_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or str(default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _ready_target_or_legacy_env(name: str, default: int) -> int:
+    if os.environ.get("LABEL_READY_TARGET", "").strip():
+        return _read_int_env("LABEL_READY_TARGET", default)
+    return _read_int_env(name, default)
+
+
+def _label_ready_target_configured() -> bool:
+    return bool(os.environ.get("LABEL_READY_TARGET", "").strip())
+
+
 QUEUE_BATCH_DEFAULT = max(36, int(os.environ.get("LABEL_QUEUE_BATCH_DEFAULT", "72") or "72"))
 QUEUE_BATCH_MAX = max(QUEUE_BATCH_DEFAULT, int(os.environ.get("LABEL_QUEUE_BATCH_MAX", "300") or "300"))
 CACHE_CLEANUP_INTERVAL_SECONDS = 300
@@ -71,17 +89,23 @@ THUMB_QUALITY = max(40, min(95, int(os.environ.get("LABEL_THUMB_QUALITY", "82") 
 FOLDER_PREWARM_MAX_WORKERS = max(
     2, min(6, int(os.environ.get("LABEL_FOLDER_PREWARM_WORKERS", "4") or "4"))
 )
+LABEL_READY_TARGET_CONFIGURED = _label_ready_target_configured()
+LABEL_READY_TARGET = (
+    max(1, _read_int_env("LABEL_READY_TARGET", 1000))
+    if LABEL_READY_TARGET_CONFIGURED
+    else None
+)
 PREWARM_FOLDER_COUNT = min(
     INTERACTIVE_PREWARM_FOLDER_CAP,
-    max(12, int(os.environ.get("LABEL_PREWARM_FOLDER_COUNT", "400") or "400")),
+    max(12, _ready_target_or_legacy_env("LABEL_PREWARM_FOLDER_COUNT", 400)),
 )
 REOLINK_PREWARM_TARGET = max(
     PREWARM_FOLDER_COUNT,
-    int(os.environ.get("LABEL_REOLINK_PREWARM_TARGET", "1000") or "1000"),
+    _ready_target_or_legacy_env("LABEL_REOLINK_PREWARM_TARGET", 1000),
 )
 INTERACTIVE_REOLINK_PREWARM_TARGET = REOLINK_PREWARM_TARGET
 AUTOLABEL_VIDEO_LOW_WATERMARK = max(
-    0, int(os.environ.get("AUTOLABEL_VIDEO_LOW_WATERMARK", "1000") or "1000")
+    0, _ready_target_or_legacy_env("AUTOLABEL_VIDEO_LOW_WATERMARK", 1000)
 )
 AUTOLABEL_VIDEO_BATCH_SIZE = max(
     1, int(os.environ.get("AUTOLABEL_VIDEO_BATCH_SIZE", "3") or "3")
@@ -90,7 +114,7 @@ HYDRATED_FOLDER_CACHE_TTL_SECONDS = max(60, int(os.environ.get("LABEL_HYDRATED_C
 READY_SCAN_MULTIPLIER = max(2, int(os.environ.get("LABEL_READY_SCAN_MULTIPLIER", "12") or "12"))
 READY_SCAN_MAX = min(
     INTERACTIVE_READY_SCAN_CAP,
-    max(100, int(os.environ.get("LABEL_READY_SCAN_MAX", "180") or "180")),
+    max(100, _ready_target_or_legacy_env("LABEL_READY_SCAN_MAX", 180)),
 )
 QUEUE_RETRY_MS = max(100, int(os.environ.get("LABEL_QUEUE_RETRY_MS", "250") or "250"))
 TIMING_LOGS_ENABLED = os.environ.get("LABEL_TIMING_LOGS", "1").strip().lower() not in {
@@ -337,6 +361,10 @@ CACHE_WARM_BATCH_PAUSE_SECONDS = max(
     0.0,
     float(os.environ.get("LABEL_CACHE_WARM_BATCH_PAUSE_SECONDS", "0.05") or "0.05"),
 )
+CACHE_WARM_LOCK_STALE_SECONDS = max(
+    60,
+    _read_int_env("LABEL_CACHE_WARM_LOCK_STALE_SECONDS", 3600),
+)
 
 # Drive client + cached folder IDs
 _source_folder_ids_cache: dict[str, dict[str, str]] = {}
@@ -373,6 +401,7 @@ _cache_warm_state: dict[str, Any] = {
     "queues_completed": 0,
     "folders_scanned": 0,
     "folders_hydrated": 0,
+    "folders_hot_cached": 0,
     "frames_seen": 0,
     "full_res_cached": 0,
     "thumbs_cached": 0,
@@ -382,6 +411,8 @@ _cache_warm_state: dict[str, Any] = {
     "last_error": None,
     "stop_requested": False,
     "batch_size": CACHE_WARM_BATCH_SIZE,
+    "shared_lock": None,
+    "shared_lock_path": None,
 }
 _folder_prewarm_executor = ThreadPoolExecutor(max_workers=FOLDER_PREWARM_MAX_WORKERS)
 _folder_prewarm_inflight: set[tuple[str, str]] = set()
@@ -1112,6 +1143,75 @@ def _label_history_path() -> Path:
 
 def _label_jobs_path() -> Path:
     return _preprocess_state_dir() / LABEL_JOBS_FILE_NAME
+
+
+def _cache_warm_shared_lock_path() -> Path:
+    return _preprocess_state_dir() / "cache_warm.lock"
+
+
+def _read_cache_warm_shared_lock(path: Path | None = None) -> dict[str, Any] | None:
+    lock_path = path or _cache_warm_shared_lock_path()
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _acquire_cache_warm_shared_lock() -> dict[str, Any] | None:
+    lock_path = _cache_warm_shared_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+
+    existing = _read_cache_warm_shared_lock(lock_path)
+    if existing is not None:
+        started_at = float(existing.get("started_at_epoch") or 0)
+        if started_at and (now - started_at) > CACHE_WARM_LOCK_STALE_SECONDS:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+
+    token = {
+        "pid": os.getpid(),
+        "started_at_epoch": now,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(str(lock_path), flags)
+    except FileExistsError:
+        return None
+    except OSError:
+        return None
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(token, sort_keys=True))
+    except OSError:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+        return None
+    return token
+
+
+def _release_cache_warm_shared_lock(token: dict[str, Any] | None) -> None:
+    if not token:
+        return
+    lock_path = _cache_warm_shared_lock_path()
+    existing = _read_cache_warm_shared_lock(lock_path)
+    if existing and existing.get("started_at_epoch") != token.get("started_at_epoch"):
+        return
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
 
 
 def _label_history_empty() -> dict[str, Any]:
@@ -2882,13 +2982,27 @@ def _warm_cache_for_context(client: DriveClient, context: QueueContext, limit: i
 
 
 def _warm_cache_folder_parallel(context: QueueContext, folder: dict[str, str]) -> None:
-    """Hydrate a single folder and download all its thumbs. Runs inside _preview_prewarm_executor."""
+    """Hydrate a folder, warm its thumbs, and keep the app-side payload hot."""
     try:
         payload = _hydrate_folder_with_fresh_client(context, folder)
         if payload is None:
+            _set_cached_hydrated_folder(context.queue_key, folder["id"], None)
             return
         _increment_cache_warm_state(folders_hydrated=1)
         frames = payload.get("frames", {})
+        history_record = _label_history_lookup(
+            context,
+            str(payload.get("folder_id") or ""),
+            str(payload.get("folder_name") or ""),
+            str(payload.get("frame_signature") or ""),
+            str(payload.get("content_signature") or ""),
+        )
+        if history_record:
+            _set_cached_hydrated_folder(context.queue_key, folder["id"], None)
+            _remove_folder_from_listing_cache(context.queue_key, str(payload.get("folder_id") or ""))
+            _schedule_hidden_folder_cleanup(context, str(payload.get("folder_id") or ""))
+            return
+
         file_futures = []
         for key in ("frame_0", "frame_1", "frame_2"):
             if _cache_warm_stop_requested():
@@ -2903,6 +3017,23 @@ def _warm_cache_folder_parallel(context: QueueContext, folder: dict[str, str]) -
                 fut.result()
             except Exception:
                 pass
+        payload["content_signature"] = _content_signature_from_frames(frames)
+        payload["cache_ready"] = _folder_cache_ready(payload)
+        history_record = _label_history_lookup(
+            context,
+            str(payload.get("folder_id") or ""),
+            str(payload.get("folder_name") or ""),
+            str(payload.get("frame_signature") or ""),
+            str(payload.get("content_signature") or ""),
+        )
+        if history_record:
+            _set_cached_hydrated_folder(context.queue_key, folder["id"], None)
+            _remove_folder_from_listing_cache(context.queue_key, str(payload.get("folder_id") or ""))
+            _schedule_hidden_folder_cleanup(context, str(payload.get("folder_id") or ""))
+            return
+        _set_cached_hydrated_folder(context.queue_key, folder["id"], payload)
+        if payload["cache_ready"]:
+            _increment_cache_warm_state(folders_hot_cached=1)
     except Exception as exc:
         folder_name = str(folder.get("name") or folder.get("id") or "unknown")
         _append_cache_warm_error(f"{context.queue_key}/{folder_name}: {exc}")
@@ -2929,7 +3060,28 @@ def _warm_cache_file_parallel(file_id: str) -> None:
     _increment_cache_warm_state(**increments)
 
 
-def _run_cache_warm_background(source: str | None, site_key: str | None, limit: int | None) -> None:
+def _run_cache_warm_background(
+    source: str | None,
+    site_key: str | None,
+    limit: int | None,
+    shared_lock: dict[str, Any] | None = None,
+    release_shared_lock: bool = False,
+) -> None:
+    acquired_here = release_shared_lock
+    if shared_lock is None:
+        shared_lock = _acquire_cache_warm_shared_lock()
+        acquired_here = shared_lock is not None
+        if shared_lock is None:
+            _set_cache_warm_state(
+                inflight=False,
+                current_queue=None,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                last_error="Another cache warm worker is already running.",
+                shared_lock=_read_cache_warm_shared_lock(),
+                shared_lock_path=str(_cache_warm_shared_lock_path()),
+            )
+            return
+
     started_at = datetime.now(timezone.utc).isoformat()
     requested = {
         "source": source or "all",
@@ -2948,6 +3100,7 @@ def _run_cache_warm_background(source: str | None, site_key: str | None, limit: 
                 "queues_completed": 0,
                 "folders_scanned": 0,
                 "folders_hydrated": 0,
+                "folders_hot_cached": 0,
                 "frames_seen": 0,
                 "full_res_cached": 0,
                 "thumbs_cached": 0,
@@ -2957,6 +3110,8 @@ def _run_cache_warm_background(source: str | None, site_key: str | None, limit: 
                 "last_error": None,
                 "stop_requested": False,
                 "batch_size": CACHE_WARM_BATCH_SIZE,
+                "shared_lock": shared_lock,
+                "shared_lock_path": str(_cache_warm_shared_lock_path()),
             }
         )
 
@@ -2971,10 +3126,13 @@ def _run_cache_warm_background(source: str | None, site_key: str | None, limit: 
     except Exception as exc:
         _append_cache_warm_error(str(exc))
     finally:
+        if acquired_here:
+            _release_cache_warm_shared_lock(shared_lock)
         _set_cache_warm_state(
             inflight=False,
             current_queue=None,
             completed_at=datetime.now(timezone.utc).isoformat(),
+            shared_lock=None,
         )
 
 
@@ -2987,7 +3145,23 @@ def _start_cache_warm(source: str | None, site_key: str | None, limit: int | Non
         _cache_warm_state["inflight"] = True
         _cache_warm_state["stop_requested"] = False
 
-    _cache_warm_executor.submit(_run_cache_warm_background, source, site_key, limit)
+    shared_lock = _acquire_cache_warm_shared_lock()
+    if shared_lock is None:
+        _set_cache_warm_state(
+            inflight=False,
+            current_queue=None,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            last_error="Another cache warm worker is already running.",
+            shared_lock=_read_cache_warm_shared_lock(),
+            shared_lock_path=str(_cache_warm_shared_lock_path()),
+        )
+        return False, _cache_warm_state_snapshot()
+
+    _set_cache_warm_state(
+        shared_lock=shared_lock,
+        shared_lock_path=str(_cache_warm_shared_lock_path()),
+    )
+    _cache_warm_executor.submit(_run_cache_warm_background, source, site_key, limit, shared_lock, True)
     return True, _cache_warm_state_snapshot()
 
 
@@ -3788,6 +3962,13 @@ def api_cache_status():
             error = error or str(exc)
 
     temp_root = Path(tempfile.gettempdir()).resolve()
+    with _hydrated_folder_cache_lock:
+        hydrated_cache_entries = len(_hydrated_folder_cache)
+        hydrated_hot_entries = sum(
+            1
+            for _cached_at, payload in _hydrated_folder_cache.values()
+            if isinstance(payload, dict) and payload.get("cache_ready")
+        )
     try:
         resolved_cache_dir = cache_dir.resolve()
     except OSError:
@@ -3817,6 +3998,10 @@ def api_cache_status():
             "uses_temp_cache": uses_temp_cache,
             "cache_max_mb": CACHE_MAX_MB,
             "cache_ttl_hours": CACHE_TTL_HOURS,
+            "ready_target": REOLINK_PREWARM_TARGET,
+            "label_ready_target_configured": LABEL_READY_TARGET_CONFIGURED,
+            "hydrated_cache_entries": hydrated_cache_entries,
+            "hydrated_hot_entries": hydrated_hot_entries,
             "scan_included": include_counts,
             "full_res_count": full_res_count if include_counts else None,
             "thumb_count": thumb_count if include_counts else None,
@@ -3839,6 +4024,8 @@ def api_cache_warm_start():
             limit = max(1, int(raw_limit))
         except (TypeError, ValueError):
             return jsonify({"error": "limit must be a positive integer"}), 400
+    elif LABEL_READY_TARGET_CONFIGURED:
+        limit = REOLINK_PREWARM_TARGET
 
     try:
         if source:
@@ -4179,14 +4366,18 @@ def api_preprocess_status():
                 "last_run_triplets": int(video_state.get("last_run_triplets") or 0),
                 "last_error": video_state["last_error"],
                 "low_watermark": AUTOLABEL_VIDEO_LOW_WATERMARK,
+                "ready_target": AUTOLABEL_VIDEO_LOW_WATERMARK,
                 "batch_size": AUTOLABEL_VIDEO_BATCH_SIZE,
             },
             "reolink": {
                 "prewarm_target": REOLINK_PREWARM_TARGET,
+                "ready_target": REOLINK_PREWARM_TARGET,
                 "sites": [site.site_key for site in REOLINK_SITES],
                 "inflight": bool(reolink_inflight),
                 "inflight_queues": reolink_inflight,
             },
+            "ready_target": REOLINK_PREWARM_TARGET,
+            "label_ready_target_configured": LABEL_READY_TARGET_CONFIGURED,
             "maintainer": {
                 "inflight": bool(maintainer_state["inflight"]),
                 "started": bool(maintainer_state["started"]),

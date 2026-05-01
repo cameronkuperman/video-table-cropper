@@ -311,6 +311,7 @@ def fake_drive(monkeypatch, tmp_path):
     label_app._hydrated_folder_cache.clear()
     label_app._preview_prewarm_inflight.clear()
     label_app._folder_prewarm_inflight.clear()
+    label_app._reolink_preprocess_inflight.clear()
     label_app._camera_config_cache = None
     label_app._crop_config_cache.clear()
     label_app._label_job_worker_rerun_requested = False
@@ -501,7 +502,41 @@ def test_cache_warmer_skips_existing_volume_files(fake_drive, tmp_path, monkeypa
     assert state["thumbs_cached"] == 2
     assert state["skipped_full_res"] == 1
     assert state["skipped_thumbs"] == 1
+    assert state["folders_hot_cached"] == 1
     assert state["errors"] == []
+    assert not label_app._cache_warm_shared_lock_path().exists()
+    cached = label_app._get_cached_hydrated_folder(label_app.VIDEO_SOURCE, "video-triplet")
+    assert cached is not label_app._MISSING
+    assert cached["cache_ready"] is True
+
+
+def test_label_ready_target_env_overrides_legacy_targets(monkeypatch):
+    monkeypatch.setenv("LABEL_READY_TARGET", "359")
+    monkeypatch.setenv("LABEL_REOLINK_PREWARM_TARGET", "5000")
+    monkeypatch.setenv("AUTOLABEL_VIDEO_LOW_WATERMARK", "1000")
+    monkeypatch.setenv("LABEL_PREWARM_FOLDER_COUNT", "60")
+
+    assert label_app._ready_target_or_legacy_env("LABEL_REOLINK_PREWARM_TARGET", 1000) == 359
+    assert label_app._ready_target_or_legacy_env("AUTOLABEL_VIDEO_LOW_WATERMARK", 1000) == 359
+    assert label_app._ready_target_or_legacy_env("LABEL_PREWARM_FOLDER_COUNT", 400) == 359
+
+
+def test_cache_warm_shared_lock_blocks_second_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._set_cache_warm_state(inflight=False, last_error=None)
+
+    token = label_app._acquire_cache_warm_shared_lock()
+    assert token is not None
+    try:
+        started, state = label_app._start_cache_warm(label_app.VIDEO_SOURCE, None, 1)
+    finally:
+        label_app._release_cache_warm_shared_lock(token)
+
+    assert started is False
+    assert state["inflight"] is False
+    assert state["last_error"] == "Another cache warm worker is already running."
+    assert state["shared_lock"]["started_at_epoch"] == token["started_at_epoch"]
+    label_app._set_cache_warm_state(inflight=False, last_error=None, shared_lock=None, shared_lock_path=None)
 
 
 def test_interactive_preview_prewarm_is_bounded(tmp_path, monkeypatch):
