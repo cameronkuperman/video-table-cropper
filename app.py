@@ -15,13 +15,14 @@ import hmac
 import secrets
 import tempfile
 import time
+import zipfile
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlencode
 
 from flask import (
@@ -144,6 +145,9 @@ LABEL_DESTINATIONS = ("clean", "dirty", "occupied", "label_later", "discarded")
 MATTHEWS_SITE_KEY = "reolink-matthews-01"
 CROP_CONFIGS_FOLDER_NAME = "crop_configs"
 PROCESSED_RAW_FOLDER_NAME = "processed_raw"
+UNASSOCIATED_ZIPS_FOLDER_NAME = "unassociated_zips"
+UNASSOCIATED_ZIPS_MANIFEST_FILE = ".compactor_manifest.jsonl"
+UNASSOCIATED_ZIPS_INNER_MANIFEST = "MANIFEST.json"
 PREPROCESS_STATE_SCHEMA_VERSION = 1
 PREPROCESS_STATE_FILE_NAME = "preprocess_state.json"
 LABEL_HISTORY_SCHEMA_VERSION = 1
@@ -516,7 +520,7 @@ def _api_json_error(error: Exception) -> Any:
         code = getattr(error, "name", "http_error").lower().replace(" ", "_")
     else:
         status_code = 500
-        message = str(error) or "Internal server error"
+        message = "Internal server error"
         code = "internal_error"
         app.logger.exception("Unhandled API error on %s", request.path)
 
@@ -701,6 +705,13 @@ def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, st
                     updated["root"],
                     PROCESSED_RAW_FOLDER_NAME,
                 )
+            if UNASSOCIATED_ZIPS_FOLDER_NAME not in updated:
+                existing_zips = client.find_file_by_name(
+                    updated["root"], UNASSOCIATED_ZIPS_FOLDER_NAME, mime_type=FOLDER_MIME
+                )
+                if existing_zips and existing_zips.get("id"):
+                    updated = dict(updated)
+                    updated[UNASSOCIATED_ZIPS_FOLDER_NAME] = str(existing_zips["id"])
             if any(updated.get(name) != shared[name] for name in LABEL_DESTINATIONS):
                 updated = {**updated, **shared}
             if updated is not cached:
@@ -724,6 +735,11 @@ def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, st
                 PROCESSED_RAW_FOLDER_NAME,
             ),
         }
+        existing_zips = client.find_file_by_name(
+            site_root_id, UNASSOCIATED_ZIPS_FOLDER_NAME, mime_type=FOLDER_MIME
+        )
+        if existing_zips and existing_zips.get("id"):
+            folder_ids[UNASSOCIATED_ZIPS_FOLDER_NAME] = str(existing_zips["id"])
         if site.manual_crop_configs:
             folder_ids["crop_configs"] = client.ensure_subfolder(site_root_id, CROP_CONFIGS_FOLDER_NAME)
         folder_ids.update(shared)
@@ -2318,23 +2334,42 @@ def _copy_optional_json_file(
 def _materialize_reolink_table_crops(
     client: DriveClient,
     context: QueueContext,
-    raw_folder: dict[str, str],
+    raw_folder: dict[str, Any],
     missing_table_polygons: list[tuple[str, list, tuple[int, int, int, int], list]],
+    *,
+    local_frame_paths: list[Path] | None = None,
+    local_metadata_path: Path | None = None,
 ) -> list[str]:
+    """Crop a raw triplet into per-table folders under unlabeled/.
+
+    By default the source frames live on Drive under raw_folder["id"]. When
+    `local_frame_paths` is provided (zip-sourced triplets), Drive list/download
+    is skipped and the local files are read directly. `local_metadata_path`
+    optionally points at a metadata.json on disk that should be copied to each
+    destination folder.
+    """
     from PIL import Image
     from person_detector import assign_track_ids, build_perception_for_table, detect_people_in_frame
     from processor import perspective_crop_polygon, save_jpeg, _scale_table_polygons
 
-    source_files = {
-        item["name"]: item
-        for item in client.list_files(
-            raw_folder["id"],
-            fields="id,name,mimeType,parents,appProperties",
-        )
-    }
-    frame_items = [source_files.get(f"frame_{idx}.jpg") for idx in range(3)]
-    if any(item is None for item in frame_items):
-        return []
+    using_local = local_frame_paths is not None
+
+    source_files: dict[str, dict[str, Any]] = {}
+    if not using_local:
+        source_files = {
+            item["name"]: item
+            for item in client.list_files(
+                raw_folder["id"],
+                fields="id,name,mimeType,parents,appProperties",
+            )
+        }
+        frame_items = [source_files.get(f"frame_{idx}.jpg") for idx in range(3)]
+        if any(item is None for item in frame_items):
+            return []
+    else:
+        if len(local_frame_paths) != 3 or not all(p.exists() for p in local_frame_paths):
+            return []
+        frame_items = [None, None, None]  # unused when using_local
 
     camera_match = _mapped_camera_tables_for_reolink_folder(
         raw_folder["name"],
@@ -2355,11 +2390,14 @@ def _materialize_reolink_table_crops(
 
     with tempfile.TemporaryDirectory(prefix="reolink_labeler_") as tmpdir:
         tmp = Path(tmpdir)
-        frame_paths: list[Path] = []
-        for idx, frame_item in enumerate(frame_items):
-            output_path = tmp / f"frame_{idx}.jpg"
-            client.download_file_to_path(frame_item["id"], output_path)
-            frame_paths.append(output_path)
+        if using_local:
+            frame_paths = list(local_frame_paths)
+        else:
+            frame_paths = []
+            for idx, frame_item in enumerate(frame_items):
+                output_path = tmp / f"frame_{idx}.jpg"
+                client.download_file_to_path(frame_item["id"], output_path)
+                frame_paths.append(output_path)
 
         with Image.open(frame_paths[0]) as image:
             frame_h, frame_w = image.height, image.width
@@ -2416,10 +2454,194 @@ def _materialize_reolink_table_crops(
                 mime_type="application/json",
             )
 
-            _copy_optional_json_file(client, source_files, "metadata.json", dest_folder_id)
+            if using_local:
+                if local_metadata_path is not None and local_metadata_path.exists():
+                    client.upsert_bytes(
+                        dest_folder_id,
+                        "metadata.json",
+                        local_metadata_path.read_bytes(),
+                        mime_type="application/json",
+                    )
+            else:
+                _copy_optional_json_file(client, source_files, "metadata.json", dest_folder_id)
             generated_names.append(derived_name)
 
         return generated_names
+
+
+@dataclass
+class _UnassociatedZipBatch:
+    """One zip from <site>/unassociated_zips/, downloaded and extracted locally.
+
+    `triplets` is a list of synthetic raw_folder dicts (id/name only) that
+    `_prepare_reolink_unlabeled_queue` can consume the same way it consumes
+    Drive-listed raw folders. Each entry carries `_local_frame_paths` and
+    `_local_metadata_path` so `_materialize_reolink_table_crops` can read
+    files from local disk.
+    """
+
+    zip_file_id: str
+    zip_name: str
+    triplets: list[dict[str, Any]]
+    work_dir: Path
+    _tmp_handle: tempfile.TemporaryDirectory[str]
+    _success_ids: set[str]
+    _failure_ids: set[str]
+
+    def mark_success(self, triplet_id: str) -> None:
+        self._success_ids.add(triplet_id)
+
+    def mark_failure(self, triplet_id: str) -> None:
+        self._failure_ids.add(triplet_id)
+
+    def all_terminal(self) -> bool:
+        terminal = self._success_ids | self._failure_ids
+        return all(t["id"] in terminal for t in self.triplets)
+
+    def cleanup(self) -> None:
+        try:
+            self._tmp_handle.cleanup()
+        except Exception:
+            pass
+
+
+def _iterate_unassociated_zip_batches(
+    client: DriveClient,
+    context: QueueContext,
+    *,
+    max_batches: int | None = None,
+) -> Iterator[_UnassociatedZipBatch]:
+    """Yield extracted zip batches from <site>/unassociated_zips/, oldest first.
+
+    The caller should mark each triplet's success/failure on the yielded handle
+    and then either let the iterator finalize the zip on the next iteration
+    (deletes the zip if every triplet reached a terminal state and at least one
+    succeeded), or call `cleanup()` to release the local temp dir without
+    deleting the zip from Drive.
+    """
+    zips_folder_id = context.folder_ids.get(UNASSOCIATED_ZIPS_FOLDER_NAME)
+    if not zips_folder_id:
+        return
+
+    zip_files = client.list_files(
+        zips_folder_id,
+        fields="id,name,mimeType,modifiedTime,size",
+    )
+    zip_files = [
+        f
+        for f in zip_files
+        if str(f.get("name", "")).endswith(".zip")
+        and str(f.get("name", "")) != UNASSOCIATED_ZIPS_MANIFEST_FILE
+    ]
+    zip_files.sort(key=lambda f: str(f.get("modifiedTime") or ""))
+
+    if max_batches is not None:
+        zip_files = zip_files[:max_batches]
+
+    for zip_file in zip_files:
+        zip_id = str(zip_file["id"])
+        zip_name = str(zip_file.get("name") or zip_id)
+
+        tmp_handle = tempfile.TemporaryDirectory(prefix=f"reolink_zip_{zip_id}_")
+        work_dir = Path(tmp_handle.name)
+        zip_local_path = work_dir / zip_name
+        try:
+            client.download_file_to_path(zip_id, zip_local_path)
+        except Exception as exc:
+            print(f"[zip-batch] failed to download zip {zip_name} ({zip_id}): {exc}")
+            tmp_handle.cleanup()
+            continue
+
+        extract_dir = work_dir / "extracted"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(zip_local_path, "r") as zf:
+                zf.extractall(extract_dir)
+        except Exception as exc:
+            print(f"[zip-batch] failed to extract zip {zip_name} ({zip_id}): {exc}")
+            tmp_handle.cleanup()
+            continue
+
+        manifest_path = extract_dir / UNASSOCIATED_ZIPS_INNER_MANIFEST
+        if not manifest_path.exists():
+            print(f"[zip-batch] zip {zip_name} missing {UNASSOCIATED_ZIPS_INNER_MANIFEST}; skipping")
+            tmp_handle.cleanup()
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[zip-batch] zip {zip_name} has unreadable manifest: {exc}")
+            tmp_handle.cleanup()
+            continue
+
+        triplets: list[dict[str, Any]] = []
+        for entry in manifest.get("triplets") or []:
+            triplet_id = str(entry.get("triplet_id") or "")
+            triplet_name = str(entry.get("triplet_name") or "")
+            sanitized_path = str(entry.get("sanitized_path") or "")
+            if not triplet_id or not triplet_name or not sanitized_path:
+                continue
+            triplet_dir = extract_dir / sanitized_path
+            frame_paths = [triplet_dir / f"frame_{idx}.jpg" for idx in range(3)]
+            if not all(p.exists() for p in frame_paths):
+                continue
+            metadata_path = triplet_dir / "metadata.json"
+            triplets.append(
+                {
+                    "id": triplet_id,
+                    "name": triplet_name,
+                    "parents": [],
+                    "appProperties": {},
+                    "_local_frame_paths": frame_paths,
+                    "_local_metadata_path": metadata_path if metadata_path.exists() else None,
+                    "_zip_sourced": True,
+                }
+            )
+
+        if not triplets:
+            print(f"[zip-batch] zip {zip_name} contained no usable triplets; skipping")
+            tmp_handle.cleanup()
+            continue
+
+        batch = _UnassociatedZipBatch(
+            zip_file_id=zip_id,
+            zip_name=zip_name,
+            triplets=triplets,
+            work_dir=extract_dir,
+            _tmp_handle=tmp_handle,
+            _success_ids=set(),
+            _failure_ids=set(),
+        )
+        try:
+            yield batch
+        finally:
+            _finalize_zip_batch(client, batch)
+
+
+def _finalize_zip_batch(client: DriveClient, batch: _UnassociatedZipBatch) -> None:
+    """Delete the zip from Drive iff every triplet reached a terminal state and
+    at least one succeeded. Otherwise leave the zip on Drive for retry."""
+    try:
+        if batch.all_terminal() and batch._success_ids and not batch._failure_ids:
+            try:
+                client.delete_file(batch.zip_file_id)
+                print(
+                    f"[zip-batch] deleted processed zip {batch.zip_name} "
+                    f"({batch.zip_file_id}) — {len(batch._success_ids)} triplets cropped"
+                )
+            except Exception as exc:
+                print(
+                    f"[zip-batch] failed to delete processed zip {batch.zip_name} "
+                    f"({batch.zip_file_id}): {exc}"
+                )
+        elif batch._failure_ids:
+            print(
+                f"[zip-batch] left zip {batch.zip_name} on Drive "
+                f"({len(batch._success_ids)} succeeded, {len(batch._failure_ids)} failed/skipped) "
+                f"— will retry next prewarm"
+            )
+    finally:
+        batch.cleanup()
 
 
 def _prepare_reolink_unlabeled_queue(
@@ -2452,8 +2674,102 @@ def _prepare_reolink_unlabeled_queue(
         if visible_count >= target_unlabeled_count:
             return 0
 
-        raw_folders = _list_reolink_raw_folders(client, context)
         preprocess_state = _load_preprocess_state()
+
+        # Phase 3: drain zipped unprocessed batches first (older queue from
+        # before the per-triplet upload pattern; lives at <site>/unassociated_zips/).
+        # Each zip is a batch of raw triplets compacted by
+        # scripts/compact_unassociated_to_zips.py. We download, extract,
+        # process each triplet from local files, then delete the zip when
+        # every triplet inside it has reached a terminal state.
+        for zip_batch in _iterate_unassociated_zip_batches(client, context):
+            if visible_count >= target_unlabeled_count:
+                break
+            for triplet in zip_batch.triplets:
+                if visible_count >= target_unlabeled_count:
+                    break
+                triplet_id = triplet["id"]
+                if _reolink_raw_folder_processed(preprocess_state, context, triplet):
+                    zip_batch.mark_success(triplet_id)
+                    continue
+
+                mapped = _mapped_camera_tables_for_reolink_folder(
+                    str(triplet.get("name", "")),
+                    site_key=context.site_key,
+                    client=client,
+                )
+                if mapped is None:
+                    zip_batch.mark_failure(triplet_id)
+                    continue
+
+                _channel_number, _camera, table_polygons = mapped
+                missing_table_polygons = [
+                    entry
+                    for entry in table_polygons
+                    if (
+                        _derived_reolink_folder_name(str(triplet["name"]), entry[0])
+                        not in existing_names
+                        and _apply_source_prefix(
+                            _derived_reolink_folder_name(str(triplet["name"]), entry[0]),
+                            label_source,
+                        )
+                        not in existing_names
+                    )
+                ]
+                if not missing_table_polygons:
+                    _mark_reolink_raw_folder_processed(
+                        preprocess_state,
+                        context,
+                        triplet,
+                        status="complete",
+                        generated=0,
+                    )
+                    zip_batch.mark_success(triplet_id)
+                    continue
+
+                try:
+                    generated_names = _materialize_reolink_table_crops(
+                        client,
+                        context,
+                        triplet,
+                        missing_table_polygons,
+                        local_frame_paths=triplet["_local_frame_paths"],
+                        local_metadata_path=triplet.get("_local_metadata_path"),
+                    )
+                except Exception as exc:
+                    print(
+                        f"[zip-batch] crop failed for {triplet.get('name')} ({triplet_id}): {exc}"
+                    )
+                    zip_batch.mark_failure(triplet_id)
+                    continue
+
+                raw_generated_count = 0
+                for name in generated_names:
+                    existing_names.add(name)
+                    unlabeled_count += 1
+                    visible_count += 1
+                    generated_any = True
+                    generated_count += 1
+                    raw_generated_count += 1
+
+                if raw_generated_count > 0:
+                    _mark_reolink_raw_folder_processed(
+                        preprocess_state,
+                        context,
+                        triplet,
+                        status="complete",
+                        generated=raw_generated_count,
+                    )
+                    zip_batch.mark_success(triplet_id)
+                else:
+                    zip_batch.mark_failure(triplet_id)
+
+        if visible_count >= target_unlabeled_count:
+            if generated_any:
+                _invalidate_listing_cache(context.queue_key)
+            return generated_count
+
+        raw_folders = _list_reolink_raw_folders(client, context)
 
         for raw_folder in raw_folders:
             if visible_count >= target_unlabeled_count:
@@ -4347,7 +4663,7 @@ def api_label():
             site_key=site_key,
             queue_key=queue_key,
         )
-        return jsonify({"error": str(e) or "Internal server error", "code": "internal_error"}), 500
+        return jsonify({"error": "Internal server error", "code": "internal_error"}), 500
 
 
 @app.route("/api/label/cancel", methods=["POST"])
@@ -4407,7 +4723,7 @@ def api_label_cancel():
             site_key=site_key,
             queue_key=queue_key,
         )
-        return jsonify({"error": str(e) or "Internal server error", "code": "internal_error"}), 500
+        return jsonify({"error": "Internal server error", "code": "internal_error"}), 500
 
 
 @app.route("/api/stats")

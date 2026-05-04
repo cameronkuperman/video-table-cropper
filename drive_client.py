@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
+import google_auth_httplib2
+import httplib2
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -19,7 +21,14 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBa
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
-RETRYABLE_HTTP_STATUSES = {403, 408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_HTTP_403_REASONS = {
+    "backendError",
+    "dailyLimitExceeded",
+    "internalError",
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+}
 T = TypeVar("T")
 
 
@@ -32,9 +41,11 @@ class DriveClient:
 
     def __init__(self, credentials_path: str | None = None) -> None:
         credentials = self._load_credentials(credentials_path)
+        self.credentials = credentials
         self.service = build("drive", "v3", credentials=credentials, cache_discovery=False)
         self.retry_attempts = max(1, int(os.environ.get("DRIVE_API_RETRY_ATTEMPTS", "6") or "6"))
         self.retry_base_seconds = max(0.25, float(os.environ.get("DRIVE_API_RETRY_BASE_SECONDS", "2.0") or "2.0"))
+        self.http_timeout_seconds = max(1, int(os.environ.get("DRIVE_HTTP_TIMEOUT_SECONDS", "120") or "120"))
 
     @staticmethod
     def _load_credentials(credentials_path: str | None = None):
@@ -80,11 +91,58 @@ class DriveClient:
         return value.replace("'", "\\'")
 
     @staticmethod
+    def _http_error_reasons(exc: HttpError) -> set[str]:
+        try:
+            raw = exc.content.decode("utf-8") if isinstance(exc.content, bytes) else str(exc.content)
+            payload = json.loads(raw)
+        except Exception:
+            return set()
+
+        reasons: set[str] = set()
+        for item in payload.get("error", {}).get("errors", []) or []:
+            reason = item.get("reason")
+            if reason:
+                reasons.add(str(reason))
+        reason = payload.get("error", {}).get("status")
+        if reason:
+            reasons.add(str(reason))
+        return reasons
+
+    @classmethod
     def _is_retryable_exception(exc: Exception) -> bool:
         if isinstance(exc, HttpError):
             status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 403:
+                reasons = cls._http_error_reasons(exc)
+                return bool(reasons & RETRYABLE_HTTP_403_REASONS)
             return bool(status in RETRYABLE_HTTP_STATUSES)
-        return isinstance(exc, (ssl.SSLError, socket.timeout, socket.gaierror, ConnectionError))
+        return isinstance(exc, (httplib2.HttpLib2Error, ssl.SSLError, socket.timeout, socket.gaierror, ConnectionError))
+
+    @staticmethod
+    def is_not_found_error(exc: Exception) -> bool:
+        cause = exc.__cause__ if isinstance(exc, DriveClientError) else exc
+        return (
+            isinstance(cause, HttpError)
+            and getattr(getattr(cause, "resp", None), "status", None) == 404
+        )
+
+    def fresh_authorized_http(self):
+        """Return a new authorized HTTP transport.
+
+        Resumable uploads can poison a persistent httplib2 connection after a
+        BrokenPipe/SSL reset. A fresh transport lets callers keep the Drive
+        resumable session but drop the dead socket.
+        """
+        http = httplib2.Http(timeout=self.http_timeout_seconds)
+        # Drive resumable uploads use 308 Resume Incomplete as a normal
+        # progress response. httplib2 treats 308 as a redirect by default,
+        # which raises RedirectMissingLocation before googleapiclient can read
+        # the upload progress headers.
+        http.redirect_codes = frozenset(code for code in http.redirect_codes if code != 308)
+        return google_auth_httplib2.AuthorizedHttp(
+            self.credentials,
+            http=http,
+        )
 
     def _execute_with_retry(self, operation: Callable[[], T], context: str) -> T:
         last_error: Exception | None = None
