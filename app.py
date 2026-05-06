@@ -1,6 +1,10 @@
 """
 --label mode: Flask UI that reads unlabeled/ subfolders from Drive,
-shows 3 images per folder, and moves the folder on Drive when labeled.
+shows N images per folder, and moves the folder on Drive when labeled.
+
+Group size N is detected per-folder at runtime (typically 10 today, 3 for
+legacy data). The wire/Drive protocol still uses "triplet" naming for
+backwards compatibility.
 """
 
 from __future__ import annotations
@@ -43,10 +47,56 @@ from werkzeug.exceptions import HTTPException
 from drive_client import DriveClient, DriveClientError, FOLDER_MIME
 from env_loader import load_local_env
 from queue_metadata import (
+    LEGACY_FRAMES_PER_GROUP,
+    MAX_FRAMES_PER_GROUP,
     build_folder_app_properties,
     extract_frame_ids_from_item,
+    frame_slot_keys,
     has_complete_frame_ids,
 )
+
+_FRAME_FILENAME_RE = re.compile(r"^frame_(\d+)\.jpg$")
+
+
+def _detect_n_from_file_names(names: Any) -> int:
+    """Count `frame_*.jpg` files (any iterable of names or dict of name→item)
+    and return how many distinct frame indices are present, treated as N.
+
+    Returns 0 when no frame files are found.
+    """
+    if isinstance(names, dict):
+        iterable = names.keys()
+    else:
+        iterable = names
+    indices: set[int] = set()
+    for name in iterable:
+        m = _FRAME_FILENAME_RE.match(str(name))
+        if m:
+            indices.add(int(m.group(1)))
+    return len(indices)
+
+
+def _detect_n_from_frame_dict(frames: dict[str, Any]) -> int:
+    """Number of frame_N keys present in a frames dict, used to recover N
+    when reading from Drive metadata that was written with the new schema."""
+    indices: set[int] = set()
+    for key in frames.keys():
+        m = re.match(r"^frame_(\d+)$", str(key))
+        if m:
+            indices.add(int(m.group(1)))
+    return len(indices)
+
+
+def _ordered_frame_keys(frames: dict[str, Any]) -> list[str]:
+    """Return present frame_N keys sorted by N. Use this everywhere that
+    iterates a frames dict so the order is deterministic regardless of N."""
+    keyed: list[tuple[int, str]] = []
+    for key in frames.keys():
+        m = re.match(r"^frame_(\d+)$", str(key))
+        if m:
+            keyed.append((int(m.group(1)), str(key)))
+    keyed.sort()
+    return [k for _, k in keyed]
 
 load_local_env()
 
@@ -1357,12 +1407,16 @@ def _save_label_history_unlocked(history: dict[str, Any]) -> None:
 
 
 def _frame_signature_from_frames(frames: dict[str, str | None]) -> str:
-    return "|".join(str(frames.get(key) or "") for key in ("frame_0", "frame_1", "frame_2"))
+    keys = _ordered_frame_keys(frames)
+    return "|".join(str(frames.get(key) or "") for key in keys)
 
 
 def _content_signature_from_frames(frames: dict[str, str | None]) -> str:
     parts: list[str] = []
-    for key in ("frame_0", "frame_1", "frame_2"):
+    keys = _ordered_frame_keys(frames)
+    if not keys:
+        return ""
+    for key in keys:
         file_id = frames.get(key)
         if not file_id:
             return ""
@@ -2237,6 +2291,9 @@ def _find_reolink_reference_frame(
                 fields="id,name,mimeType,parents,appProperties",
             )
         }
+        # frame_0.jpg is intentionally used as the reference image: every group
+        # has a frame_0 regardless of N, and we only need one frame to extract
+        # the camera's image dimensions for crop calibration.
         frame_item = source_files.get("frame_0.jpg")
         if not frame_item or not frame_item.get("id"):
             continue
@@ -2266,7 +2323,14 @@ def _find_reolink_reference_frame(
             "width": width,
             "height": height,
         }
-        if all(source_files.get(f"frame_{idx}.jpg") for idx in range(3)):
+        # Treat the folder as fully present if it has at least the legacy
+        # 3 frames OR a complete contiguous frame_0..N-1 set. We only need
+        # one valid reference frame, so accept any folder whose first frame
+        # exists; richer N detection happens during materialization.
+        n_present = _detect_n_from_file_names(source_files)
+        if n_present >= LEGACY_FRAMES_PER_GROUP and all(
+            source_files.get(f"frame_{idx}.jpg") for idx in range(n_present)
+        ):
             return reference_payload
         if fallback_reference is None:
             fallback_reference = reference_payload
@@ -2363,13 +2427,17 @@ def _materialize_reolink_table_crops(
                 fields="id,name,mimeType,parents,appProperties",
             )
         }
-        frame_items = [source_files.get(f"frame_{idx}.jpg") for idx in range(3)]
+        n_frames = _detect_n_from_file_names(source_files)
+        if n_frames < LEGACY_FRAMES_PER_GROUP:
+            return []
+        frame_items = [source_files.get(f"frame_{idx}.jpg") for idx in range(n_frames)]
         if any(item is None for item in frame_items):
             return []
     else:
-        if len(local_frame_paths) != 3 or not all(p.exists() for p in local_frame_paths):
+        n_frames = len(local_frame_paths)
+        if n_frames < LEGACY_FRAMES_PER_GROUP or not all(p.exists() for p in local_frame_paths):
             return []
-        frame_items = [None, None, None]  # unused when using_local
+        frame_items = [None] * n_frames  # unused when using_local
 
     camera_match = _mapped_camera_tables_for_reolink_folder(
         raw_folder["name"],
@@ -2422,9 +2490,7 @@ def _materialize_reolink_table_crops(
             )
             dest_folder_id = client.ensure_subfolder(context.input_folder_id, derived_name)
             uploaded_frame_ids: dict[str, str | None] = {
-                "frame_0": None,
-                "frame_1": None,
-                "frame_2": None,
+                f"frame_{i}": None for i in range(n_frames)
             }
 
             for frame_idx, frame_path in enumerate(frame_paths):
@@ -2443,7 +2509,9 @@ def _materialize_reolink_table_crops(
                 {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
             )
 
-            perception = build_perception_for_table(frame_detections, tight_poly, img_shape)
+            perception = build_perception_for_table(
+                frame_detections, tight_poly, img_shape, n_frames=n_frames
+            )
             perception_path = tmp / "perception" / f"{derived_name}_perception.json"
             perception_path.parent.mkdir(parents=True, exist_ok=True)
             perception_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
@@ -2582,7 +2650,17 @@ def _iterate_unassociated_zip_batches(
             if not triplet_id or not triplet_name or not sanitized_path:
                 continue
             triplet_dir = extract_dir / sanitized_path
-            frame_paths = [triplet_dir / f"frame_{idx}.jpg" for idx in range(3)]
+            # Detect N by scanning what the producer actually wrote — the
+            # manifest schema may not specify it on older zips. Fall back to
+            # the legacy 3-frame layout if no frame files match the pattern.
+            present_indices = sorted({
+                int(m.group(1))
+                for child in triplet_dir.iterdir() if child.is_file()
+                for m in [_FRAME_FILENAME_RE.match(child.name)]
+                if m
+            }) if triplet_dir.is_dir() else []
+            n_frames_in_zip = len(present_indices) or LEGACY_FRAMES_PER_GROUP
+            frame_paths = [triplet_dir / f"frame_{idx}.jpg" for idx in range(n_frames_in_zip)]
             if not all(p.exists() for p in frame_paths):
                 continue
             metadata_path = triplet_dir / "metadata.json"
@@ -3025,11 +3103,8 @@ def _list_source_subfolders(
 
 def _frame_payload_from_files(files: list[dict]) -> dict[str, str | None]:
     file_map = {f["name"]: f["id"] for f in files}
-    return {
-        "frame_0": file_map.get("frame_0.jpg"),
-        "frame_1": file_map.get("frame_1.jpg"),
-        "frame_2": file_map.get("frame_2.jpg"),
-    }
+    n = _detect_n_from_file_names(file_map) or LEGACY_FRAMES_PER_GROUP
+    return {f"frame_{i}": file_map.get(f"frame_{i}.jpg") for i in range(n)}
 
 
 def _frame_payload_from_folder(folder: dict[str, object]) -> dict[str, str | None]:
@@ -3098,7 +3173,10 @@ def _thumb_path_for_file(file_id: str) -> Path:
 
 
 def _frames_cache_ready(frames: dict[str, str | None]) -> bool:
-    for key in ("frame_0", "frame_1", "frame_2"):
+    keys = _ordered_frame_keys(frames)
+    if not keys:
+        return False
+    for key in keys:
         file_id = frames.get(key)
         if not file_id or not _cache_path_for_file(file_id).exists():
             return False
@@ -3106,7 +3184,10 @@ def _frames_cache_ready(frames: dict[str, str | None]) -> bool:
 
 
 def _thumbs_cache_ready(frames: dict[str, str | None]) -> bool:
-    for key in ("frame_0", "frame_1", "frame_2"):
+    keys = _ordered_frame_keys(frames)
+    if not keys:
+        return False
+    for key in keys:
         file_id = frames.get(key)
         if not file_id or not _thumb_path_for_file(file_id).exists():
             return False
@@ -3221,7 +3302,7 @@ def _schedule_preview_prewarm(hydrated_folders: list[dict]) -> int:
     scheduled = 0
     for folder in warm_targets:
         frames = folder.get("frames", {})
-        for key in ("frame_0", "frame_1", "frame_2"):
+        for key in _ordered_frame_keys(frames):
             file_id = frames.get(key)
             if not file_id:
                 continue
@@ -3413,7 +3494,7 @@ def _warm_cache_folder_parallel(context: QueueContext, folder: dict[str, str]) -
             return
 
         file_futures = []
-        for key in ("frame_0", "frame_1", "frame_2"):
+        for key in _ordered_frame_keys(frames):
             if _cache_warm_stop_requested():
                 break
             file_id = frames.get(key)
@@ -4571,18 +4652,23 @@ def api_label():
             return jsonify({"error": "parent_id does not match the active queue"}), 400
 
         raw_frames = data.get("frames") if isinstance(data.get("frames"), dict) else {}
+        # Accept whatever frame_N keys the client sends (1..MAX). Fall back to
+        # the legacy 3-frame slot set when nothing recognizable was provided so
+        # old clients still produce a valid (empty) frames dict.
+        n_from_client = _detect_n_from_frame_dict(raw_frames)
+        slot_count = n_from_client if n_from_client > 0 else LEGACY_FRAMES_PER_GROUP
         frames = {
             key: str(raw_frames.get(key) or "") or None
-            for key in ("frame_0", "frame_1", "frame_2")
+            for key in frame_slot_keys(slot_count)
         }
         frame_signature = str(data.get("frame_signature") or "").strip()
         if not frame_signature:
             frame_signature = _frame_signature_from_frames(frames)
-        if not has_complete_frame_ids(frames):
-            frames = {"frame_0": None, "frame_1": None, "frame_2": None}
+        if not has_complete_frame_ids(frames, n_frames=slot_count):
+            frames = {key: None for key in frame_slot_keys(slot_count)}
         folder_name = str(data.get("folder_name") or "").strip()
         content_signature = str(data.get("content_signature") or "").strip()
-        if not content_signature and has_complete_frame_ids(frames):
+        if not content_signature and has_complete_frame_ids(frames, n_frames=slot_count):
             content_signature = _content_signature_from_frames(frames)
 
         existing_history = _label_history_lookup(context, folder_id, folder_name, frame_signature, content_signature)
@@ -4683,9 +4769,11 @@ def api_label_cancel():
         context = _resolve_queue_context(get_client(), source, site_key)
         queue_key = context.queue_key
         raw_frames = data.get("frames") if isinstance(data.get("frames"), dict) else {}
+        n_from_client = _detect_n_from_frame_dict(raw_frames)
+        slot_count = n_from_client if n_from_client > 0 else LEGACY_FRAMES_PER_GROUP
         frames = {
             key: str(raw_frames.get(key) or "") or None
-            for key in ("frame_0", "frame_1", "frame_2")
+            for key in frame_slot_keys(slot_count)
         }
         frame_signature = str(data.get("frame_signature") or "").strip()
         if not frame_signature:

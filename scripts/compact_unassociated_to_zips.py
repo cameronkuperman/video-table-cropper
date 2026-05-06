@@ -79,7 +79,18 @@ MANIFEST_LOG_NAME = ".compactor_manifest.jsonl"
 MANIFEST_FILE_NAME = "MANIFEST.json"
 SCHEMA_VERSION = 1
 
-EXPECTED_FRAME_NAMES = ("frame_0.jpg", "frame_1.jpg", "frame_2.jpg")
+# Frame files are named `frame_{idx}.jpg` for any group size. The compactor
+# detects N per-triplet from the actual files present rather than hardcoding
+# a count, so groups of 3 (legacy), 10 (current target), or any other size
+# in [MIN, MAX]_FRAMES_PER_GROUP all pass through unchanged.
+FRAME_FILENAME_RE = re.compile(r"^frame_(\d+)\.jpg$")
+MIN_FRAMES_PER_TRIPLET = 2  # mirrors processor.MIN_FRAMES_PER_GROUP
+MAX_FRAMES_PER_TRIPLET = 16  # mirrors processor.MAX_FRAMES_PER_GROUP
+
+
+def _frame_index_from_name(name: str) -> int | None:
+    m = FRAME_FILENAME_RE.match(name)
+    return int(m.group(1)) if m else None
 
 
 @dataclass
@@ -98,6 +109,7 @@ class TripletFolder:
     sanitized_name: str  # safe-on-disk, name__id pattern
     modified_time: dt.datetime | None
     frame_files: list[dict[str, Any]]  # populated lazily before zipping
+    expected_frame_count: int = 0  # detected from frame_files during hydration
 
 
 @dataclass
@@ -373,17 +385,31 @@ def _hydrate_batch_files(
         try:
             worker_client = client if workers <= 1 else _thread_local_client()
             files = worker_client.list_files(triplet.folder_id, fields="id,name,mimeType,size,md5Checksum")
-            frames = [
-                f
-                for f in files
-                if str(f.get("mimeType", "")) != FOLDER_MIME
-                and str(f.get("name", "")) in EXPECTED_FRAME_NAMES
-            ]
-            triplet.frame_files = frames
-            if len(frames) != len(EXPECTED_FRAME_NAMES):
+            frames_by_index: dict[int, dict[str, Any]] = {}
+            for f in files:
+                if str(f.get("mimeType", "")) == FOLDER_MIME:
+                    continue
+                idx = _frame_index_from_name(str(f.get("name", "")))
+                if idx is None:
+                    continue
+                frames_by_index[idx] = f
+
+            if not frames_by_index:
+                return triplet, RuntimeError("no frame_*.jpg files found")
+
+            n = max(frames_by_index) + 1
+            if not (MIN_FRAMES_PER_TRIPLET <= n <= MAX_FRAMES_PER_TRIPLET):
                 return triplet, RuntimeError(
-                    f"expected {len(EXPECTED_FRAME_NAMES)} frames, got {len(frames)}"
+                    f"detected n_frames={n} outside [{MIN_FRAMES_PER_TRIPLET},{MAX_FRAMES_PER_TRIPLET}]"
                 )
+            missing = [i for i in range(n) if i not in frames_by_index]
+            if missing:
+                return triplet, RuntimeError(
+                    f"missing frames {missing} (expected contiguous 0..{n - 1})"
+                )
+
+            triplet.frame_files = [frames_by_index[i] for i in range(n)]
+            triplet.expected_frame_count = n
             return triplet, None
         except Exception as exc:
             return triplet, exc
@@ -462,6 +488,7 @@ def _download_batch_to_local(
             "frames": [],
             "frame_bytes_total": 0,
             "modified_time": triplet.modified_time.isoformat() if triplet.modified_time else None,
+            "frames_per_triplet": triplet.expected_frame_count,
         }
 
     overall_bytes = 0
@@ -503,12 +530,12 @@ def _download_batch_to_local(
     failures: list[tuple[TripletFolder, Exception]] = []
     triplets_meta: list[dict[str, Any]] = []
 
-    expected = len(EXPECTED_FRAME_NAMES)
     for triplet in batch:
         entry = by_triplet[triplet.folder_id]
         entry["frames"].sort(key=lambda f: f["frame_name"])
         entry["frame_count"] = len(entry["frames"])
-        if len(entry["frames"]) == expected and triplet.folder_id not in triplet_errors:
+        expected = triplet.expected_frame_count
+        if expected > 0 and len(entry["frames"]) == expected and triplet.folder_id not in triplet_errors:
             triplets_meta.append(entry)
             archived_triplets.append(triplet)
         else:

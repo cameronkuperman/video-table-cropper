@@ -1,7 +1,11 @@
 """
 --process mode: downloads videos from Drive raw_videos/, extracts frames,
-draws table polygon overlays, uploads triplets to temp_processing/, then
+draws table polygon overlays, uploads frame groups to temp_processing/, then
 crops per-table and uploads to unlabeled/.
+
+Internally a "group" is N frames (default 10 via FRAMES_PER_GROUP_VIDEO);
+historically called a "triplet" when N was 3, and the name is preserved on
+folder suffixes (`_t{idx:04d}`) and metadata keys for backwards compatibility.
 """
 
 from __future__ import annotations
@@ -58,6 +62,57 @@ def _apply_video_prefix(name: str) -> str:
 
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 FRAME_INTERVAL_SECONDS = 3  # extract one frame every N seconds
+
+# Group-size bounds. The "triplet" name is preserved everywhere it touches the
+# wire/Drive protocol (folder suffix `_t{idx:04d}`, app-property
+# `autolabel_preprocess_triplets`, edge config `frames_per_triplet`) for
+# backwards compatibility with deployed clients and existing labeled data.
+# Internally we treat a "group" as N frames; N is detected per-group at runtime.
+MIN_FRAMES_PER_GROUP = 2
+MAX_FRAMES_PER_GROUP = 16
+# Default group size for the video-import path (where the processor regroups a
+# flat list of frames extracted from a single video file). The Pi-zip path
+# detects N from the manifest instead.
+FRAMES_PER_GROUP_VIDEO = 10
+
+
+def detect_n_frames(
+    frame_paths: list[Path] | None = None,
+    metadata: dict | None = None,
+    *,
+    file_count: int | None = None,
+) -> int:
+    """Infer the number of frames in a group.
+
+    Priority: explicit metadata field → file_count argument → len(frame_paths).
+    Validates the result against MIN/MAX_FRAMES_PER_GROUP.
+    """
+    n: int | None = None
+    if metadata:
+        meta_n = metadata.get("frames_per_triplet")
+        if isinstance(meta_n, int):
+            n = meta_n
+    if n is None and file_count is not None:
+        n = int(file_count)
+    if n is None and frame_paths is not None:
+        n = len(frame_paths)
+    if n is None:
+        raise ValueError("detect_n_frames: no source provided")
+    if not (MIN_FRAMES_PER_GROUP <= n <= MAX_FRAMES_PER_GROUP):
+        raise ValueError(
+            f"n_frames={n} outside allowed range [{MIN_FRAMES_PER_GROUP},{MAX_FRAMES_PER_GROUP}]"
+        )
+    return n
+
+
+def frame_keys(n_frames: int) -> tuple[str, ...]:
+    """('frame_0', ..., 'frame_{n-1}')"""
+    return tuple(f"frame_{i}" for i in range(n_frames))
+
+
+def frame_filenames(n_frames: int) -> tuple[str, ...]:
+    """('frame_0.jpg', ..., 'frame_{n-1}.jpg')"""
+    return tuple(f"frame_{i}.jpg" for i in range(n_frames))
 
 
 @dataclass
@@ -572,15 +627,22 @@ def _process_video(
         table_polygons = _scale_table_polygons(table_polygons, ref_w, ref_h, frame_w, frame_h)
         all_polygons = [p for _, p, _, _ in table_polygons]
 
-    # Group into non-overlapping triplets
-    triplets = [frame_paths[i:i+3] for i in range(0, len(frame_paths) - 2, 3)]
+    # Group frames into non-overlapping groups of FRAMES_PER_GROUP_VIDEO.
+    # The variable is still called `triplets` and folder names still use the
+    # `_t{idx:04d}` suffix for protocol/data backwards compatibility — see the
+    # comment on FRAMES_PER_GROUP_VIDEO above.
+    n_frames = FRAMES_PER_GROUP_VIDEO
+    triplets = [
+        frame_paths[i:i + n_frames]
+        for i in range(0, len(frame_paths) - (n_frames - 1), n_frames)
+    ]
     if not triplets:
-        reason = f"not enough frames for a triplet (need >=3, got {len(frame_paths)})"
+        reason = f"not enough frames for a group (need >={n_frames}, got {len(frame_paths)})"
         print(f"  {reason}.")
         return VideoProcessResult(status="skipped", reason=reason)
 
     perception_note = " + perception" if yolo_model is not None else " (no perception — install ultralytics)"
-    print(f"  {len(frame_paths)} frames → {len(triplets)} triplet(s), {len(table_polygons)} table(s){perception_note}")
+    print(f"  {len(frame_paths)} frames → {len(triplets)} group(s) of {n_frames}, {len(table_polygons)} table(s){perception_note}")
 
     # Build set of generated folder names across all destinations for resume.
     # This intentionally includes legacy unprefixed names so online deploys do
@@ -642,9 +704,7 @@ def _process_video(
                     folders["unlabeled"], subfolder_name
                 )
                 uploaded_frame_ids: dict[str, str | None] = {
-                    "frame_0": None,
-                    "frame_1": None,
-                    "frame_2": None,
+                    f"frame_{i}": None for i in range(n_frames)
                 }
 
                 crop_futures = {}
@@ -668,7 +728,9 @@ def _process_video(
                 )
 
                 if frame_detections is not None:
-                    perception = build_perception_for_table(frame_detections, tight_poly, img_shape)
+                    perception = build_perception_for_table(
+                        frame_detections, tight_poly, img_shape, n_frames=n_frames
+                    )
                     perc_path = tmp / "perception" / f"{subfolder_name}_perception.json"
                     perc_path.parent.mkdir(parents=True, exist_ok=True)
                     perc_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")

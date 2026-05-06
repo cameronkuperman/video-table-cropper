@@ -103,7 +103,7 @@ Expected outcome:
 - Downloads 50 → zips → uploads → 4-step verifies → appends manifest log entry → permanent-deletes 50 originals → stops.
 - One zip should appear in `<root>/restaurant-pi-1/unassociated_zips/`.
 
-If that succeeds, manually open one zip in Drive UI and confirm the structure: `<sanitized_name>__<folder_id>/frame_0.jpg`, `frame_1.jpg`, `frame_2.jpg`, plus `MANIFEST.json` at the root.
+If that succeeds, manually open one zip in Drive UI and confirm the structure: `<sanitized_name>__<folder_id>/frame_0.jpg` … `frame_{N-1}.jpg` (N detected per-triplet from the manifest, default 10 for new uploads, 3 for legacy data), plus `MANIFEST.json` at the root.
 
 ### Step 2 — full run
 

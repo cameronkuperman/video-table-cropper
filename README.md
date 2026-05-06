@@ -11,8 +11,8 @@ One project root folder on Google Drive. The video pipeline uses these subfolder
 ```
 <your root folder>/
 ├── raw_videos/         ← drop source videos here
-├── temp_processing/    ← 3-frame triplets with table overlays drawn on
-├── unlabeled/          ← cropped table triplets waiting to be labeled
+├── temp_processing/    ← N-frame groups with table overlays drawn on
+├── unlabeled/          ← cropped table groups waiting to be labeled
 ├── clean/              ← labeled output
 ├── dirty/              ← labeled output
 ├── occupied/           ← labeled output
@@ -37,15 +37,23 @@ Each site should look like:
 └── discarded/          ← rejected output
 ```
 
-Each raw triplet folder in `unassociated/` should contain `frame_0.jpg`, `frame_1.jpg`,
-and `frame_2.jpg`. The labeler maps channel names like `CH-CH03` to the matching camera
-geometry (`IPC3`), runs the same YOLO/perception + table-crop flow used by the video
-pipeline, and materializes per-table folders into `unlabeled/`.
+Each raw group folder in `unassociated/` should contain a contiguous set of
+`frame_0.jpg` through `frame_{N-1}.jpg` (current target N=10; legacy data may
+have N=3). The labeler maps channel names like `CH-CH03` to the matching camera
+geometry (`IPC3`), runs the same YOLO/perception + table-crop flow used by the
+video pipeline, and materializes per-table folders into `unlabeled/`.
+
+> **Naming note.** The codebase still calls a group of frames a "triplet" in
+> some places — variable names, folder suffixes (`_t{idx:04d}`), the edge-side
+> config (`triplet_capture`, `frames_per_triplet`), and Drive app-properties
+> (`autolabel_preprocess_triplets`). These names are preserved as a stable wire
+> protocol shared with deployed Pis and existing labeled data. Internally a
+> "triplet" can be any N frames, detected per-group at runtime.
 
 `reolink-matthews-01` is now special-cased:
 - it does **not** use the general `CH-CHNN -> IPCN` mapping
 - it requires a saved `crop_configs/CH-CHNN.json` per channel before queue generation
-- those saved 4-point polygons drive cropped `frame_0.jpg`, `frame_1.jpg`, `frame_2.jpg`,
+- those saved polygons drive cropped `frame_0.jpg` through `frame_{N-1}.jpg`,
   plus `perception.json`, exactly like the original video pipeline
 
 `restaurant-pi-1` stays on the general IPC-mapping behavior.
@@ -174,8 +182,8 @@ python main.py --process
 ```
 
 Downloads videos from `raw_videos/`, extracts frames, draws polygon overlays,
-uploads 3-frame triplets to `temp_processing/`, crops each table and uploads
-to `unlabeled/`.
+uploads N-frame groups to `temp_processing/` (default N=10 via
+`FRAMES_PER_GROUP_VIDEO`), crops each table and uploads to `unlabeled/`.
 
 ### Label images
 
@@ -184,8 +192,9 @@ python main.py --label
 # open http://localhost:8080
 ```
 
-Shows 3 images per unlabeled folder. Click **Occupied / Dirty / Clean**
-(or press `1` / `2` / `3`). Press `4` for **Label Later**.
+Shows N images per unlabeled folder (10 today, 3 for legacy data). Click
+**Occupied / Dirty / Clean** (or press `1` / `2` / `3`). Press `4` for
+**Label Later**.
 
 The UI now supports two source types:
 - `Video`: reads from the project root `unlabeled/`
@@ -202,8 +211,8 @@ Pick a channel, open its full-frame reference image, click four corners per tabl
 If any Matthews channel in `unassociated/` is missing a saved config, the Reolink queue will
 stop and link you to the crop editor first.
 
-In both modes, labeling moves the entire triplet folder to the matching Drive folder instantly.
-Press `→` or `Space` to discard the current triplet. Discarded triplets are moved
+In both modes, labeling moves the entire group folder to the matching Drive folder instantly.
+Press `→` or `Space` to discard the current group. Discarded groups are moved
 to `discarded/` and are treated as already handled by future preprocessing.
 
 ## Table geometry
