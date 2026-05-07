@@ -49,6 +49,7 @@ from env_loader import load_local_env
 from queue_metadata import (
     LEGACY_FRAMES_PER_GROUP,
     MAX_FRAMES_PER_GROUP,
+    SPARSE_SAMPLE_FRAME_INDICES,
     build_folder_app_properties,
     extract_frame_ids_from_item,
     frame_slot_keys,
@@ -85,6 +86,35 @@ def _detect_n_from_frame_dict(frames: dict[str, Any]) -> int:
         if m:
             indices.add(int(m.group(1)))
     return len(indices)
+
+
+def _frame_index_from_key(key: Any) -> int | None:
+    m = re.match(r"^frame_(\d+)$", str(key))
+    return int(m.group(1)) if m else None
+
+
+def _frame_keys_from_client_payload(raw_frames: dict[str, Any]) -> list[str]:
+    indices = sorted({
+        idx
+        for key in raw_frames.keys()
+        for idx in [_frame_index_from_key(key)]
+        if idx is not None
+    })
+    if not indices:
+        return list(frame_slot_keys(LEGACY_FRAMES_PER_GROUP))
+    if indices == [0, 5, 9]:
+        return [f"frame_{idx}" for idx in indices]
+    if indices == list(range(indices[-1] + 1)):
+        return [f"frame_{idx}" for idx in indices]
+    return []
+
+
+def _frames_from_client_payload(raw_frames: dict[str, Any]) -> dict[str, str | None]:
+    keys = _frame_keys_from_client_payload(raw_frames)
+    return {
+        key: str(raw_frames.get(key) or "") or None
+        for key in keys
+    }
 
 
 def _ordered_frame_keys(frames: dict[str, Any]) -> list[str]:
@@ -2414,7 +2444,13 @@ def _materialize_reolink_table_crops(
     """
     from PIL import Image
     from person_detector import assign_track_ids, build_perception_for_table, detect_people_in_frame
-    from processor import perspective_crop_polygon, save_jpeg, _scale_table_polygons
+    from processor import (
+        perception_filename_for_n_frames,
+        perspective_crop_polygon,
+        sample_frame_indices,
+        save_jpeg,
+        _scale_table_polygons,
+    )
 
     using_local = local_frame_paths is not None
 
@@ -2477,9 +2513,13 @@ def _materialize_reolink_table_crops(
         if ref_w != frame_w or ref_h != frame_h:
             scaled_polygons = _scale_table_polygons(selected_polygons, ref_w, ref_h, frame_w, frame_h)
 
-        yolo_model = _get_yolo_model()
-        frame_detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
-        assign_track_ids(frame_detections)
+        sample_indices = sample_frame_indices(n_frames)
+        perception_file_name = perception_filename_for_n_frames(n_frames)
+        frame_detections = None
+        if perception_file_name is not None:
+            yolo_model = _get_yolo_model()
+            frame_detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
+            assign_track_ids(frame_detections)
 
         label_source = _resolve_label_source(context.source, context.site_key)
         generated_names: list[str] = []
@@ -2490,10 +2530,11 @@ def _materialize_reolink_table_crops(
             )
             dest_folder_id = client.ensure_subfolder(context.input_folder_id, derived_name)
             uploaded_frame_ids: dict[str, str | None] = {
-                f"frame_{i}": None for i in range(n_frames)
+                f"frame_{i}": None for i in sample_indices
             }
 
-            for frame_idx, frame_path in enumerate(frame_paths):
+            for frame_idx in sample_indices:
+                frame_path = frame_paths[frame_idx]
                 cropped = perspective_crop_polygon(frame_path, zone_poly)
                 crop_path = tmp / "crops" / f"{derived_name}_f{frame_idx}.jpg"
                 save_jpeg(cropped, crop_path)
@@ -2509,18 +2550,19 @@ def _materialize_reolink_table_crops(
                 {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
             )
 
-            perception = build_perception_for_table(
-                frame_detections, tight_poly, img_shape, n_frames=n_frames
-            )
-            perception_path = tmp / "perception" / f"{derived_name}_perception.json"
-            perception_path.parent.mkdir(parents=True, exist_ok=True)
-            perception_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
-            client.upload_or_update_file(
-                perception_path,
-                dest_folder_id,
-                file_name="perception.json",
-                mime_type="application/json",
-            )
+            if frame_detections is not None and perception_file_name is not None:
+                perception = build_perception_for_table(
+                    frame_detections, tight_poly, img_shape, n_frames=n_frames
+                )
+                perception_path = tmp / "perception" / f"{derived_name}_{perception_file_name}"
+                perception_path.parent.mkdir(parents=True, exist_ok=True)
+                perception_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
+                client.upload_or_update_file(
+                    perception_path,
+                    dest_folder_id,
+                    file_name=perception_file_name,
+                    mime_type="application/json",
+                )
 
             if using_local:
                 if local_metadata_path is not None and local_metadata_path.exists():
@@ -3103,8 +3145,21 @@ def _list_source_subfolders(
 
 def _frame_payload_from_files(files: list[dict]) -> dict[str, str | None]:
     file_map = {f["name"]: f["id"] for f in files}
-    n = _detect_n_from_file_names(file_map) or LEGACY_FRAMES_PER_GROUP
-    return {f"frame_{i}": file_map.get(f"frame_{i}.jpg") for i in range(n)}
+    present_indices = sorted({
+        int(m.group(1))
+        for name in file_map
+        for m in [_FRAME_FILENAME_RE.match(str(name))]
+        if m
+    })
+    if not present_indices:
+        return {f"frame_{i}": file_map.get(f"frame_{i}.jpg") for i in range(LEGACY_FRAMES_PER_GROUP)}
+    if present_indices == list(range(present_indices[-1] + 1)):
+        indices = list(range(present_indices[-1] + 1))
+    elif tuple(present_indices) == SPARSE_SAMPLE_FRAME_INDICES:
+        indices = present_indices
+    else:
+        indices = list(range(present_indices[-1] + 1))
+    return {f"frame_{i}": file_map.get(f"frame_{i}.jpg") for i in indices}
 
 
 def _frame_payload_from_folder(folder: dict[str, object]) -> dict[str, str | None]:
@@ -4652,23 +4707,15 @@ def api_label():
             return jsonify({"error": "parent_id does not match the active queue"}), 400
 
         raw_frames = data.get("frames") if isinstance(data.get("frames"), dict) else {}
-        # Accept whatever frame_N keys the client sends (1..MAX). Fall back to
-        # the legacy 3-frame slot set when nothing recognizable was provided so
-        # old clients still produce a valid (empty) frames dict.
-        n_from_client = _detect_n_from_frame_dict(raw_frames)
-        slot_count = n_from_client if n_from_client > 0 else LEGACY_FRAMES_PER_GROUP
-        frames = {
-            key: str(raw_frames.get(key) or "") or None
-            for key in frame_slot_keys(slot_count)
-        }
+        frames = _frames_from_client_payload(raw_frames)
         frame_signature = str(data.get("frame_signature") or "").strip()
         if not frame_signature:
             frame_signature = _frame_signature_from_frames(frames)
-        if not has_complete_frame_ids(frames, n_frames=slot_count):
-            frames = {key: None for key in frame_slot_keys(slot_count)}
+        if not has_complete_frame_ids(frames):
+            frames = {key: None for key in _ordered_frame_keys(frames)}
         folder_name = str(data.get("folder_name") or "").strip()
         content_signature = str(data.get("content_signature") or "").strip()
-        if not content_signature and has_complete_frame_ids(frames, n_frames=slot_count):
+        if not content_signature and has_complete_frame_ids(frames):
             content_signature = _content_signature_from_frames(frames)
 
         existing_history = _label_history_lookup(context, folder_id, folder_name, frame_signature, content_signature)
@@ -4769,12 +4816,7 @@ def api_label_cancel():
         context = _resolve_queue_context(get_client(), source, site_key)
         queue_key = context.queue_key
         raw_frames = data.get("frames") if isinstance(data.get("frames"), dict) else {}
-        n_from_client = _detect_n_from_frame_dict(raw_frames)
-        slot_count = n_from_client if n_from_client > 0 else LEGACY_FRAMES_PER_GROUP
-        frames = {
-            key: str(raw_frames.get(key) or "") or None
-            for key in frame_slot_keys(slot_count)
-        }
+        frames = _frames_from_client_payload(raw_frames)
         frame_signature = str(data.get("frame_signature") or "").strip()
         if not frame_signature:
             frame_signature = _frame_signature_from_frames(frames)

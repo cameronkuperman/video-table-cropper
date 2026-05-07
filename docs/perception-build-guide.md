@@ -12,9 +12,10 @@ and in every reader.
 
 ## 1. What `perception.json` is
 
-`perception.json` is a small JSON file that lives **next to a group of N
-cropped table images** (`frame_0.jpg` … `frame_{N-1}.jpg`) in a Drive folder
-or local directory. There is exactly one `perception.json` per
+The perception artifact is a small JSON file that lives **next to the sampled
+cropped table images** in a Drive folder or local directory. Legacy 3-frame
+groups use `perception.json`; 10-frame groups use `perception_10frame.json`.
+There is exactly one perception artifact per
 `(table × group)` — i.e. for each combination of one physical table and one
 group of N frames sampled from a camera looking at that table.
 
@@ -123,7 +124,7 @@ Step 3 — Per-table perception build:
 
 Step 4 — Write:
     Serialize as UTF-8 JSON (with indent=2 for human-debuggability) and
-    store next to frame_0..frame_{N-1}.jpg.
+    store next to the sampled crop images.
 ```
 
 Steps 1, 2 happen once per group (shared across every table in the group).
@@ -340,9 +341,9 @@ All floats rounded to 4 d.p. except scores (3 d.p.) for diff stability.
 }
 ```
 
-Serialize with `indent=2, sort_keys=False`. UTF-8 encoding. Filename:
-`perception.json`. Place it in the same folder as `frame_0.jpg` …
-`frame_{N-1}.jpg`.
+Serialize with `indent=2, sort_keys=False`. UTF-8 encoding. Use
+`perception.json` for 3-frame legacy groups and `perception_10frame.json` for
+10-frame groups. Place it in the same folder as the sampled crop images.
 
 ---
 
@@ -553,8 +554,9 @@ reference implementation.
 
 ## 11. Output handoff conventions
 
-- **Filename:** `perception.json` (lowercase, no version in name).
-- **Location:** same directory as `frame_0.jpg` … `frame_{N-1}.jpg`.
+- **Filename:** `perception.json` for legacy 3-frame groups;
+  `perception_10frame.json` for 10-frame groups.
+- **Location:** same directory as the sampled crop images.
 - **Encoding:** UTF-8.
 - **Pretty-printed:** `indent=2`. Pretty-printing is for human debuggability;
   readers must accept any whitespace.

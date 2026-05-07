@@ -127,12 +127,32 @@ function isCurrentLoad(loadToken) {
     return loadToken === sourceLoadToken;
 }
 
+function orderedFrameKeys(folder) {
+    const frames = folder?.frames || {};
+    return Object.keys(frames)
+        .filter(key => /^frame_\d+$/.test(key))
+        .sort((a, b) => Number(a.slice(6)) - Number(b.slice(6)));
+}
+
+function displayFrameKeys(folder) {
+    const keys = orderedFrameKeys(folder);
+    if (keys.length === 0) {
+        return ['frame_0', 'frame_1', 'frame_2'];
+    }
+    if (keys.length === 10) {
+        return ['frame_0', 'frame_5', 'frame_9'].filter(key => keys.includes(key));
+    }
+    return keys;
+}
+
 function frameSignature(folder) {
     if (folder?.frame_signature) {
         return String(folder.frame_signature);
     }
     const frames = folder?.frames || {};
-    return ['frame_0', 'frame_1', 'frame_2']
+    const keys = orderedFrameKeys(folder);
+    const signatureKeys = keys.length ? keys : ['frame_0', 'frame_1', 'frame_2'];
+    return signatureKeys
         .map(key => frames[key] || '')
         .join('|');
 }
@@ -817,7 +837,7 @@ function preloadFolder(folder) {
     }
 
     const startedAt = performance.now();
-    const urls = ['frame_0', 'frame_1', 'frame_2']
+    const urls = displayFrameKeys(folder)
         .map(key => folder.thumb_urls?.[key] ?? folder.preview_urls?.[key])
         .filter(Boolean);
 
@@ -890,7 +910,7 @@ function warmBuffer(loadToken = sourceLoadToken) {
 
 function renderFolderCard(folder) {
     currentImagesReady = false;
-    const frameKeys = ['frame_0', 'frame_1', 'frame_2'];
+    const frameKeys = displayFrameKeys(folder);
     const imgHtml = frameKeys.map((key, idx) => {
         const url = folder.thumb_urls?.[key] ?? folder.preview_urls?.[key];
         const fullUrl = folder.preview_urls?.[key] || '';

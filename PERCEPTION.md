@@ -1,9 +1,11 @@
 # Perception Data — How It Works
 
-Every labeled subfolder can contain a `perception.json` alongside the N images
-in the group. It is generated during `--process` if `ultralytics` is installed,
-and is carried through untouched when the human labels the sample. Training
-code can use both the images and this file.
+Every labeled subfolder can contain a perception artifact alongside the sampled
+images in the group. Legacy 3-frame groups use `perception.json`; current
+10-frame groups use `perception_10frame.json`. It is generated during
+`--process` if `ultralytics` is installed, and is carried through untouched
+when the human labels the sample. Training code can use both the images and
+this file.
 
 `perception.json` is **strictly the occupied/unoccupied signal.** Dirty-vs-clean
 classification is computed elsewhere from the cropped image itself.
@@ -35,7 +37,7 @@ that 3 frames over 9 s couldn't capture.
 ## How it is generated
 
 ```
-For each group of N frames:
+For each source group of N frames:
 
   Step 1 — Detection (full frame, per frame)
     Run YOLOv8-seg on each full frame.
@@ -48,7 +50,7 @@ For each group of N frames:
     inter-frame gap → same track_id. Larger jumps → new track_id.
 
   Step 3 — Per-table filtering and perception building
-    For each table in the group (e.g. 7 tables → 7 separate perception.json files):
+    For each table in the group (e.g. 7 tables → 7 separate perception files):
       Filter to only people whose mask OR bbox overlaps this table's polygon.
       For each kept (person × frame) pair, compute:
         overlap_frac_of_person   — what % of the person's body is over the table
@@ -57,12 +59,12 @@ For each group of N frames:
         displacement_from_prev   — how far they moved since previous frame (0–1)
         bbox_below_table_frac    — fraction of bbox below the table's bottom edge
         bbox_aspect_ratio        — h/w; standing ~2.5+, sitting ~1.0–1.5
-      Aggregate per-track and per-group, write perception.json.
+      Aggregate per-track and per-group, write the perception artifact.
 ```
 
 ---
 
-## perception.json structure (schema v2)
+## perception artifact structure (schema v2)
 
 ```json
 {

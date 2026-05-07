@@ -76,6 +76,24 @@ MAX_FRAMES_PER_GROUP = 16
 FRAMES_PER_GROUP_VIDEO = 10
 
 
+def sample_frame_indices(n_frames: int) -> tuple[int, ...]:
+    """Frame indices uploaded for label review from an N-frame source group."""
+    if n_frames == 10:
+        return (0, 5, 9)
+    if n_frames == 3:
+        return (0, 1, 2)
+    return tuple(range(n_frames))
+
+
+def perception_filename_for_n_frames(n_frames: int) -> str | None:
+    """Perception artifact name for supported group sizes."""
+    if n_frames == 10:
+        return "perception_10frame.json"
+    if n_frames == 3:
+        return "perception.json"
+    return None
+
+
 def detect_n_frames(
     frame_paths: list[Path] | None = None,
     metadata: dict | None = None,
@@ -665,16 +683,20 @@ def _process_video(
                 print(f"  Triplet {triplet_idx+1}/{len(triplets)} already uploaded, skipping.")
                 continue
 
+            sample_indices = sample_frame_indices(n_frames)
+            perception_file_name = perception_filename_for_n_frames(n_frames)
+
             # ── Person detection for this triplet (full frames, once per triplet) ──
             frame_detections = None
-            if yolo_model is not None:
+            if yolo_model is not None and perception_file_name is not None:
                 frame_detections = detect_people_batch(list(triplet), yolo_model)
                 assign_track_ids(frame_detections)
 
-            # ── temp_processing: 3 frames with all overlays drawn (parallel upload) ──
+            # ── temp_processing: sampled frames with all overlays drawn (parallel upload) ──
             temp_subfolder_id = client.ensure_subfolder(folders["temp_processing"], triplet_name)
             overlay_futures = []
-            for frame_idx, frame_path in enumerate(triplet):
+            for frame_idx in sample_indices:
+                frame_path = triplet[frame_idx]
                 overlaid = draw_overlays(frame_path, all_polygons)
                 if frame_detections is not None:
                     overlaid = draw_person_detections(overlaid, frame_detections[frame_idx])
@@ -704,11 +726,12 @@ def _process_video(
                     folders["unlabeled"], subfolder_name
                 )
                 uploaded_frame_ids: dict[str, str | None] = {
-                    f"frame_{i}": None for i in range(n_frames)
+                    f"frame_{i}": None for i in sample_indices
                 }
 
                 crop_futures = {}
-                for frame_idx, frame_path in enumerate(triplet):
+                for frame_idx in sample_indices:
+                    frame_path = triplet[frame_idx]
                     cropped = perspective_crop_polygon(frame_path, zone_poly)
                     out = tmp / "crops" / f"{subfolder_name}_f{frame_idx}.jpg"
                     save_jpeg(cropped, out)
@@ -727,7 +750,7 @@ def _process_video(
                     {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
                 )
 
-                if frame_detections is not None:
+                if frame_detections is not None and perception_file_name is not None:
                     perception = build_perception_for_table(
                         frame_detections, tight_poly, img_shape, n_frames=n_frames
                     )
@@ -737,7 +760,7 @@ def _process_video(
                     client.upload_or_update_file(
                         perc_path,
                         unlabeled_subfolder_id,
-                        file_name="perception.json",
+                        file_name=perception_file_name,
                     )
                 return True
 

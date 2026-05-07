@@ -25,7 +25,7 @@ Raw Video (Drive)
 [5] Perception Build ----- filter YOLO detections to people overlapping this table
       |
       v
-[6] Upload to Drive ------ crops + perception.json → unlabeled/{folder}/
+[6] Upload to Drive ------ sampled crops + perception artifact → unlabeled/{folder}/
       |
       v
 [7] Human Labeling ------- Flask UI, reviewer picks clean/dirty/occupied
@@ -124,7 +124,7 @@ unlabeled/{video_stem}_{table_id}_t{idx:04d}/
     frame_1.jpg           # 3 seconds later
     ...
     frame_{N-1}.jpg       # 3*(N-1) seconds later (27s at N=10)
-    perception.json       # person-table interaction data (if YOLO available)
+    perception_10frame.json # person-table interaction data for 10-frame groups
 ```
 
 A parallel debug output also goes to:
@@ -320,14 +320,14 @@ Drive project root/
 │       ├── frame_1.jpg
 │       ├── ...
 │       ├── frame_{N-1}.jpg
-│       └── perception.json
+│       └── perception_10frame.json
 │
 ├── clean/                                 # LABELED: table is clean/empty
 │   └── IPC11_2024-01-15_table_top_5_t0000/
 │       ├── frame_0.jpg                    #   same cropped frames, unchanged
 │       ├── ...
 │       ├── frame_{N-1}.jpg
-│       └── perception.json               #   same perception data, unchanged
+│       └── perception_10frame.json       #   same perception data, unchanged
 │
 ├── dirty/                                 # LABELED: table is dirty/needs clearing
 │   └── IPC11_2024-01-15_table_top_5_t0001/
@@ -350,13 +350,13 @@ There are two coordinate spaces in this system:
 
 | Space | Where used | Origin | Units |
 |-------|-----------|--------|-------|
-| **Full-frame pixels** | `bbox_xyxy` in perception.json, table polygon coords | top-left (0,0) | pixels at actual frame resolution |
+| **Full-frame pixels** | `bbox_xyxy` in the perception artifact, table polygon coords | top-left (0,0) | pixels at actual frame resolution |
 | **Normalized 0-1** | `centroid_x/y`, `distance_norm`, `displacement_from_prev` | top-left (0,0) | fraction of frame width/height |
 
-The cropped frame images (`frame_0..{N-1}.jpg`) are in their own local pixel space
-after the perspective warp. There is no coordinate mapping stored from crop space
-back to full-frame space — the crops are visual data only. All structured
-coordinates in perception.json reference the **original full frame**.
+The sampled cropped frame images are in their own local pixel space after the
+perspective warp. There is no coordinate mapping stored from crop space back to
+full-frame space — the crops are visual data only. All structured coordinates
+in the perception artifact reference the **original full frame**.
 
 ---
 

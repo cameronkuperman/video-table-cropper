@@ -4,7 +4,8 @@ Frame slots are keyed `frame_0`..`frame_{MAX_FRAMES_PER_GROUP-1}` to support
 groups larger than the legacy 3-frame triplet without breaking old data:
 folders written under the old schema only have `frame_0_id`..`frame_2_id`
 appProperties; folders written under the new schema may have up to
-`frame_{MAX-1}_id`. Readers default to legacy size when no `n_frames` is given.
+`frame_{MAX-1}_id`. Readers infer the stored frame count from appProperties
+when possible, and fall back to legacy size for old or empty metadata.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ QUEUE_SCHEMA_VERSION = "1"
 # headroom. Increasing this is safe; decreasing breaks old data.
 MAX_FRAMES_PER_GROUP = 16
 LEGACY_FRAMES_PER_GROUP = 3
+SPARSE_SAMPLE_FRAME_INDICES = (0, 5, 9)
 
 FRAME_PROPERTY_KEYS: dict[str, str] = {
     f"frame_{i}": f"autolabel_frame_{i}_id" for i in range(MAX_FRAMES_PER_GROUP)
@@ -28,6 +30,21 @@ FRAME_PROPERTY_KEYS: dict[str, str] = {
 def frame_slot_keys(n_frames: int) -> tuple[str, ...]:
     """Return ('frame_0', 'frame_1', ..., 'frame_{n-1}')."""
     return tuple(f"frame_{i}" for i in range(n_frames))
+
+
+def _infer_frame_keys_from_app_properties(app_properties: Mapping[str, Any]) -> tuple[str, ...]:
+    present_indices = [
+        idx
+        for idx in range(MAX_FRAMES_PER_GROUP)
+        if app_properties.get(FRAME_PROPERTY_KEYS[f"frame_{idx}"])
+    ]
+    if not present_indices:
+        return frame_slot_keys(LEGACY_FRAMES_PER_GROUP)
+    if present_indices == list(range(present_indices[-1] + 1)):
+        return frame_slot_keys(present_indices[-1] + 1)
+    if tuple(present_indices) == SPARSE_SAMPLE_FRAME_INDICES:
+        return tuple(f"frame_{idx}" for idx in present_indices)
+    return frame_slot_keys(present_indices[-1] + 1)
 
 
 def extract_frame_ids_from_item(
@@ -40,15 +57,21 @@ def extract_frame_ids_from_item(
     `frame_{n-1}`), missing values as None. Used when the caller knows the
     expected group size.
 
-    With `n_frames=None`: returns LEGACY_FRAMES_PER_GROUP keys for backwards
-    compatibility with code that hasn't been updated to detect N.
+    With `n_frames=None`: infers stored keys from appProperties. Contiguous
+    frame sets return the full span; sparse sampled sets return only present
+    keys.
     """
-    size = n_frames if n_frames is not None else LEGACY_FRAMES_PER_GROUP
-    keys = frame_slot_keys(size)
-
     app_properties = item.get("appProperties")
     if not isinstance(app_properties, Mapping):
+        size = n_frames if n_frames is not None else LEGACY_FRAMES_PER_GROUP
+        keys = frame_slot_keys(size)
         return {key: None for key in keys}
+
+    keys = (
+        frame_slot_keys(n_frames)
+        if n_frames is not None
+        else _infer_frame_keys_from_app_properties(app_properties)
+    )
 
     frames: dict[str, str | None] = {}
     for frame_key in keys:

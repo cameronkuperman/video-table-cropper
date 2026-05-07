@@ -11,6 +11,7 @@ from PIL import Image
 
 import app as label_app
 import processor
+from queue_metadata import extract_frame_ids_from_item, has_complete_frame_ids
 
 
 class FakeDriveClient:
@@ -393,6 +394,80 @@ def test_queue_is_source_aware_and_reolink_filters_incomplete_triplets(client):
     ]
 
 
+def test_queue_metadata_extracts_contiguous_and_sparse_frame_sets():
+    legacy = {
+        "appProperties": {
+            "autolabel_frame_0_id": "f0",
+            "autolabel_frame_1_id": "f1",
+            "autolabel_frame_2_id": "f2",
+        }
+    }
+    sparse = {
+        "appProperties": {
+            "autolabel_frame_0_id": "f0",
+            "autolabel_frame_5_id": "f5",
+            "autolabel_frame_9_id": "f9",
+        }
+    }
+    damaged = {
+        "appProperties": {
+            "autolabel_frame_0_id": "f0",
+            "autolabel_frame_2_id": "f2",
+        }
+    }
+    full = {
+        "appProperties": {
+            f"autolabel_frame_{idx}_id": f"f{idx}"
+            for idx in range(10)
+        }
+    }
+
+    assert list(extract_frame_ids_from_item(legacy)) == ["frame_0", "frame_1", "frame_2"]
+    assert extract_frame_ids_from_item(sparse) == {
+        "frame_0": "f0",
+        "frame_5": "f5",
+        "frame_9": "f9",
+    }
+    assert has_complete_frame_ids(extract_frame_ids_from_item(sparse)) is True
+    assert extract_frame_ids_from_item(damaged) == {
+        "frame_0": "f0",
+        "frame_1": None,
+        "frame_2": "f2",
+    }
+    assert has_complete_frame_ids(extract_frame_ids_from_item(damaged)) is False
+    assert list(extract_frame_ids_from_item(full)) == [f"frame_{idx}" for idx in range(10)]
+
+
+def test_sparse_sample_file_listing_hydrates_present_frame_keys():
+    files = [
+        {"name": "frame_0.jpg", "id": "f0"},
+        {"name": "frame_5.jpg", "id": "f5"},
+        {"name": "frame_9.jpg", "id": "f9"},
+    ]
+
+    assert label_app._frame_payload_from_files(files) == {
+        "frame_0": "f0",
+        "frame_5": "f5",
+        "frame_9": "f9",
+    }
+
+
+def test_sparse_non_sample_file_listing_hydrates_missing_slots():
+    files = [
+        {"name": "frame_0.jpg", "id": "f0"},
+        {"name": "frame_2.jpg", "id": "f2"},
+    ]
+
+    frames = label_app._frame_payload_from_files(files)
+
+    assert frames == {
+        "frame_0": "f0",
+        "frame_1": None,
+        "frame_2": "f2",
+    }
+    assert has_complete_frame_ids(frames) is False
+
+
 def test_queue_returns_uncached_fallback_when_no_frames_are_cached(client, fake_drive, monkeypatch):
     monkeypatch.setattr(label_app, "_thumbs_cache_ready", lambda frames: False)
     label_app._hydrated_folder_cache.clear()
@@ -760,6 +835,38 @@ def test_label_route_records_durable_job_before_drive_move(client, fake_drive):
     job = jobs["jobs"]["video:video-triplet"]
     assert job["status"] == "pending"
     assert job["label"] == "clean"
+
+
+def test_label_route_preserves_sparse_sample_frame_keys(client, fake_drive):
+    folder_id = fake_drive.ensure_subfolder("video-unlabeled", "ipc3_table-4_t0009")
+    frames = {
+        "frame_0": "sample-frame0",
+        "frame_5": "sample-frame5",
+        "frame_9": "sample-frame9",
+    }
+    for key, file_id in frames.items():
+        fake_drive._add_file(file_id, f"{key}.jpg", folder_id)
+    fake_drive.update_file_metadata(
+        folder_id,
+        {"appProperties": label_app.build_folder_app_properties(frames)},
+    )
+
+    payload = {
+        "folder_id": folder_id,
+        "parent_id": "video-unlabeled",
+        "label": "clean",
+        "source": "video",
+        "site_key": None,
+        "folder_name": "ipc3_table-4_t0009",
+        "frames": frames,
+    }
+    response = client.post("/api/label", json=payload)
+
+    assert response.status_code == 200
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    job = jobs["jobs"][f"video:{folder_id}"]
+    assert job["frames"] == frames
+    assert job["frame_signature"] == "sample-frame0|sample-frame5|sample-frame9"
 
 
 def test_label_route_returns_json_when_state_write_fails(client, monkeypatch):
@@ -1378,6 +1485,14 @@ def test_video_processor_marks_completed_and_moves_raw_video(fake_drive, monkeyp
     assert fake_drive.items["video-1"]["appProperties"][processor.PREPROCESS_STATUS_PROPERTY] == "complete"
     assert fake_drive.items["video-1"]["appProperties"][processor.PREPROCESS_TRIPLETS_PROPERTY] == "2"
     assert fake_drive.items["video-1"]["parents"] == ["project-root:processed_raw"]
+
+
+def test_processor_sampling_and_perception_artifact_policy():
+    assert processor.sample_frame_indices(3) == (0, 1, 2)
+    assert processor.sample_frame_indices(10) == (0, 5, 9)
+    assert processor.perception_filename_for_n_frames(3) == "perception.json"
+    assert processor.perception_filename_for_n_frames(10) == "perception_10frame.json"
+    assert processor.perception_filename_for_n_frames(4) is None
 
 
 def test_video_processor_does_not_move_failed_video(fake_drive, monkeypatch):

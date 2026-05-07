@@ -53,8 +53,9 @@ video pipeline, and materializes per-table folders into `unlabeled/`.
 `reolink-matthews-01` is now special-cased:
 - it does **not** use the general `CH-CHNN -> IPCN` mapping
 - it requires a saved `crop_configs/CH-CHNN.json` per channel before queue generation
-- those saved polygons drive cropped `frame_0.jpg` through `frame_{N-1}.jpg`,
-  plus `perception.json`, exactly like the original video pipeline
+- those saved polygons drive sampled crops (`frame_0.jpg`, `frame_5.jpg`,
+  `frame_9.jpg` for 10-frame groups) plus `perception_10frame.json`, exactly
+  like the original video pipeline
 
 `restaurant-pi-1` stays on the general IPC-mapping behavior.
 
