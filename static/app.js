@@ -911,6 +911,7 @@ function warmBuffer(loadToken = sourceLoadToken) {
 function renderFolderCard(folder) {
     currentImagesReady = false;
     const frameKeys = displayFrameKeys(folder);
+    const sourceLabel = folder.source_label || folder.source || 'unknown';
     const imgHtml = frameKeys.map((key, idx) => {
         const url = folder.thumb_urls?.[key] ?? folder.preview_urls?.[key];
         const fullUrl = folder.preview_urls?.[key] || '';
@@ -940,6 +941,7 @@ function renderFolderCard(folder) {
             <button class="btn later label-action"    onclick="labelCurrent('label_later')" disabled>Label Later [4]</button>
             <button class="btn skip label-action"     onclick="skipCurrent()" disabled>Discard [S / &rarr;]</button>
         </div>
+        <div class="folder-source">Source: ${escapeHtml(sourceLabel)}</div>
     `;
 
     const statusEl = document.getElementById('image-status');

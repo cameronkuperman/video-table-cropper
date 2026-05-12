@@ -3672,11 +3672,13 @@ def _build_folder_payload(
     }
     parents = [str(parent) for parent in folder.get("parents", []) if parent]
     parent_id = parents[0] if parents else context.input_folder_id
+    source_label = _folder_source_label(folder, context, parent_id)
     return {
         "folder_id": folder["id"],
         "folder_name": folder["name"],
         "parent_id": parent_id,
         "source": context.source,
+        "source_label": source_label,
         "site_key": context.site_key,
         "queue_key": context.queue_key,
         "frames": frames,
@@ -3689,6 +3691,17 @@ def _build_folder_payload(
         "perception_file_name": folder.get("_perception_file_name"),
         "metadata_file_id": folder.get("_metadata_file_id"),
     }
+
+
+def _folder_source_label(folder: dict[str, Any], context: QueueContext, parent_id: str) -> str:
+    if context.source == REOLINK_SOURCE:
+        screenrecord_unlabeled = context.folder_ids.get(SCREENRECORD_THREE_FRAME_UNLABELED_KEY)
+        if screenrecord_unlabeled and parent_id == screenrecord_unlabeled:
+            return SCREENRECORD_TRUE_TEN_FOLDER_NAME
+        if folder.get("_perception_file_name") == PERCEPTION_V2_FILE_NAME:
+            return SCREENRECORD_TRUE_TEN_FOLDER_NAME
+        return context.input_folder_name
+    return context.source
 
 
 def _persist_folder_frame_metadata(

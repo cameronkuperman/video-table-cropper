@@ -416,6 +416,7 @@ def test_reolink_hydration_normalizes_legacy_ten_frame_perception(fake_drive):
 
     assert payload is not None
     assert payload["parent_id"] == "r-3frame-unlabeled"
+    assert payload["source_label"] == label_app.SCREENRECORD_TRUE_TEN_FOLDER_NAME
     assert payload["perception_file_name"] == label_app.PERCEPTION_V2_FILE_NAME
     assert fake_drive.find_file_by_name("sr-artifact", label_app.PERCEPTION_V2_FILE_NAME) is not None
 
