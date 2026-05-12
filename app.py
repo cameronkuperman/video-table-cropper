@@ -193,6 +193,10 @@ AUTOLABEL_VIDEO_LOW_WATERMARK = max(
 AUTOLABEL_VIDEO_BATCH_SIZE = max(
     1, int(os.environ.get("AUTOLABEL_VIDEO_BATCH_SIZE", "3") or "3")
 )
+AUTOLABEL_VIDEO_AUTO_PREPROCESS = os.environ.get(
+    "AUTOLABEL_VIDEO_AUTO_PREPROCESS",
+    "0",
+).strip().lower() in {"1", "true", "yes", "on"}
 HYDRATED_FOLDER_CACHE_TTL_SECONDS = max(60, int(os.environ.get("LABEL_HYDRATED_CACHE_TTL_SECONDS", "900") or "900"))
 READY_SCAN_MULTIPLIER = max(2, int(os.environ.get("LABEL_READY_SCAN_MULTIPLIER", "12") or "12"))
 READY_SCAN_MAX = min(
@@ -1327,8 +1331,17 @@ def _list_screenrecord_true_ten_folders(
     )
 
 
-def _screenrecord_output_unlabeled_folder_id(context: QueueContext) -> str:
-    return context.folder_ids.get(SCREENRECORD_THREE_FRAME_UNLABELED_KEY) or context.input_folder_id
+def _screenrecord_output_unlabeled_folder_id(client: DriveClient, context: QueueContext) -> str:
+    existing = context.folder_ids.get(SCREENRECORD_THREE_FRAME_UNLABELED_KEY)
+    if existing:
+        return existing
+    node_root_id = context.folder_ids.get("root")
+    if not node_root_id:
+        return context.input_folder_id
+    three_frame_id = client.ensure_subfolder(node_root_id, SCREENRECORD_THREE_FRAME_FOLDER_NAME)
+    unlabeled_id = client.ensure_subfolder(three_frame_id, "unlabeled")
+    context.folder_ids[SCREENRECORD_THREE_FRAME_UNLABELED_KEY] = unlabeled_id
+    return unlabeled_id
 
 
 def _screenrecord_state_raw_folder(raw_folder: dict[str, Any]) -> dict[str, Any]:
@@ -2630,7 +2643,7 @@ def _materialize_screenrecord_true_ten_artifacts(
         return []
 
     label_source = _resolve_label_source(context.source, context.site_key)
-    output_parent_id = _screenrecord_output_unlabeled_folder_id(context)
+    output_parent_id = _screenrecord_output_unlabeled_folder_id(client, context)
     selected_source_indices = [0, 5, 9]
 
     with tempfile.TemporaryDirectory(prefix="screenrecord_10frame_") as tmpdir:
@@ -3078,10 +3091,14 @@ def _prepare_reolink_unlabeled_queue(
     label_source = _resolve_label_source(context.source, context.site_key)
     with _reolink_generation_lock:
         _assert_manual_crop_setup_ready(client, context)
-        unlabeled_folders = client.list_folders(
-            context.input_folder_id,
-            fields="id,name,mimeType,parents,appProperties",
-        )
+        unlabeled_folders: list[dict[str, Any]] = []
+        for input_folder_id in _context_input_folder_ids(context):
+            unlabeled_folders.extend(
+                client.list_folders(
+                    input_folder_id,
+                    fields="id,name,mimeType,parents,appProperties",
+                )
+            )
         existing_names = _existing_generated_folder_names(client, context)
         unlabeled_count = len(unlabeled_folders)
         visible_count = unlabeled_count if current_visible_count is None else current_visible_count
@@ -4229,7 +4246,8 @@ def _run_ready_maintainer_once() -> None:
                 - int(ready_stats["duplicate_signatures"]),
             )
             if context.source == VIDEO_SOURCE:
-                _maybe_trigger_video_preprocess(context, visible_count)
+                if AUTOLABEL_VIDEO_AUTO_PREPROCESS:
+                    _maybe_trigger_video_preprocess(context, visible_count)
             elif context.source == REOLINK_SOURCE:
                 generated = _prepare_reolink_unlabeled_queue(
                     client,
@@ -5434,16 +5452,17 @@ def api_preprocess_status():
     maintainer_state = _ready_maintainer_state_snapshot()
     return jsonify(
         {
-            "video": {
-                "inflight": bool(video_state["inflight"]),
-                "last_run_at": video_state["last_run_at"],
-                "last_run_videos": int(video_state["last_run_videos"] or 0),
-                "last_run_triplets": int(video_state.get("last_run_triplets") or 0),
-                "last_error": video_state["last_error"],
-                "low_watermark": AUTOLABEL_VIDEO_LOW_WATERMARK,
-                "ready_target": AUTOLABEL_VIDEO_LOW_WATERMARK,
-                "batch_size": AUTOLABEL_VIDEO_BATCH_SIZE,
-            },
+        "video": {
+            "inflight": bool(video_state["inflight"]),
+            "last_run_at": video_state["last_run_at"],
+            "last_run_videos": int(video_state["last_run_videos"] or 0),
+            "last_run_triplets": int(video_state.get("last_run_triplets") or 0),
+            "last_error": video_state["last_error"],
+            "low_watermark": AUTOLABEL_VIDEO_LOW_WATERMARK,
+            "ready_target": AUTOLABEL_VIDEO_LOW_WATERMARK,
+            "batch_size": AUTOLABEL_VIDEO_BATCH_SIZE,
+            "auto_preprocess": AUTOLABEL_VIDEO_AUTO_PREPROCESS,
+        },
             "reolink": {
                 "prewarm_target": REOLINK_PREWARM_TARGET,
                 "ready_target": REOLINK_PREWARM_TARGET,
@@ -5467,7 +5486,9 @@ def api_preprocess_status():
 
 
 def run_label_ui(port: int = 8080) -> None:
-    print(f"Starting label UI at http://localhost:{port}")
+    host = os.environ.get("LABEL_UI_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    display_host = "localhost" if host in {"127.0.0.1", "0.0.0.0"} else host
+    print(f"Starting label UI at http://{display_host}:{port}")
     _cleanup_cache_if_needed(force=True)
     _ensure_ready_maintainer_started()
     print(f"Preview cache: {CACHE_DIR}")
@@ -5478,4 +5499,4 @@ def run_label_ui(port: int = 8080) -> None:
     )
     # Request-scoped Drive clients and locked shared caches make threaded
     # serving practical here, which helps keep the warm queue filled.
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
+    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)

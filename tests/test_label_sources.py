@@ -509,6 +509,93 @@ def test_screenrecord_true_ten_generation_creates_three_crops_and_perception(mon
     assert perception["n_frames"] == 10
 
 
+def test_screenrecord_artifacts_count_toward_reolink_generation_target(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    fake._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake._add_folder("sr-10-node", "restaurant-pi-1", "sr-10-root")
+    fake._add_folder("sr-raw-ready", "IPC4_t0015", "sr-10-node")
+    fake._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+    fake._add_folder("sr-ready-artifact", "mimosas-IPC4_table_top_1_t0015", "r-3frame-unlabeled")
+    fake._add_triplet_files("sr-ready-artifact", "sr-ready-artifact", include_metadata=True)
+
+    def fail_materialize(*_args, **_kwargs):
+        raise AssertionError("ready ScreenRecord artifacts should satisfy the target")
+
+    monkeypatch.setattr(label_app, "_materialize_screenrecord_true_ten_artifacts", fail_materialize)
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1,
+    )
+
+    assert generated == 0
+
+
+def test_screenrecord_true_ten_generation_creates_missing_three_frame_branch(monkeypatch, tmp_path):
+    import person_detector
+
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    fake._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake._add_folder("sr-10-node", "restaurant-pi-1", "sr-10-root")
+    fake._add_folder("sr-raw-no-branch", "IPC4_t0016", "sr-10-node")
+    for idx in range(10):
+        fake._add_file(
+            f"sr-raw-no-branch-frame-{idx}",
+            f"frame_{idx}.jpg",
+            "sr-raw-no-branch",
+            content=_jpeg_bytes(color=(idx * 10, 30, 50)),
+        )
+    fake._add_file(
+        "sr-raw-no-branch-metadata",
+        "metadata.json",
+        "sr-raw-no-branch",
+        mime_type="application/json",
+        content=json.dumps({"camera_id": "IPC4", "camera_name": "IPC4", "triplet_index": 16}).encode("utf-8"),
+    )
+
+    monkeypatch.setattr(label_app, "_get_yolo_model", lambda: object())
+    monkeypatch.setattr(person_detector, "detect_people_in_frame", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        label_app,
+        "_mapped_camera_tables_for_screenrecord_folder",
+        lambda *_args, **_kwargs: (
+            4,
+            {"camera_number": 4, "image_width": 80, "image_height": 60},
+            [("table_top_1", [(0, 0), (40, 0), (40, 40), (0, 40)], (0, 0, 40, 40), [(0, 0), (50, 0), (50, 50), (0, 50)])],
+        ),
+    )
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1,
+    )
+
+    assert generated == 1
+    three_frame = fake.find_file_by_name("site-restaurant", "3frame", mime_type=label_app.FOLDER_MIME)
+    assert three_frame is not None
+    unlabeled = fake.find_file_by_name(three_frame["id"], "unlabeled", mime_type=label_app.FOLDER_MIME)
+    assert unlabeled is not None
+    artifact = fake.find_file_by_name(unlabeled["id"], "mimosas-IPC4_table_top_1_t0016", mime_type=label_app.FOLDER_MIME)
+    assert artifact is not None
+
+
 def test_queue_is_source_aware_and_reolink_filters_incomplete_triplets(client):
     video_response = client.get("/api/queue?source=video&limit=10")
     video_payload = video_response.get_json()
