@@ -20,7 +20,7 @@ let nextQueueFetchAt = 0;
 let currentImagesReady = false;
 let availableSources = [];
 let reolinkSites = [];
-let activeSource = 'video';
+let activeSource = 'reolink';
 let activeSiteKey = null;
 let activePendingLabel = 'unlabeled';
 let activeDisplayName = 'Video';
@@ -324,7 +324,7 @@ function updateSourceSummary() {
 
 function normalizeSourceSelection(defaultSource = {}) {
     if (!availableSources.some(source => source.source === activeSource)) {
-        activeSource = defaultSource.source || availableSources[0]?.source || 'video';
+        activeSource = defaultSource.source || (reolinkSites.length ? 'reolink' : availableSources[0]?.source) || 'video';
     }
 
     if (!activeSiteKey) {

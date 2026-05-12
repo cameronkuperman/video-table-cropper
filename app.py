@@ -228,6 +228,12 @@ PROCESSED_RAW_FOLDER_NAME = "processed_raw"
 UNASSOCIATED_ZIPS_FOLDER_NAME = "unassociated_zips"
 UNASSOCIATED_ZIPS_MANIFEST_FILE = ".compactor_manifest.jsonl"
 UNASSOCIATED_ZIPS_INNER_MANIFEST = "MANIFEST.json"
+SCREENRECORD_TRUE_TEN_FOLDER_NAME = "10frametrue"
+SCREENRECORD_THREE_FRAME_FOLDER_NAME = "3frame"
+SCREENRECORD_THREE_FRAME_UNLABELED_KEY = "screenrecord_3frame_unlabeled"
+SCREENRECORD_TRUE_TEN_NODE_KEY = "screenrecord_10frametrue_node"
+PERCEPTION_V2_FILE_NAME = "perception_v2.json"
+LEGACY_PERCEPTION_FILE_NAMES = ("perception.json", "perception_10frame.json")
 PREPROCESS_STATE_SCHEMA_VERSION = 1
 PREPROCESS_STATE_FILE_NAME = "preprocess_state.json"
 LABEL_HISTORY_SCHEMA_VERSION = 1
@@ -727,6 +733,43 @@ def _discover_reolink_root_id(client: DriveClient, site: ReolinkSiteConfig) -> s
     )
 
 
+def _find_screenrecord_three_frame_unlabeled(client: DriveClient, node_root_id: str) -> str | None:
+    three_frame = client.find_file_by_name(
+        node_root_id,
+        SCREENRECORD_THREE_FRAME_FOLDER_NAME,
+        mime_type=FOLDER_MIME,
+    )
+    if not three_frame or not three_frame.get("id"):
+        return None
+    unlabeled = client.find_file_by_name(
+        str(three_frame["id"]),
+        "unlabeled",
+        mime_type=FOLDER_MIME,
+    )
+    return str(unlabeled["id"]) if unlabeled and unlabeled.get("id") else None
+
+
+def _find_screenrecord_true_ten_node_folder(client: DriveClient, node_root_id: str) -> str | None:
+    true_ten_root = client.find_file_by_name(
+        _root_id(),
+        SCREENRECORD_TRUE_TEN_FOLDER_NAME,
+        mime_type=FOLDER_MIME,
+    )
+    if not true_ten_root or not true_ten_root.get("id"):
+        return None
+
+    node_root = client.get_file(node_root_id, fields="id,name,mimeType,parents")
+    node_name = str(node_root.get("name") or "").strip()
+    if not node_name:
+        return None
+    node_folder = client.find_file_by_name(
+        str(true_ten_root["id"]),
+        node_name,
+        mime_type=FOLDER_MIME,
+    )
+    return str(node_folder["id"]) if node_folder and node_folder.get("id") else None
+
+
 _SHARED_DESTINATIONS_CACHE_KEY = "__shared_destinations__"
 
 
@@ -792,6 +835,16 @@ def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, st
                 if existing_zips and existing_zips.get("id"):
                     updated = dict(updated)
                     updated[UNASSOCIATED_ZIPS_FOLDER_NAME] = str(existing_zips["id"])
+            if SCREENRECORD_THREE_FRAME_UNLABELED_KEY not in updated:
+                screenrecord_unlabeled = _find_screenrecord_three_frame_unlabeled(client, updated["root"])
+                if screenrecord_unlabeled:
+                    updated = dict(updated)
+                    updated[SCREENRECORD_THREE_FRAME_UNLABELED_KEY] = screenrecord_unlabeled
+            if SCREENRECORD_TRUE_TEN_NODE_KEY not in updated:
+                screenrecord_true_ten = _find_screenrecord_true_ten_node_folder(client, updated["root"])
+                if screenrecord_true_ten:
+                    updated = dict(updated)
+                    updated[SCREENRECORD_TRUE_TEN_NODE_KEY] = screenrecord_true_ten
             if any(updated.get(name) != shared[name] for name in LABEL_DESTINATIONS):
                 updated = {**updated, **shared}
             if updated is not cached:
@@ -820,6 +873,12 @@ def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, st
         )
         if existing_zips and existing_zips.get("id"):
             folder_ids[UNASSOCIATED_ZIPS_FOLDER_NAME] = str(existing_zips["id"])
+        screenrecord_unlabeled = _find_screenrecord_three_frame_unlabeled(client, site_root_id)
+        if screenrecord_unlabeled:
+            folder_ids[SCREENRECORD_THREE_FRAME_UNLABELED_KEY] = screenrecord_unlabeled
+        screenrecord_true_ten = _find_screenrecord_true_ten_node_folder(client, site_root_id)
+        if screenrecord_true_ten:
+            folder_ids[SCREENRECORD_TRUE_TEN_NODE_KEY] = screenrecord_true_ten
         if site.manual_crop_configs:
             folder_ids["crop_configs"] = client.ensure_subfolder(site_root_id, CROP_CONFIGS_FOLDER_NAME)
         folder_ids.update(shared)
@@ -1157,9 +1216,79 @@ def _mapped_camera_tables_for_reolink_folder(
     return channel_number, camera, table_polygons
 
 
+def _screenrecord_camera_number_from_metadata(raw_folder_name: str, metadata: dict[str, Any]) -> int | None:
+    candidates = [
+        str(metadata.get("camera_id") or ""),
+        str(metadata.get("camera_name") or ""),
+        str(metadata.get("triplet_stem") or ""),
+        raw_folder_name,
+    ]
+    for candidate in candidates:
+        channel_number = _extract_reolink_channel_number(candidate)
+        if channel_number is not None:
+            return channel_number
+        ipc = re.search(r"IPC[\s_-]*(\d+)", candidate, re.IGNORECASE)
+        if ipc:
+            return int(ipc.group(1))
+    return None
+
+
+def _screenrecord_channel_code_from_metadata(raw_folder_name: str, metadata: dict[str, Any]) -> str | None:
+    for candidate in (
+        str(metadata.get("camera_id") or ""),
+        str(metadata.get("camera_name") or ""),
+        str(metadata.get("triplet_stem") or ""),
+        raw_folder_name,
+    ):
+        channel_code = _extract_reolink_channel_code(candidate)
+        if channel_code:
+            return channel_code
+    camera_number = _screenrecord_camera_number_from_metadata(raw_folder_name, metadata)
+    return f"CH-CH{camera_number:02d}" if camera_number is not None else None
+
+
+def _mapped_camera_tables_for_screenrecord_folder(
+    raw_folder_name: str,
+    metadata: dict[str, Any],
+    *,
+    site_key: str | None = None,
+    client: DriveClient | None = None,
+) -> tuple[int, dict[str, Any], list[tuple[str, list, tuple[int, int, int, int], list]]] | None:
+    channel_number = _screenrecord_camera_number_from_metadata(raw_folder_name, metadata)
+    if channel_number is None:
+        return None
+
+    if _site_uses_manual_crop_configs(site_key):
+        if client is None:
+            raise RuntimeError("Drive client is required for manual Reolink crop configs.")
+        channel_code = _screenrecord_channel_code_from_metadata(raw_folder_name, metadata)
+        if not channel_code:
+            return None
+        crop_config = _load_saved_crop_config(client, site_key or "", channel_code)
+        if crop_config is None:
+            return None
+        table_polygons = _build_table_polygons_from_crop_config(crop_config)
+        if not table_polygons:
+            return None
+        return channel_number, _manual_crop_camera_payload(channel_number, channel_code, crop_config), table_polygons
+
+    camera = _camera_configs_by_number().get(channel_number)
+    if camera is None:
+        return None
+    table_polygons = _build_table_polygons(camera)
+    if not table_polygons:
+        return None
+    return channel_number, camera, table_polygons
+
+
 def _existing_generated_folder_names(client: DriveClient, context: QueueContext) -> set[str]:
     names: set[str] = set()
-    for folder_name in ("unlabeled", *LABEL_DESTINATIONS):
+    for input_folder_id in _context_input_folder_ids(context):
+        for item in client.list_folders(input_folder_id, fields="id,name,mimeType,parents,appProperties"):
+            name = item.get("name")
+            if name:
+                names.add(str(name))
+    for folder_name in LABEL_DESTINATIONS:
         for item in client.list_folders(context.folder_ids[folder_name], fields="id,name,mimeType,parents,appProperties"):
             name = item.get("name")
             if name:
@@ -1180,6 +1309,32 @@ def _list_reolink_raw_folders(
         ),
         key=lambda item: str(item.get("name", "")).lower(),
     )
+
+
+def _list_screenrecord_true_ten_folders(
+    client: DriveClient,
+    context: QueueContext,
+) -> list[dict[str, Any]]:
+    node_folder_id = context.folder_ids.get(SCREENRECORD_TRUE_TEN_NODE_KEY)
+    if not node_folder_id:
+        return []
+    return sorted(
+        client.list_folders(
+            node_folder_id,
+            fields="id,name,mimeType,parents,appProperties,modifiedTime",
+        ),
+        key=lambda item: str(item.get("name", "")).lower(),
+    )
+
+
+def _screenrecord_output_unlabeled_folder_id(context: QueueContext) -> str:
+    return context.folder_ids.get(SCREENRECORD_THREE_FRAME_UNLABELED_KEY) or context.input_folder_id
+
+
+def _screenrecord_state_raw_folder(raw_folder: dict[str, Any]) -> dict[str, Any]:
+    state = dict(raw_folder)
+    state["id"] = f"screenrecord:{raw_folder.get('id') or raw_folder.get('name')}"
+    return state
 
 
 def _parse_drive_timestamp(value: object) -> datetime | None:
@@ -2050,7 +2205,7 @@ def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
     parent_id = str(job.get("parent_id") or "")
     if not folder_id or not parent_id:
         raise ValueError("label job is missing folder_id, parent_id, or label")
-    if parent_id != context.input_folder_id:
+    if parent_id not in _context_input_folder_ids(context):
         raise ValueError("label job parent_id does not match the active queue")
 
     current = client.get_file(folder_id, fields="id,name,parents,appProperties")
@@ -2425,6 +2580,154 @@ def _copy_optional_json_file(
     )
 
 
+def _materialize_screenrecord_true_ten_artifacts(
+    client: DriveClient,
+    context: QueueContext,
+    raw_folder: dict[str, Any],
+    missing_table_polygons: list[tuple[str, list, tuple[int, int, int, int], list]],
+    metadata: dict[str, Any],
+) -> list[str]:
+    """Build final labeler artifacts from a ScreenRecord 10frametrue folder.
+
+    The source is ten full frames. The output is a compact 3-frame table crop
+    folder plus perception_v2.json built from all ten full frames.
+    """
+    from PIL import Image
+    from person_detector import assign_track_ids, build_perception_for_table, detect_people_in_frame
+    from processor import perspective_crop_polygon, save_jpeg, _scale_table_polygons
+
+    source_files = {
+        item["name"]: item
+        for item in client.list_files(
+            raw_folder["id"],
+            fields="id,name,mimeType,parents,appProperties",
+        )
+    }
+    frame_items = [source_files.get(f"frame_{idx}.jpg") for idx in range(10)]
+    if any(item is None for item in frame_items):
+        return []
+
+    mapped = _mapped_camera_tables_for_screenrecord_folder(
+        str(raw_folder.get("name") or ""),
+        metadata,
+        site_key=context.site_key,
+        client=client,
+    )
+    if mapped is None:
+        return []
+
+    _channel_number, camera, all_table_polygons = mapped
+    table_polygons_by_id = {
+        table_id: (table_id, tight_poly, tight_bbox, zone_poly)
+        for table_id, tight_poly, tight_bbox, zone_poly in all_table_polygons
+    }
+    selected_polygons = [
+        table_polygons_by_id[table_id]
+        for table_id, *_rest in missing_table_polygons
+        if table_id in table_polygons_by_id
+    ]
+    if not selected_polygons:
+        return []
+
+    label_source = _resolve_label_source(context.source, context.site_key)
+    output_parent_id = _screenrecord_output_unlabeled_folder_id(context)
+    selected_source_indices = [0, 5, 9]
+
+    with tempfile.TemporaryDirectory(prefix="screenrecord_10frame_") as tmpdir:
+        tmp = Path(tmpdir)
+        frame_paths: list[Path] = []
+        for idx, frame_item in enumerate(frame_items):
+            frame_path = tmp / f"frame_{idx}.jpg"
+            client.download_file_to_path(str(frame_item["id"]), frame_path)
+            frame_paths.append(frame_path)
+
+        with Image.open(frame_paths[0]) as image:
+            frame_h, frame_w = image.height, image.width
+        img_shape = (frame_h, frame_w)
+
+        ref_w = int(camera.get("image_width") or camera.get("frame_width") or camera.get("width") or frame_w)
+        ref_h = int(camera.get("image_height") or camera.get("frame_height") or camera.get("height") or frame_h)
+        scaled_polygons = selected_polygons
+        if ref_w != frame_w or ref_h != frame_h:
+            scaled_polygons = _scale_table_polygons(selected_polygons, ref_w, ref_h, frame_w, frame_h)
+
+        yolo_model = _get_yolo_model()
+        frame_detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
+        assign_track_ids(frame_detections)
+
+        generated_names: list[str] = []
+        source_captured_at = list(metadata.get("captured_at_utc") or metadata.get("source_captured_at_utc") or [])
+        selected_captured_at = [
+            source_captured_at[idx]
+            for idx in selected_source_indices
+            if idx < len(source_captured_at)
+        ]
+        raw_name = str(raw_folder.get("name") or metadata.get("triplet_stem") or "triplet")
+
+        for table_id, tight_poly, _tight_bbox, zone_poly in scaled_polygons:
+            derived_name = _apply_source_prefix(
+                _derived_reolink_folder_name(raw_name, table_id),
+                label_source,
+            )
+            dest_folder_id = client.ensure_subfolder(output_parent_id, derived_name)
+            uploaded_frame_ids: dict[str, str | None] = {}
+
+            for output_idx, source_idx in enumerate(selected_source_indices):
+                cropped = perspective_crop_polygon(frame_paths[source_idx], zone_poly)
+                crop_path = tmp / "crops" / f"{derived_name}_f{output_idx}.jpg"
+                save_jpeg(cropped, crop_path)
+                uploaded = client.upload_or_update_file(
+                    crop_path,
+                    dest_folder_id,
+                    file_name=f"frame_{output_idx}.jpg",
+                )
+                uploaded_frame_ids[f"frame_{output_idx}"] = str(uploaded["id"])
+
+            artifact_metadata = {
+                **metadata,
+                "frame_count": 3,
+                "source_frame_count": 10,
+                "selected_source_frame_indices": selected_source_indices,
+                "selected_captured_at_utc": selected_captured_at,
+                "captured_at_utc": selected_captured_at,
+                "table_id": table_id,
+                "table": {
+                    "label": table_id,
+                },
+                "perception_file": PERCEPTION_V2_FILE_NAME,
+            }
+            client.upsert_bytes(
+                dest_folder_id,
+                "metadata.json",
+                json.dumps(artifact_metadata, indent=2).encode("utf-8"),
+                mime_type="application/json",
+            )
+
+            perception = build_perception_for_table(
+                frame_detections,
+                tight_poly,
+                img_shape,
+                n_frames=10,
+            )
+            perception_path = tmp / "perception" / f"{derived_name}_{PERCEPTION_V2_FILE_NAME}"
+            perception_path.parent.mkdir(parents=True, exist_ok=True)
+            perception_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
+            client.upload_or_update_file(
+                perception_path,
+                dest_folder_id,
+                file_name=PERCEPTION_V2_FILE_NAME,
+                mime_type="application/json",
+            )
+
+            client.update_file_metadata(
+                dest_folder_id,
+                {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
+            )
+            generated_names.append(derived_name)
+
+        return generated_names
+
+
 def _materialize_reolink_table_crops(
     client: DriveClient,
     context: QueueContext,
@@ -2445,7 +2748,6 @@ def _materialize_reolink_table_crops(
     from PIL import Image
     from person_detector import assign_track_ids, build_perception_for_table, detect_people_in_frame
     from processor import (
-        perception_filename_for_n_frames,
         perspective_crop_polygon,
         sample_frame_indices,
         save_jpeg,
@@ -2514,7 +2816,7 @@ def _materialize_reolink_table_crops(
             scaled_polygons = _scale_table_polygons(selected_polygons, ref_w, ref_h, frame_w, frame_h)
 
         sample_indices = sample_frame_indices(n_frames)
-        perception_file_name = perception_filename_for_n_frames(n_frames)
+        perception_file_name = PERCEPTION_V2_FILE_NAME if n_frames == 10 else None
         frame_detections = None
         if perception_file_name is not None:
             yolo_model = _get_yolo_model()
@@ -2796,6 +3098,90 @@ def _prepare_reolink_unlabeled_queue(
 
         preprocess_state = _load_preprocess_state()
 
+        # ScreenRecord-native path: use ready 3-frame artifacts first, then
+        # materialize missing artifacts from root-level 10frametrue folders.
+        for true_ten_folder in _list_screenrecord_true_ten_folders(client, context):
+            if visible_count >= target_unlabeled_count:
+                break
+
+            state_folder = _screenrecord_state_raw_folder(true_ten_folder)
+            if _reolink_raw_folder_processed(preprocess_state, context, state_folder):
+                continue
+
+            source_files = {
+                item["name"]: item
+                for item in client.list_files(
+                    true_ten_folder["id"],
+                    fields="id,name,mimeType,parents,appProperties",
+                )
+            }
+            metadata = _load_json_file_from_drive(client, source_files.get("metadata.json"))
+            if not metadata:
+                continue
+
+            mapped = _mapped_camera_tables_for_screenrecord_folder(
+                str(true_ten_folder.get("name", "")),
+                metadata,
+                site_key=context.site_key,
+                client=client,
+            )
+            if mapped is None:
+                continue
+
+            _channel_number, _camera, table_polygons = mapped
+            missing_table_polygons = [
+                entry
+                for entry in table_polygons
+                if (
+                    _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0])
+                    not in existing_names
+                    and _apply_source_prefix(
+                        _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0]),
+                        label_source,
+                    )
+                    not in existing_names
+                )
+            ]
+            if not missing_table_polygons:
+                _mark_reolink_raw_folder_processed(
+                    preprocess_state,
+                    context,
+                    state_folder,
+                    status="complete",
+                    generated=0,
+                )
+                continue
+
+            generated_names = _materialize_screenrecord_true_ten_artifacts(
+                client,
+                context,
+                true_ten_folder,
+                missing_table_polygons,
+                metadata,
+            )
+            raw_generated_count = 0
+            for name in generated_names:
+                existing_names.add(name)
+                unlabeled_count += 1
+                visible_count += 1
+                generated_any = True
+                generated_count += 1
+                raw_generated_count += 1
+
+            if raw_generated_count > 0:
+                _mark_reolink_raw_folder_processed(
+                    preprocess_state,
+                    context,
+                    state_folder,
+                    status="complete",
+                    generated=raw_generated_count,
+                )
+
+        if visible_count >= target_unlabeled_count:
+            if generated_any:
+                _invalidate_listing_cache(context.queue_key)
+            return generated_count
+
         # Phase 3: drain zipped unprocessed batches first (older queue from
         # before the per-triplet upload pattern; lives at <site>/unassociated_zips/).
         # Each zip is a batch of raw triplets compacted by
@@ -3067,14 +3453,29 @@ def _maybe_trigger_reolink_preprocess(
     )
 
 
+def _context_input_folder_ids(context: QueueContext) -> tuple[str, ...]:
+    folder_ids = [context.input_folder_id]
+    if context.source == REOLINK_SOURCE:
+        screenrecord_unlabeled = context.folder_ids.get(SCREENRECORD_THREE_FRAME_UNLABELED_KEY)
+        if screenrecord_unlabeled:
+            folder_ids.append(screenrecord_unlabeled)
+    unique: list[str] = []
+    for folder_id in folder_ids:
+        if folder_id and folder_id not in unique:
+            unique.append(folder_id)
+    return tuple(unique)
+
+
 def _fetch_source_listing(client: DriveClient, context: QueueContext) -> list[dict[str, str]]:
-    return sorted(
-        client.list_folders(
-            context.input_folder_id,
-            fields="id,name,mimeType,parents,appProperties",
-        ),
-        key=lambda item: str(item.get("name", "")).lower(),
-    )
+    folders: list[dict[str, str]] = []
+    for input_folder_id in _context_input_folder_ids(context):
+        folders.extend(
+            client.list_folders(
+                input_folder_id,
+                fields="id,name,mimeType,parents,appProperties,modifiedTime",
+            )
+        )
+    return sorted(folders, key=lambda item: str(item.get("name", "")).lower())
 
 
 def _set_listing_cache(queue_key: str, listing: list[dict[str, str]]) -> None:
@@ -3166,6 +3567,75 @@ def _frame_payload_from_folder(folder: dict[str, object]) -> dict[str, str | Non
     return extract_frame_ids_from_item(folder)
 
 
+def _file_by_name(files: list[dict[str, Any]]) -> dict[str, Any]:
+    return {str(item.get("name") or ""): item for item in files}
+
+
+def _load_json_file_from_drive(client: DriveClient, file_item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not file_item or not file_item.get("id"):
+        return None
+    try:
+        raw = client.download_file_content(str(file_item["id"]))
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _perception_payload_is_from_ten_frames(
+    perception: dict[str, Any] | None,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+    if not isinstance(perception, dict):
+        return False
+    try:
+        if int(perception.get("n_frames") or 0) == 10:
+            return True
+    except (TypeError, ValueError):
+        pass
+    # Only use metadata as supporting evidence when the perception explicitly
+    # declares schema v2; otherwise legacy 3-frame sidecars are too ambiguous.
+    try:
+        schema_version = int(perception.get("schema_version") or 0)
+        source_frame_count = int((metadata or {}).get("source_frame_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return schema_version >= 2 and source_frame_count == 10
+
+
+def _normalize_perception_sidecar(
+    client: DriveClient,
+    folder: dict[str, Any],
+    files_by_name: dict[str, dict[str, Any]],
+) -> None:
+    metadata = _load_json_file_from_drive(client, files_by_name.get("metadata.json"))
+    canonical = files_by_name.get(PERCEPTION_V2_FILE_NAME)
+    if canonical:
+        perception = _load_json_file_from_drive(client, canonical)
+        if _perception_payload_is_from_ten_frames(perception, metadata):
+            folder["_perception_file_id"] = str(canonical["id"])
+            folder["_perception_file_name"] = PERCEPTION_V2_FILE_NAME
+        return
+
+    for legacy_name in LEGACY_PERCEPTION_FILE_NAMES:
+        legacy = files_by_name.get(legacy_name)
+        if not legacy:
+            continue
+        perception = _load_json_file_from_drive(client, legacy)
+        if not _perception_payload_is_from_ten_frames(perception, metadata):
+            continue
+        data = client.download_file_content(str(legacy["id"]))
+        uploaded = client.upsert_bytes(
+            str(folder["id"]),
+            PERCEPTION_V2_FILE_NAME,
+            data,
+            mime_type="application/json",
+        )
+        folder["_perception_file_id"] = str(uploaded["id"])
+        folder["_perception_file_name"] = PERCEPTION_V2_FILE_NAME
+        return
+
+
 def _build_folder_payload(
     folder: dict[str, str],
     context: QueueContext,
@@ -3183,10 +3653,12 @@ def _build_folder_payload(
         for key, file_id in frames.items()
         if file_id
     }
+    parents = [str(parent) for parent in folder.get("parents", []) if parent]
+    parent_id = parents[0] if parents else context.input_folder_id
     return {
         "folder_id": folder["id"],
         "folder_name": folder["name"],
-        "parent_id": context.input_folder_id,
+        "parent_id": parent_id,
         "source": context.source,
         "site_key": context.site_key,
         "queue_key": context.queue_key,
@@ -3196,6 +3668,9 @@ def _build_folder_payload(
         "preview_urls": preview_urls,
         "thumb_urls": thumb_urls,
         "cache_ready": _thumbs_cache_ready(frames),
+        "perception_file_id": folder.get("_perception_file_id"),
+        "perception_file_name": folder.get("_perception_file_name"),
+        "metadata_file_id": folder.get("_metadata_file_id"),
     }
 
 
@@ -3254,11 +3729,21 @@ def _folder_cache_ready(folder: dict) -> bool:
 
 
 def _hydrate_folder(client: DriveClient, context: QueueContext, folder: dict[str, str]) -> dict | None:
+    files: list[dict[str, Any]] | None = None
+    if context.source == REOLINK_SOURCE:
+        files = client.list_files(folder["id"])
+        files_by_name = _file_by_name(files)
+        if "metadata.json" in files_by_name:
+            folder["_metadata_file_id"] = str(files_by_name["metadata.json"]["id"])
+        _normalize_perception_sidecar(client, folder, files_by_name)
+
     frames = _frame_payload_from_folder(folder)
     if has_complete_frame_ids(frames):
         return _build_folder_payload(folder, context, frames)
 
-    frames = _frame_payload_from_files(client.list_files(folder["id"]))
+    if files is None:
+        files = client.list_files(folder["id"])
+    frames = _frame_payload_from_files(files)
     if not has_complete_frame_ids(frames):
         return None
 
@@ -3884,7 +4369,7 @@ def _schedule_folder_hydration_prewarm(
 
 def _compute_stats(client: DriveClient, context: QueueContext) -> dict[str, int]:
     stats: dict[str, int] = {
-        "unlabeled": len(client.list_folders(context.input_folder_id)),
+        "unlabeled": sum(len(client.list_folders(folder_id)) for folder_id in _context_input_folder_ids(context)),
     }
     for name in LABEL_DESTINATIONS:
         stats[name] = len(client.list_folders(context.folder_ids[name]))
@@ -4245,7 +4730,7 @@ def api_sources():
             ],
             "reolink_sites": reolink_sites,
             "default_source": {
-                "source": VIDEO_SOURCE,
+                "source": REOLINK_SOURCE if reolink_sites else VIDEO_SOURCE,
                 "site_key": _default_reolink_site_key(),
             },
         }
@@ -4344,7 +4829,7 @@ def api_folders():
             {
                 "folder_id": f["id"],
                 "folder_name": f["name"],
-                "parent_id": context.input_folder_id,
+                "parent_id": next(iter(f.get("parents", []) or []), context.input_folder_id),
                 "source": context.source,
                 "site_key": context.site_key,
                 "queue_key": context.queue_key,

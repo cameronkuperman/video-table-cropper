@@ -231,6 +231,21 @@ class FakeDriveClient:
         self._add_file(item_id, file_name, parent_id, mime_type=mime_type, content=data)
         return self._copy(item_id)
 
+    def upload_or_update_file(
+        self,
+        local_path: Path,
+        parent_id: str,
+        file_name: str | None = None,
+        mime_type: str | None = None,
+    ) -> dict:
+        target_name = file_name or local_path.name
+        return self.upsert_bytes(
+            parent_id,
+            target_name,
+            local_path.read_bytes(),
+            mime_type=mime_type or "image/jpeg",
+        )
+
 
 def _fake_prepare_reolink_unlabeled_queue(fake: FakeDriveClient, context, target_unlabeled_count: int) -> int:
     if context.source != label_app.REOLINK_SOURCE or not context.seed_folder_id:
@@ -342,6 +357,13 @@ def _label_payload(folder: dict, label: str) -> dict:
     }
 
 
+def _jpeg_bytes(width: int = 80, height: int = 60, color: tuple[int, int, int] = (20, 40, 60)) -> bytes:
+    img = Image.new("RGB", (width, height), color)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    return buf.getvalue()
+
+
 @pytest.fixture()
 def client(fake_drive):
     return label_app.app.test_client()
@@ -363,6 +385,128 @@ def test_api_sources_exposes_video_and_reolink_sites(client):
     assert matthews_site["crop_editor_url"] == "/crop-editor?site=reolink-matthews-01"
     assert matthews_site["label"] == "Matthews"
     assert sites_by_key["restaurant-pi-1"]["label"] == "Mimosas (Photos)"
+    assert payload["default_source"]["source"] == "reolink"
+    assert payload["default_source"]["site_key"] == "restaurant-pi-1"
+
+
+def test_reolink_hydration_normalizes_legacy_ten_frame_perception(fake_drive):
+    fake_drive._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake_drive._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+    fake_drive._add_folder("sr-artifact", "front-camera_table_top_1_t0015", "r-3frame-unlabeled")
+    fake_drive._add_triplet_files("sr-artifact", "sr-artifact", include_metadata=False)
+    fake_drive._add_file(
+        "sr-artifact-metadata",
+        "metadata.json",
+        "sr-artifact",
+        mime_type="application/json",
+        content=json.dumps({"source_frame_count": 10}).encode("utf-8"),
+    )
+    fake_drive._add_file(
+        "sr-artifact-perception",
+        "perception.json",
+        "sr-artifact",
+        mime_type="application/json",
+        content=json.dumps({"schema_version": 2, "n_frames": 10}).encode("utf-8"),
+    )
+    label_app._source_folder_ids_cache.clear()
+
+    context = label_app._resolve_queue_context(fake_drive, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    folder = fake_drive.get_file("sr-artifact", fields="id,name,mimeType,parents,appProperties")
+    payload = label_app._hydrate_folder(fake_drive, context, folder)
+
+    assert payload is not None
+    assert payload["parent_id"] == "r-3frame-unlabeled"
+    assert payload["perception_file_name"] == label_app.PERCEPTION_V2_FILE_NAME
+    assert fake_drive.find_file_by_name("sr-artifact", label_app.PERCEPTION_V2_FILE_NAME) is not None
+
+
+def test_reolink_hydration_ignores_ambiguous_perception(fake_drive):
+    fake_drive._add_folder("artifact-no-ten", "front-camera_table_top_1_t0016", "r-unlabeled")
+    fake_drive._add_triplet_files("artifact-no-ten", "artifact-no-ten", include_metadata=False)
+    fake_drive._add_file(
+        "artifact-no-ten-perception",
+        "perception.json",
+        "artifact-no-ten",
+        mime_type="application/json",
+        content=json.dumps({"schema_version": 1, "n_frames": 3}).encode("utf-8"),
+    )
+
+    context = label_app._resolve_queue_context(fake_drive, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    folder = fake_drive.get_file("artifact-no-ten", fields="id,name,mimeType,parents,appProperties")
+    payload = label_app._hydrate_folder(fake_drive, context, folder)
+
+    assert payload is not None
+    assert payload["perception_file_id"] is None
+    assert fake_drive.find_file_by_name("artifact-no-ten", label_app.PERCEPTION_V2_FILE_NAME) is None
+
+
+def test_screenrecord_true_ten_generation_creates_three_crops_and_perception(monkeypatch, tmp_path):
+    import person_detector
+
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    fake._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake._add_folder("sr-10-node", "restaurant-pi-1", "sr-10-root")
+    fake._add_folder("sr-raw", "IPC4_t0015", "sr-10-node")
+    for idx in range(10):
+        fake._add_file(
+            f"sr-raw-frame-{idx}",
+            f"frame_{idx}.jpg",
+            "sr-raw",
+            content=_jpeg_bytes(color=(idx * 10, 20, 40)),
+        )
+    fake._add_file(
+        "sr-raw-metadata",
+        "metadata.json",
+        "sr-raw",
+        mime_type="application/json",
+        content=json.dumps(
+            {
+                "site_id": "site-1",
+                "node_id": "restaurant-pi-1",
+                "camera_id": "IPC4",
+                "camera_name": "IPC4",
+                "triplet_index": 15,
+                "triplet_stem": "IPC4",
+                "captured_at_utc": [f"2026-03-12T00:00:{idx * 3:02d}Z" for idx in range(10)],
+            }
+        ).encode("utf-8"),
+    )
+    fake._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+
+    monkeypatch.setattr(label_app, "_get_yolo_model", lambda: object())
+    monkeypatch.setattr(person_detector, "detect_people_in_frame", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        label_app,
+        "_mapped_camera_tables_for_screenrecord_folder",
+        lambda *_args, **_kwargs: (
+            4,
+            {"camera_number": 4, "image_width": 80, "image_height": 60},
+            [("table_top_1", [(0, 0), (40, 0), (40, 40), (0, 40)], (0, 0, 40, 40), [(0, 0), (50, 0), (50, 50), (0, 50)])],
+        ),
+    )
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1,
+    )
+
+    assert generated == 1
+    artifact = fake.find_file_by_name("r-3frame-unlabeled", "mimosas-IPC4_table_top_1_t0015", mime_type=label_app.FOLDER_MIME)
+    assert artifact is not None
+    files = {item["name"]: item for item in fake.list_files(artifact["id"])}
+    assert {"frame_0.jpg", "frame_1.jpg", "frame_2.jpg", "metadata.json", label_app.PERCEPTION_V2_FILE_NAME} <= set(files)
+    perception = json.loads(fake.download_file_content(files[label_app.PERCEPTION_V2_FILE_NAME]["id"]).decode("utf-8"))
+    assert perception["schema_version"] == 2
+    assert perception["n_frames"] == 10
 
 
 def test_queue_is_source_aware_and_reolink_filters_incomplete_triplets(client):
