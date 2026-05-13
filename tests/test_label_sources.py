@@ -14,6 +14,23 @@ import processor
 from queue_metadata import extract_frame_ids_from_item, has_complete_frame_ids
 
 
+@pytest.fixture(autouse=True)
+def isolate_supabase_crop_env(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_DB_SCHEMA", raising=False)
+    label_app._supabase_crop_cache.clear()
+    label_app._set_supabase_crop_status(
+        enabled=False,
+        last_error=None,
+        last_lookup_at=None,
+        last_cache_hit=False,
+        last_camera_source_id=None,
+        last_table_count=0,
+    )
+
+
 class FakeDriveClient:
     def __init__(self) -> None:
         self.items: dict[str, dict] = {}
@@ -318,6 +335,17 @@ def fake_drive(monkeypatch, tmp_path):
             target_unlabeled_count,
         ),
     )
+    original_list_source_subfolders = label_app._list_source_subfolders
+
+    def fake_list_source_subfolders(client, context, force_refresh=False):
+        if context.source == label_app.REOLINK_SOURCE:
+            existing = original_list_source_subfolders(client, context, force_refresh=True)
+            if not existing:
+                _fake_prepare_reolink_unlabeled_queue(fake, context, target_unlabeled_count=10)
+                label_app._invalidate_listing_cache(context.queue_key)
+        return original_list_source_subfolders(client, context, force_refresh=force_refresh)
+
+    monkeypatch.setattr(label_app, "_list_source_subfolders", fake_list_source_subfolders)
     monkeypatch.setattr(label_app, "_maybe_trigger_video_preprocess", lambda context, unlabeled_count: None)
     monkeypatch.setattr(label_app, "_schedule_label_job_worker", lambda: False)
 
@@ -421,6 +449,32 @@ def test_reolink_hydration_normalizes_legacy_ten_frame_perception(fake_drive):
     assert fake_drive.find_file_by_name("sr-artifact", label_app.PERCEPTION_V2_FILE_NAME) is not None
 
 
+def test_reolink_site_loads_without_unassociated_when_screenrecord_artifacts_exist(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    fake.children["site-restaurant"] = [
+        child_id for child_id in fake.children["site-restaurant"] if child_id != "r-unassociated"
+    ]
+    fake.items.pop("r-unassociated")
+    fake._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+    fake._add_folder("sr-artifact-ready", "mimosas-IPC4_table_top_1_t0020", "r-3frame-unlabeled")
+    fake._add_triplet_files("sr-artifact-ready", "sr-ready", include_metadata=True)
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    listing = label_app._list_source_subfolders(fake, context, force_refresh=True)
+    payload = label_app._hydrate_folder(fake, context, listing[0])
+
+    assert context.seed_folder_id is None
+    assert context.folder_ids[label_app.SCREENRECORD_THREE_FRAME_UNLABELED_KEY] == "r-3frame-unlabeled"
+    assert [folder["name"] for folder in listing] == ["mimosas-IPC4_table_top_1_t0020"]
+    assert payload["source_label"] == label_app.SCREENRECORD_TRUE_TEN_FOLDER_NAME
+
+
 def test_reolink_hydration_ignores_ambiguous_perception(fake_drive):
     fake_drive._add_folder("artifact-no-ten", "front-camera_table_top_1_t0016", "r-unlabeled")
     fake_drive._add_triplet_files("artifact-no-ten", "artifact-no-ten", include_metadata=False)
@@ -488,7 +542,21 @@ def test_screenrecord_true_ten_generation_creates_three_crops_and_perception(mon
         "_mapped_camera_tables_for_screenrecord_folder",
         lambda *_args, **_kwargs: (
             4,
-            {"camera_number": 4, "image_width": 80, "image_height": 60},
+            {
+                "camera_number": 4,
+                "image_width": 80,
+                "image_height": 60,
+                "_table_metadata_by_id": {
+                    "table_top_1": {
+                        "label": "Table 23",
+                        "restaurant_id": "restaurant-uuid",
+                        "table_id": "table-uuid",
+                        "camera_source_id": "camera-source-uuid",
+                        "table_camera_crops_id": "crop-uuid",
+                        "crop_source": "supabase_table_camera_crops",
+                    }
+                },
+            },
             [("table_top_1", [(0, 0), (40, 0), (40, 40), (0, 40)], (0, 0, 40, 40), [(0, 0), (50, 0), (50, 50), (0, 50)])],
         ),
     )
@@ -505,9 +573,97 @@ def test_screenrecord_true_ten_generation_creates_three_crops_and_perception(mon
     assert artifact is not None
     files = {item["name"]: item for item in fake.list_files(artifact["id"])}
     assert {"frame_0.jpg", "frame_1.jpg", "frame_2.jpg", "metadata.json", label_app.PERCEPTION_V2_FILE_NAME} <= set(files)
+    metadata = json.loads(fake.download_file_content(files["metadata.json"]["id"]).decode("utf-8"))
+    assert metadata["restaurant_id"] == "restaurant-uuid"
+    assert metadata["supabase_table_id"] == "table-uuid"
+    assert metadata["camera_source_id"] == "camera-source-uuid"
+    assert metadata["table_camera_crops_id"] == "crop-uuid"
+    assert metadata["table"]["label"] == "Table 23"
     perception = json.loads(fake.download_file_content(files[label_app.PERCEPTION_V2_FILE_NAME]["id"]).decode("utf-8"))
     assert perception["schema_version"] == 2
     assert perception["n_frames"] == 10
+
+
+def test_screenrecord_generation_dedupes_existing_metadata_identity(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+    fake.children["site-restaurant"] = [
+        child_id for child_id in fake.children["site-restaurant"] if child_id != "r-unassociated"
+    ]
+    fake.items.pop("r-unassociated")
+
+    fake._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake._add_folder("sr-10-node", "restaurant-pi-1", "sr-10-root")
+    fake._add_folder("sr-raw-dupe", "IPC4_t0030", "sr-10-node")
+    for idx in range(10):
+        fake._add_file(
+            f"sr-dupe-frame-{idx}",
+            f"frame_{idx}.jpg",
+            "sr-raw-dupe",
+            content=_jpeg_bytes(color=(idx * 10, 50, 70)),
+        )
+    fake._add_file(
+        "sr-dupe-metadata",
+        "metadata.json",
+        "sr-raw-dupe",
+        mime_type="application/json",
+        content=json.dumps({"camera_id": "IPC4", "triplet_stem": "IPC4", "triplet_index": 30}).encode("utf-8"),
+    )
+    fake._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+    fake._add_folder("uuid-looking-artifact-folder", "d1cf6d88-4212-4ef2-9f7f-2d4cda0b2d2d", "r-3frame-unlabeled")
+    fake._add_triplet_files("uuid-looking-artifact-folder", "dupe", include_metadata=False)
+    fake._add_file(
+        "uuid-looking-artifact-metadata",
+        "metadata.json",
+        "uuid-looking-artifact-folder",
+        mime_type="application/json",
+        content=json.dumps(
+            {
+                "triplet_stem": "IPC4",
+                "triplet_index": 30,
+                "table_camera_crops_id": "crop-uuid",
+                "supabase_table_id": "table-uuid",
+            }
+        ).encode("utf-8"),
+    )
+    monkeypatch.setattr(
+        label_app,
+        "_mapped_camera_tables_for_screenrecord_folder",
+        lambda *_args, **_kwargs: (
+            4,
+            {
+                "camera_number": 4,
+                "image_width": 80,
+                "image_height": 60,
+                "_table_metadata_by_id": {
+                    "table_top_1": {
+                        "table_id": "table-uuid",
+                        "table_camera_crops_id": "crop-uuid",
+                    }
+                },
+            },
+            [("table_top_1", [(0, 0), (40, 0), (40, 40), (0, 40)], (0, 0, 40, 40), [(0, 0), (50, 0), (50, 50), (0, 50)])],
+        ),
+    )
+
+    def fail_materialize(*_args, **_kwargs):
+        raise AssertionError("matching metadata identity should prevent a duplicate artifact")
+
+    monkeypatch.setattr(label_app, "_materialize_screenrecord_true_ten_artifacts", fail_materialize)
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=2,
+    )
+
+    assert generated == 0
 
 
 def test_screenrecord_artifacts_count_toward_reolink_generation_target(monkeypatch, tmp_path):
@@ -1872,9 +2028,16 @@ def test_reolink_preprocess_records_existing_drive_folders_in_local_state(monkey
     monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
     label_app._source_folder_ids_cache.clear()
 
-    legacy_name = "Reolink-CH-CH04_table_top_1_t0004"
-    legacy_id = fake.ensure_subfolder("r-unlabeled", legacy_name)
-    fake._add_triplet_files(legacy_id, "legacy-rready")
+    mapped = label_app._mapped_camera_tables_for_reolink_folder(
+        "Reolink-CH-CH04_t0004",
+        site_key="restaurant-pi-1",
+        client=fake,
+    )
+    assert mapped is not None
+    for table_id, *_rest in mapped[2]:
+        legacy_name = f"Reolink-CH-CH04_{table_id}_t0004"
+        legacy_id = fake.ensure_subfolder("r-unlabeled", legacy_name)
+        fake._add_triplet_files(legacy_id, f"legacy-rready-{table_id}")
 
     def fail_materialize(*_args, **_kwargs):
         raise AssertionError("existing Drive folders should prevent materialization")

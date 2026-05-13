@@ -1,6 +1,7 @@
 # AutoLabeler
 
-Label table images from Google Drive. Two commands, local-only, no database.
+Label table images from Google Drive. Two commands, local-first, with optional
+Supabase crop lookup for ScreenRecord/Reolink sites.
 
 ## Drive folder structure
 
@@ -27,9 +28,12 @@ Each site should look like:
 
 ```
 <site root>/
-├── unassociated/       ← raw screenshot triplets grouped by channel/time
+├── 3frame/unlabeled/   ← ScreenRecord-generated crop artifacts ready to label
+├── 10frametrue/<node>/ ← raw 10-frame ScreenRecord captures used as fallback input
+├── unassociated/       ← legacy raw screenshot triplets grouped by channel/time
 ├── crop_configs/       ← permanent manual crop configs (Matthews only)
 ├── unlabeled/          ← generated per-table crops waiting to be labeled
+├── processed_raw/      ← legacy raw inputs already processed
 ├── clean/              ← labeled output
 ├── dirty/              ← labeled output
 ├── occupied/           ← labeled output
@@ -37,11 +41,28 @@ Each site should look like:
 └── discarded/          ← rejected output
 ```
 
-Each raw group folder in `unassociated/` should contain a contiguous set of
+For ScreenRecord-backed Reolink sites, `unassociated/` is optional. The labeler
+prefers ready artifacts in `3frame/unlabeled/`, accepts schema-v2
+`perception.json` sidecars as canonical `perception_v2.json`, and uses
+`10frametrue/<node>/` only to top up missing artifacts in the background. Legacy
+raw group folders in `unassociated/` can still contain a contiguous set of
 `frame_0.jpg` through `frame_{N-1}.jpg` (current target N=10; legacy data may
-have N=3). The labeler maps channel names like `CH-CH03` to the matching camera
-geometry (`IPC3`), runs the same YOLO/perception + table-crop flow used by the
-video pipeline, and materializes per-table folders into `unlabeled/`.
+have N=3).
+
+When Supabase is configured, active `table_camera_crops` rows are the preferred
+crop source. Set:
+
+```text
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...   # or SUPABASE_SECRET_KEY
+SUPABASE_DB_SCHEMA=public       # optional
+SUPABASE_CROP_CACHE_TTL_SECONDS=300
+```
+
+Supabase crop rows are cached briefly in memory and as last-good state under
+`PREPROCESS_STATE_DIR`, so already-preprocessed artifacts remain labelable even
+if Supabase is unavailable. Without Supabase identity, the repo/Drive crop JSON
+fallbacks remain available for legacy inputs.
 
 > **Naming note.** The codebase still calls a group of frames a "triplet" in
 > some places — variable names, folder suffixes (`_t{idx:04d}`), the edge-side
@@ -199,8 +220,9 @@ Shows N images per unlabeled folder (10 today, 3 for legacy data). Click
 
 The UI now supports two source types:
 - `Video`: reads from the project root `unlabeled/`
-- `Reolink`: generates per-table crops from a selected site `unassociated/`, then labels
-  the derived folders in that site `unlabeled/`
+- `Reolink`: labels ready ScreenRecord artifacts from `3frame/unlabeled/`, tops
+  up from `10frametrue/<node>/`, and still supports legacy `unassociated/`
+  inputs
 
 For Matthews setup, open:
 

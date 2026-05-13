@@ -240,6 +240,11 @@ PERCEPTION_V2_FILE_NAME = "perception_v2.json"
 LEGACY_PERCEPTION_FILE_NAMES = ("perception.json", "perception_10frame.json")
 PREPROCESS_STATE_SCHEMA_VERSION = 1
 PREPROCESS_STATE_FILE_NAME = "preprocess_state.json"
+SUPABASE_CROP_CACHE_FILE_NAME = "supabase_crop_cache.json"
+SUPABASE_CROP_CACHE_TTL_SECONDS = max(
+    30,
+    int(os.environ.get("SUPABASE_CROP_CACHE_TTL_SECONDS", "300") or "300"),
+)
 LABEL_HISTORY_SCHEMA_VERSION = 1
 LABEL_HISTORY_FILE_NAME = "label_history.json"
 LABEL_JOBS_SCHEMA_VERSION = 1
@@ -551,6 +556,16 @@ _camera_config_lock = Lock()
 _crop_config_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
 _crop_config_lock = Lock()
 _CROP_CONFIG_CACHE_MISS = object()
+_supabase_crop_cache: dict[str, dict[str, Any]] = {}
+_supabase_crop_cache_lock = Lock()
+_supabase_crop_status: dict[str, Any] = {
+    "enabled": False,
+    "last_error": None,
+    "last_lookup_at": None,
+    "last_cache_hit": False,
+    "last_camera_source_id": None,
+    "last_table_count": 0,
+}
 
 
 def _csrf_token() -> str:
@@ -753,6 +768,11 @@ def _find_screenrecord_three_frame_unlabeled(client: DriveClient, node_root_id: 
     return str(unlabeled["id"]) if unlabeled and unlabeled.get("id") else None
 
 
+def _ensure_screenrecord_three_frame_unlabeled(client: DriveClient, node_root_id: str) -> str:
+    three_frame_id = client.ensure_subfolder(node_root_id, SCREENRECORD_THREE_FRAME_FOLDER_NAME)
+    return client.ensure_subfolder(three_frame_id, "unlabeled")
+
+
 def _find_screenrecord_true_ten_node_folder(client: DriveClient, node_root_id: str) -> str | None:
     true_ten_root = client.find_file_by_name(
         _root_id(),
@@ -840,10 +860,11 @@ def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, st
                     updated = dict(updated)
                     updated[UNASSOCIATED_ZIPS_FOLDER_NAME] = str(existing_zips["id"])
             if SCREENRECORD_THREE_FRAME_UNLABELED_KEY not in updated:
-                screenrecord_unlabeled = _find_screenrecord_three_frame_unlabeled(client, updated["root"])
-                if screenrecord_unlabeled:
-                    updated = dict(updated)
-                    updated[SCREENRECORD_THREE_FRAME_UNLABELED_KEY] = screenrecord_unlabeled
+                updated = dict(updated)
+                updated[SCREENRECORD_THREE_FRAME_UNLABELED_KEY] = _ensure_screenrecord_three_frame_unlabeled(
+                    client,
+                    updated["root"],
+                )
             if SCREENRECORD_TRUE_TEN_NODE_KEY not in updated:
                 screenrecord_true_ten = _find_screenrecord_true_ten_node_folder(client, updated["root"])
                 if screenrecord_true_ten:
@@ -858,28 +879,26 @@ def _reolink_site_folder_ids(client: DriveClient, site_key: str) -> dict[str, st
         site = _resolve_site_config(site_key)
         site_root_id = _discover_reolink_root_id(client, site)
         unassociated = client.find_file_by_name(site_root_id, "unassociated", mime_type=FOLDER_MIME)
-        if not unassociated or not unassociated.get("id"):
-            raise RuntimeError(
-                f"Reolink site '{site.display_name}' is missing required folder 'unassociated'."
-            )
 
         folder_ids = {
             "root": site_root_id,
-            "unassociated": str(unassociated["id"]),
             "unlabeled": client.ensure_subfolder(site_root_id, "unlabeled"),
             PROCESSED_RAW_FOLDER_NAME: client.ensure_subfolder(
                 site_root_id,
                 PROCESSED_RAW_FOLDER_NAME,
             ),
+            SCREENRECORD_THREE_FRAME_UNLABELED_KEY: _ensure_screenrecord_three_frame_unlabeled(
+                client,
+                site_root_id,
+            ),
         }
+        if unassociated and unassociated.get("id"):
+            folder_ids["unassociated"] = str(unassociated["id"])
         existing_zips = client.find_file_by_name(
             site_root_id, UNASSOCIATED_ZIPS_FOLDER_NAME, mime_type=FOLDER_MIME
         )
         if existing_zips and existing_zips.get("id"):
             folder_ids[UNASSOCIATED_ZIPS_FOLDER_NAME] = str(existing_zips["id"])
-        screenrecord_unlabeled = _find_screenrecord_three_frame_unlabeled(client, site_root_id)
-        if screenrecord_unlabeled:
-            folder_ids[SCREENRECORD_THREE_FRAME_UNLABELED_KEY] = screenrecord_unlabeled
         screenrecord_true_ten = _find_screenrecord_true_ten_node_folder(client, site_root_id)
         if screenrecord_true_ten:
             folder_ids[SCREENRECORD_TRUE_TEN_NODE_KEY] = screenrecord_true_ten
@@ -997,7 +1016,7 @@ def _resolve_queue_context(
         input_folder_name="unlabeled",
         input_folder_id=folder_ids["unlabeled"],
         seed_folder_name="unassociated",
-        seed_folder_id=folder_ids["unassociated"],
+        seed_folder_id=folder_ids.get("unassociated"),
         folder_ids=folder_ids,
         persist_frame_metadata=False,
     )
@@ -1169,6 +1188,315 @@ def _build_table_polygons_from_crop_config(
     return table_polygons
 
 
+def _safe_table_slug(value: Any, fallback: str) -> str:
+    slug = re.sub(r"\s+", "_", str(value or "").strip())
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", slug).strip("_.-")
+    return slug or fallback
+
+
+def _camera_id_candidates(raw_folder_name: str, metadata: dict[str, Any] | None = None) -> list[str]:
+    metadata = metadata or {}
+    candidates: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+
+    for key in ("camera_id", "camera_name", "triplet_stem", "raw_camera_id"):
+        add(metadata.get(key))
+    add(raw_folder_name)
+
+    for candidate in list(candidates):
+        ipc = re.search(r"IPC[\s_-]*(\d+)", candidate, re.IGNORECASE)
+        if ipc:
+            add(f"IPC{int(ipc.group(1))}")
+            add(f"CH-CH{int(ipc.group(1)):02d}")
+        channel = _extract_reolink_channel_code(candidate)
+        if channel:
+            add(channel)
+            number = _extract_reolink_channel_number(channel)
+            if number is not None:
+                add(f"IPC{number}")
+    return candidates
+
+
+def _supabase_table_label(table_row: dict[str, Any] | None, crop: dict[str, Any], idx: int) -> str:
+    source_metadata = crop.get("source_metadata") if isinstance(crop.get("source_metadata"), dict) else {}
+    for value in (
+        source_metadata.get("original_name"),
+        source_metadata.get("label"),
+        (table_row or {}).get("host_facing_label"),
+        (table_row or {}).get("table_number"),
+        (table_row or {}).get("internal_name"),
+        crop.get("table_label"),
+        crop.get("table_id"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return f"table_{idx + 1}"
+
+
+def _normalize_supabase_crops_as_camera(
+    camera_source: dict[str, Any],
+    crops: list[dict[str, Any]],
+    table_rows: dict[str, dict[str, Any]],
+) -> tuple[int, dict[str, Any], list[tuple[str, list, tuple[int, int, int, int], list]]] | None:
+    from processor import bbox_from_polygon
+
+    camera_number = _screenrecord_camera_number_from_metadata(
+        "",
+        {
+            "camera_id": camera_source.get("config", {}).get("edge_camera_id")
+            if isinstance(camera_source.get("config"), dict)
+            else "",
+            "camera_name": camera_source.get("name"),
+        },
+    )
+    if camera_number is None:
+        camera_number = 0
+
+    table_polygons: list[tuple[str, list, tuple[int, int, int, int], list]] = []
+    table_metadata_by_id: dict[str, dict[str, Any]] = {}
+    seen_slugs: set[str] = set()
+    image_width = 0
+    image_height = 0
+    for idx, crop in enumerate(crops):
+        raw_polygon = crop.get("polygon")
+        if not isinstance(raw_polygon, list) or len(raw_polygon) < 3:
+            continue
+        polygon = [
+            (float(point[0]), float(point[1]))
+            for point in raw_polygon
+            if isinstance(point, (list, tuple)) and len(point) == 2
+        ]
+        if len(polygon) < 3:
+            continue
+        if len(polygon) == 4:
+            polygon = _ordered_quadrilateral_points(polygon)
+
+        table_row = table_rows.get(str(crop.get("table_id") or ""))
+        label = _supabase_table_label(table_row, crop, idx)
+        table_id = _safe_table_slug(label, f"table_{idx + 1}")
+        if table_id in seen_slugs:
+            table_id = f"{table_id}_{idx + 1}"
+        seen_slugs.add(table_id)
+
+        tight_bbox = bbox_from_polygon(polygon)
+        table_polygons.append((table_id, polygon, tight_bbox, polygon))
+        table_metadata_by_id[table_id] = {
+            "label": label,
+            "restaurant_id": crop.get("restaurant_id") or (table_row or {}).get("restaurant_id"),
+            "table_id": crop.get("table_id"),
+            "camera_source_id": crop.get("camera_source_id"),
+            "table_camera_crops_id": crop.get("id"),
+            "crop_version": crop.get("version"),
+            "crop_source": crop.get("source"),
+            "frame_width": crop.get("frame_width"),
+            "frame_height": crop.get("frame_height"),
+        }
+        try:
+            image_width = max(image_width, int(crop.get("frame_width") or 0))
+            image_height = max(image_height, int(crop.get("frame_height") or 0))
+        except (TypeError, ValueError):
+            pass
+
+    if not table_polygons:
+        return None
+
+    camera_payload = {
+        "camera_number": camera_number,
+        "camera_id": camera_source.get("id"),
+        "camera_source_id": camera_source.get("id"),
+        "camera_name": camera_source.get("name"),
+        "image_width": image_width,
+        "image_height": image_height,
+        "source": "supabase_table_camera_crops",
+        "_table_metadata_by_id": table_metadata_by_id,
+    }
+    return camera_number, camera_payload, table_polygons
+
+
+def _supabase_table_rows_by_id(client: SupabaseCropClient, table_ids: list[str]) -> dict[str, dict[str, Any]]:
+    ids = [table_id for table_id in table_ids if _is_valid_uuid(table_id)]
+    if not ids:
+        return {}
+    try:
+        rows = client.select(
+            "tables",
+            {
+                "select": "id,restaurant_id,table_number,host_facing_label,internal_name,is_active",
+                "id": f"in.({','.join(ids)})",
+                "limit": str(max(1, len(ids))),
+            },
+        )
+    except Exception:
+        return {}
+    return {str(row.get("id")): row for row in rows if row.get("id")}
+
+
+def _supabase_active_crops_for_camera(client: SupabaseCropClient, camera_source_id: str) -> list[dict[str, Any]]:
+    cached = _supabase_cached_tables(camera_source_id)
+    if cached is not None:
+        _set_supabase_crop_status(
+            enabled=client.enabled,
+            last_lookup_at=_utc_iso_now(),
+            last_cache_hit=True,
+            last_camera_source_id=camera_source_id,
+            last_table_count=len(cached),
+        )
+        return cached
+
+    try:
+        rows = client.select(
+            "table_camera_crops",
+            {
+                "select": "*",
+                "camera_source_id": f"eq.{camera_source_id}",
+                "is_active": "eq.true",
+                "limit": "1000",
+            },
+        )
+    except Exception as exc:
+        stale = _supabase_cached_tables(camera_source_id, allow_stale=True)
+        _set_supabase_crop_status(
+            enabled=client.enabled,
+            last_lookup_at=_utc_iso_now(),
+            last_cache_hit=stale is not None,
+            last_error=str(exc),
+            last_camera_source_id=camera_source_id,
+            last_table_count=len(stale or []),
+        )
+        return stale or []
+
+    _store_supabase_cached_tables(camera_source_id, rows)
+    _set_supabase_crop_status(
+        enabled=client.enabled,
+        last_lookup_at=_utc_iso_now(),
+        last_cache_hit=False,
+        last_error=None,
+        last_camera_source_id=camera_source_id,
+        last_table_count=len(rows),
+    )
+    return rows
+
+
+def _resolve_supabase_camera_source(
+    raw_folder_name: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    client = _get_supabase_crop_client()
+    if not client.enabled:
+        _set_supabase_crop_status(enabled=False)
+        return None
+
+    metadata = metadata or {}
+    explicit_id = str(metadata.get("camera_source_id") or "").strip()
+    if _is_valid_uuid(explicit_id):
+        try:
+            camera = _select_one_supabase(
+                client,
+                "camera_sources",
+                {
+                    "select": "id,name,restaurant_id,is_active,config",
+                    "id": f"eq.{explicit_id}",
+                },
+            )
+            if camera and camera.get("is_active") is not False:
+                return camera
+        except Exception as exc:
+            _set_supabase_crop_status(enabled=True, last_error=str(exc), last_lookup_at=_utc_iso_now())
+
+    site_id = str(metadata.get("site_id") or "").strip()
+    node_id = str(metadata.get("node_id") or "").strip()
+    for camera_id in _camera_id_candidates(raw_folder_name, metadata):
+        params = {
+            "select": "id,node_id,restaurant_id,site_id,camera_id,camera_name,camera_source_id,metadata",
+            "camera_id": f"eq.{camera_id}",
+            "limit": "50",
+        }
+        if site_id:
+            params["site_id"] = f"eq.{site_id}"
+        try:
+            registry_rows = client.select("edge_camera_registry", params)
+        except Exception as exc:
+            _set_supabase_crop_status(enabled=True, last_error=str(exc), last_lookup_at=_utc_iso_now())
+            registry_rows = []
+        if node_id:
+            registry_rows = [row for row in registry_rows if str(row.get("node_id") or "") == node_id] or registry_rows
+        for row in registry_rows:
+            camera_source_id = str(row.get("camera_source_id") or "").strip()
+            if not _is_valid_uuid(camera_source_id):
+                continue
+            try:
+                camera = _select_one_supabase(
+                    client,
+                    "camera_sources",
+                    {
+                        "select": "id,name,restaurant_id,is_active,config",
+                        "id": f"eq.{camera_source_id}",
+                    },
+                )
+            except Exception as exc:
+                _set_supabase_crop_status(enabled=True, last_error=str(exc), last_lookup_at=_utc_iso_now())
+                continue
+            if camera and camera.get("is_active") is not False:
+                return camera
+
+    restaurant_id = str(metadata.get("restaurant_id") or "").strip()
+    if _is_valid_uuid(restaurant_id):
+        try:
+            candidates = client.select(
+                "camera_sources",
+                {
+                    "select": "id,name,restaurant_id,is_active,config",
+                    "restaurant_id": f"eq.{restaurant_id}",
+                    "limit": "1000",
+                },
+            )
+        except Exception as exc:
+            _set_supabase_crop_status(enabled=True, last_error=str(exc), last_lookup_at=_utc_iso_now())
+            candidates = []
+        camera_ids = set(_camera_id_candidates(raw_folder_name, metadata))
+        for camera in candidates:
+            if camera.get("is_active") is False:
+                continue
+            config = camera.get("config") if isinstance(camera.get("config"), dict) else {}
+            values = {
+                str(camera.get("name") or "").strip(),
+                str(config.get("edge_camera_id") or "").strip(),
+                str(config.get("edge_camera_key") or "").strip(),
+            }
+            if any(value in camera_ids for value in values if value):
+                return camera
+
+    return None
+
+
+def _resolve_supabase_crop_tables(
+    raw_folder_name: str,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any], list[tuple[str, list, tuple[int, int, int, int], list]]] | None:
+    client = _get_supabase_crop_client()
+    if not client.enabled:
+        _set_supabase_crop_status(enabled=False)
+        return None
+
+    camera_source = _resolve_supabase_camera_source(raw_folder_name, metadata)
+    if not camera_source or not camera_source.get("id"):
+        return None
+    camera_source_id = str(camera_source["id"])
+    crops = _supabase_active_crops_for_camera(client, camera_source_id)
+    if not crops:
+        return None
+    table_rows = _supabase_table_rows_by_id(
+        client,
+        [str(crop.get("table_id") or "") for crop in crops],
+    )
+    return _normalize_supabase_crops_as_camera(camera_source, crops, table_rows)
+
+
 def _manual_crop_camera_payload(
     channel_number: int,
     channel_code: str,
@@ -1192,6 +1520,10 @@ def _mapped_camera_tables_for_reolink_folder(
     site_key: str | None = None,
     client: DriveClient | None = None,
 ) -> tuple[int, dict[str, Any], list[tuple[str, list, tuple[int, int, int, int], list]]] | None:
+    supabase_match = _resolve_supabase_crop_tables(raw_folder_name, {})
+    if supabase_match is not None:
+        return supabase_match
+
     channel_code = _extract_reolink_channel_code(raw_folder_name)
     channel_number = _extract_reolink_channel_number(raw_folder_name)
     if channel_number is None or channel_code is None:
@@ -1258,6 +1590,10 @@ def _mapped_camera_tables_for_screenrecord_folder(
     site_key: str | None = None,
     client: DriveClient | None = None,
 ) -> tuple[int, dict[str, Any], list[tuple[str, list, tuple[int, int, int, int], list]]] | None:
+    supabase_match = _resolve_supabase_crop_tables(raw_folder_name, metadata)
+    if supabase_match is not None:
+        return supabase_match
+
     channel_number = _screenrecord_camera_number_from_metadata(raw_folder_name, metadata)
     if channel_number is None:
         return None
@@ -1348,6 +1684,65 @@ def _screenrecord_state_raw_folder(raw_folder: dict[str, Any]) -> dict[str, Any]
     state = dict(raw_folder)
     state["id"] = f"screenrecord:{raw_folder.get('id') or raw_folder.get('name')}"
     return state
+
+
+def _camera_table_metadata(camera: dict[str, Any], table_id: str) -> dict[str, Any]:
+    metadata_by_id = camera.get("_table_metadata_by_id")
+    if isinstance(metadata_by_id, dict):
+        value = metadata_by_id.get(table_id)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _source_capture_identity(raw_name: str, metadata: dict[str, Any] | None = None) -> str:
+    metadata = metadata or {}
+    stem = str(metadata.get("triplet_stem") or "").strip()
+    triplet_index = metadata.get("triplet_index")
+    if stem and triplet_index is not None:
+        try:
+            return f"{stem}_t{int(triplet_index):04d}"
+        except (TypeError, ValueError):
+            return f"{stem}_t{triplet_index}"
+    for key in ("raw_folder_name", "source_folder_name", "capture_id"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    return str(raw_name or "").strip()
+
+
+def _artifact_identity(raw_name: str, table_metadata: dict[str, Any], metadata: dict[str, Any] | None = None) -> str:
+    source = _source_capture_identity(raw_name, metadata)
+    table = (
+        str(table_metadata.get("table_camera_crops_id") or "").strip()
+        or str(table_metadata.get("table_id") or "").strip()
+        or str((metadata or {}).get("table_id") or "").strip()
+        or str(((metadata or {}).get("table") or {}).get("label") if isinstance((metadata or {}).get("table"), dict) else "").strip()
+    )
+    return f"{source}|{table}" if source and table else ""
+
+
+def _metadata_identity(metadata: dict[str, Any]) -> str:
+    table_metadata = {
+        "table_camera_crops_id": metadata.get("table_camera_crops_id"),
+        "table_id": metadata.get("supabase_table_id") or metadata.get("table_id"),
+    }
+    raw_name = str(metadata.get("raw_folder_name") or metadata.get("triplet_stem") or "").strip()
+    return _artifact_identity(raw_name, table_metadata, metadata)
+
+
+def _existing_generated_artifact_identities(client: DriveClient, context: QueueContext) -> set[str]:
+    identities: set[str] = set()
+    for input_folder_id in _context_input_folder_ids(context):
+        for folder in client.list_folders(input_folder_id, fields="id,name,mimeType,parents,appProperties"):
+            metadata_item = client.find_file_by_name(str(folder["id"]), "metadata.json")
+            metadata = _load_json_file_from_drive(client, metadata_item)
+            if not metadata:
+                continue
+            identity = _metadata_identity(metadata)
+            if identity:
+                identities.add(identity)
+    return identities
 
 
 def _parse_drive_timestamp(value: object) -> datetime | None:
@@ -1460,6 +1855,10 @@ def _label_jobs_path() -> Path:
     return _preprocess_state_dir() / LABEL_JOBS_FILE_NAME
 
 
+def _supabase_crop_cache_path() -> Path:
+    return _preprocess_state_dir() / SUPABASE_CROP_CACHE_FILE_NAME
+
+
 @contextmanager
 def _state_file_lock(lock_name: str):
     lock_path = _preprocess_state_dir() / f"{lock_name}.lock"
@@ -1488,6 +1887,152 @@ def _state_file_lock(lock_name: str):
 
 def _state_tmp_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _is_valid_uuid(value: Any) -> bool:
+    try:
+        import uuid
+
+        uuid.UUID(str(value or ""))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _supabase_rest_config() -> tuple[str, str, str]:
+    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        or os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+    )
+    schema = os.environ.get("SUPABASE_DB_SCHEMA", "public").strip() or "public"
+    return url, key, schema
+
+
+def _supabase_crop_client_configured() -> bool:
+    url, key, _schema = _supabase_rest_config()
+    return bool(url and key)
+
+
+class SupabaseCropClient:
+    """Tiny PostgREST reader for the crop tables ScreenRecord already uses."""
+
+    def __init__(
+        self,
+        *,
+        url: str | None = None,
+        key: str | None = None,
+        schema: str | None = None,
+        timeout_seconds: float = 15.0,
+    ) -> None:
+        configured_url, configured_key, configured_schema = _supabase_rest_config()
+        self.url = (url if url is not None else configured_url).strip().rstrip("/")
+        self.key = (key if key is not None else configured_key).strip()
+        self.schema = (schema if schema is not None else configured_schema).strip() or "public"
+        self.timeout_seconds = timeout_seconds
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url and self.key)
+
+    def select(self, table: str, params: dict[str, str]) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        import httpx
+
+        endpoint = f"{self.url}/rest/v1/{table}"
+        headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Accept": "application/json",
+            "Accept-Profile": self.schema,
+        }
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            response = client.get(endpoint, params=params, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+        return payload if isinstance(payload, list) else []
+
+
+def _get_supabase_crop_client() -> SupabaseCropClient:
+    return SupabaseCropClient()
+
+
+def _set_supabase_crop_status(**updates: Any) -> None:
+    with _supabase_crop_cache_lock:
+        _supabase_crop_status.update(updates)
+
+
+def _supabase_crop_status_snapshot() -> dict[str, Any]:
+    with _supabase_crop_cache_lock:
+        return dict(_supabase_crop_status)
+
+
+def _load_supabase_crop_cache_file() -> dict[str, Any]:
+    path = _supabase_crop_cache_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_supabase_crop_cache_file(cache: dict[str, Any]) -> None:
+    path = _supabase_crop_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _state_tmp_path(path)
+    tmp_path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _supabase_cached_tables(camera_source_id: str, *, allow_stale: bool = False) -> list[dict[str, Any]] | None:
+    now = time.time()
+    with _supabase_crop_cache_lock:
+        entry = _supabase_crop_cache.get(camera_source_id)
+        if entry:
+            expires_at = float(entry.get("expires_at") or 0.0)
+            if allow_stale or expires_at > now:
+                tables = entry.get("tables")
+                if isinstance(tables, list):
+                    return [dict(item) for item in tables if isinstance(item, dict)]
+
+    file_cache = _load_supabase_crop_cache_file()
+    entry = file_cache.get(camera_source_id)
+    if not isinstance(entry, dict):
+        return None
+    expires_at = float(entry.get("expires_at") or 0.0)
+    if not allow_stale and expires_at <= now:
+        return None
+    tables = entry.get("tables")
+    if not isinstance(tables, list):
+        return None
+    with _supabase_crop_cache_lock:
+        _supabase_crop_cache[camera_source_id] = entry
+    return [dict(item) for item in tables if isinstance(item, dict)]
+
+
+def _store_supabase_cached_tables(camera_source_id: str, tables: list[dict[str, Any]]) -> None:
+    entry = {
+        "camera_source_id": camera_source_id,
+        "cached_at": _utc_iso_now(),
+        "expires_at": time.time() + SUPABASE_CROP_CACHE_TTL_SECONDS,
+        "tables": tables,
+    }
+    with _supabase_crop_cache_lock:
+        _supabase_crop_cache[camera_source_id] = entry
+    with _state_file_lock("supabase_crop_cache"):
+        cache = _load_supabase_crop_cache_file()
+        cache[camera_source_id] = entry
+        _save_supabase_crop_cache_file(cache)
+
+
+def _select_one_supabase(client: SupabaseCropClient, table: str, params: dict[str, str]) -> dict[str, Any] | None:
+    rows = client.select(table, {**params, "limit": params.get("limit", "1")})
+    return rows[0] if rows else None
 
 
 def _cache_warm_shared_lock_path() -> Path:
@@ -2434,6 +2979,8 @@ def _missing_manual_crop_channels(
 ) -> list[str]:
     if not context.site_key or not _site_uses_manual_crop_configs(context.site_key):
         return []
+    if _supabase_crop_client_configured():
+        return []
 
     seen_channels: set[str] = set()
     for raw_folder in _list_reolink_raw_folders(client, context):
@@ -2469,14 +3016,16 @@ def _find_reolink_reference_frame(
     if not normalized_channel:
         raise ValueError("channel must look like CH-CH03")
 
-    raw_folders = sorted(
-        client.list_folders(
-            folder_ids["unassociated"],
-            fields="id,name,mimeType,parents,appProperties",
-        ),
-        key=lambda item: str(item.get("name", "")).lower(),
-        reverse=True,
-    )
+    raw_folders = []
+    if folder_ids.get("unassociated"):
+        raw_folders = sorted(
+            client.list_folders(
+                folder_ids["unassociated"],
+                fields="id,name,mimeType,parents,appProperties",
+            ),
+            key=lambda item: str(item.get("name", "")).lower(),
+            reverse=True,
+        )
 
     fallback_reference: dict[str, Any] | None = None
     for raw_folder in raw_folders:
@@ -2678,6 +3227,7 @@ def _materialize_screenrecord_true_ten_artifacts(
         raw_name = str(raw_folder.get("name") or metadata.get("triplet_stem") or "triplet")
 
         for table_id, tight_poly, _tight_bbox, zone_poly in scaled_polygons:
+            table_metadata = _camera_table_metadata(camera, table_id)
             derived_name = _apply_source_prefix(
                 _derived_reolink_folder_name(raw_name, table_id),
                 label_source,
@@ -2705,8 +3255,17 @@ def _materialize_screenrecord_true_ten_artifacts(
                 "captured_at_utc": selected_captured_at,
                 "table_id": table_id,
                 "table": {
-                    "label": table_id,
+                    "label": table_metadata.get("label") or table_id,
                 },
+                "raw_folder_id": raw_folder.get("id"),
+                "raw_folder_name": raw_name,
+                "restaurant_id": table_metadata.get("restaurant_id") or metadata.get("restaurant_id"),
+                "supabase_table_id": table_metadata.get("table_id"),
+                "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
+                "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
+                "crop_version": table_metadata.get("crop_version"),
+                "crop_source": table_metadata.get("crop_source"),
+                "artifact_identity": _artifact_identity(raw_name, table_metadata, metadata),
                 "perception_file": PERCEPTION_V2_FILE_NAME,
             }
             client.upsert_bytes(
@@ -2839,6 +3398,7 @@ def _materialize_reolink_table_crops(
         label_source = _resolve_label_source(context.source, context.site_key)
         generated_names: list[str] = []
         for table_id, tight_poly, _tight_bbox, zone_poly in scaled_polygons:
+            table_metadata = _camera_table_metadata(camera, table_id)
             derived_name = _apply_source_prefix(
                 _derived_reolink_folder_name(raw_folder["name"], table_id),
                 label_source,
@@ -2881,14 +3441,53 @@ def _materialize_reolink_table_crops(
 
             if using_local:
                 if local_metadata_path is not None and local_metadata_path.exists():
+                    try:
+                        metadata = json.loads(local_metadata_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        metadata = {}
+                    metadata.update(
+                        {
+                            "table_id": table_id,
+                            "table": {"label": table_metadata.get("label") or table_id},
+                            "restaurant_id": table_metadata.get("restaurant_id") or metadata.get("restaurant_id"),
+                            "supabase_table_id": table_metadata.get("table_id"),
+                            "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
+                            "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
+                            "crop_version": table_metadata.get("crop_version"),
+                            "crop_source": table_metadata.get("crop_source"),
+                            "artifact_identity": _artifact_identity(str(raw_folder["name"]), table_metadata, metadata),
+                            "perception_file": perception_file_name,
+                        }
+                    )
                     client.upsert_bytes(
                         dest_folder_id,
                         "metadata.json",
-                        local_metadata_path.read_bytes(),
+                        json.dumps(metadata, indent=2).encode("utf-8"),
                         mime_type="application/json",
                     )
             else:
-                _copy_optional_json_file(client, source_files, "metadata.json", dest_folder_id)
+                metadata = _load_json_file_from_drive(client, source_files.get("metadata.json")) or {}
+                metadata.update(
+                    {
+                        "table_id": table_id,
+                        "table": {"label": table_metadata.get("label") or table_id},
+                        "restaurant_id": table_metadata.get("restaurant_id") or metadata.get("restaurant_id"),
+                        "supabase_table_id": table_metadata.get("table_id"),
+                        "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
+                        "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
+                        "crop_version": table_metadata.get("crop_version"),
+                        "crop_source": table_metadata.get("crop_source"),
+                        "artifact_identity": _artifact_identity(str(raw_folder["name"]), table_metadata, metadata),
+                        "perception_file": perception_file_name,
+                    }
+                )
+                if metadata:
+                    client.upsert_bytes(
+                        dest_folder_id,
+                        "metadata.json",
+                        json.dumps(metadata, indent=2).encode("utf-8"),
+                        mime_type="application/json",
+                    )
             generated_names.append(derived_name)
 
         return generated_names
@@ -3085,7 +3684,7 @@ def _prepare_reolink_unlabeled_queue(
     target_unlabeled_count: int,
     current_visible_count: int | None = None,
 ) -> int:
-    if context.source != REOLINK_SOURCE or not context.seed_folder_id:
+    if context.source != REOLINK_SOURCE:
         return 0
 
     label_source = _resolve_label_source(context.source, context.site_key)
@@ -3100,6 +3699,7 @@ def _prepare_reolink_unlabeled_queue(
                 )
             )
         existing_names = _existing_generated_folder_names(client, context)
+        existing_identities = _existing_generated_artifact_identities(client, context)
         unlabeled_count = len(unlabeled_folders)
         visible_count = unlabeled_count if current_visible_count is None else current_visible_count
         generated_any = False
@@ -3157,6 +3757,12 @@ def _prepare_reolink_unlabeled_queue(
                         label_source,
                     )
                     not in existing_names
+                    and _artifact_identity(
+                        str(true_ten_folder.get("name", "")),
+                        _camera_table_metadata(_camera, entry[0]),
+                        metadata,
+                    )
+                    not in existing_identities
                 )
             ]
             if not missing_table_polygons:
@@ -3179,6 +3785,7 @@ def _prepare_reolink_unlabeled_queue(
             raw_generated_count = 0
             for name in generated_names:
                 existing_names.add(name)
+                existing_identities.update(_existing_generated_artifact_identities(client, context))
                 unlabeled_count += 1
                 visible_count += 1
                 generated_any = True
@@ -3237,6 +3844,12 @@ def _prepare_reolink_unlabeled_queue(
                             label_source,
                         )
                         not in existing_names
+                        and _artifact_identity(
+                            str(triplet.get("name", "")),
+                            _camera_table_metadata(_camera, entry[0]),
+                            {},
+                        )
+                        not in existing_identities
                     )
                 ]
                 if not missing_table_polygons:
@@ -3269,6 +3882,7 @@ def _prepare_reolink_unlabeled_queue(
                 raw_generated_count = 0
                 for name in generated_names:
                     existing_names.add(name)
+                    existing_identities.update(_existing_generated_artifact_identities(client, context))
                     unlabeled_count += 1
                     visible_count += 1
                     generated_any = True
@@ -3329,6 +3943,12 @@ def _prepare_reolink_unlabeled_queue(
                         label_source,
                     )
                     not in existing_names
+                    and _artifact_identity(
+                        str(raw_folder.get("name", "")),
+                        _camera_table_metadata(_camera, entry[0]),
+                        {},
+                    )
+                    not in existing_identities
                 )
             ]
             if not missing_table_polygons:
@@ -3364,6 +3984,7 @@ def _prepare_reolink_unlabeled_queue(
             raw_generated_count = 0
             for name in generated_names:
                 existing_names.add(name)
+                existing_identities.update(_existing_generated_artifact_identities(client, context))
                 unlabeled_count += 1
                 visible_count += 1
                 generated_any = True
@@ -5482,6 +6103,7 @@ def api_preprocess_status():
                 "sites": [site.site_key for site in REOLINK_SITES],
                 "inflight": bool(reolink_inflight),
                 "inflight_queues": reolink_inflight,
+                "supabase_crops": _supabase_crop_status_snapshot(),
             },
             "ready_target": REOLINK_PREWARM_TARGET,
             "label_ready_target_configured": LABEL_READY_TARGET_CONFIGURED,

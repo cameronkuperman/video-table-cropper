@@ -2,6 +2,7 @@ flask
 google-api-python-client
 google-auth
 gunicorn
+httpx
 numpy
 Pillow
 pytest
