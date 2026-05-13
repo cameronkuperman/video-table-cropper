@@ -2780,7 +2780,7 @@ def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
 
     if destination_id in current_parents:
         pass
-    elif context.input_folder_id in current_parents:
+    elif parent_id in current_parents:
         client.move_file(folder_id, new_parent_id=destination_id, remove_parent_id=parent_id)
     elif current_label_parent:
         client.move_file(folder_id, new_parent_id=destination_id, remove_parent_id=current_label_parent)
@@ -5840,7 +5840,7 @@ def api_label():
 
         context = _resolve_queue_context(get_client(), source, site_key)
         queue_key = context.queue_key
-        if parent_id != context.input_folder_id:
+        if parent_id not in _context_input_folder_ids(context):
             return jsonify({"error": "parent_id does not match the active queue"}), 400
 
         raw_frames = data.get("frames") if isinstance(data.get("frames"), dict) else {}

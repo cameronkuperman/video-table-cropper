@@ -1101,6 +1101,32 @@ def test_reolink_label_moves_folder_within_same_site_tree(client, fake_drive):
     assert stats_payload["unlabeled"] == 1
 
 
+def test_reolink_label_accepts_screenrecord_three_frame_parent(client, fake_drive):
+    fake_drive._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake_drive._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+    fake_drive._add_folder("sr-label-artifact", "mimosas-Swann-CH05_crop_t0001", "r-3frame-unlabeled")
+    fake_drive._add_triplet_files("sr-label-artifact", "sr-label", include_metadata=True)
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    context = label_app._resolve_queue_context(fake_drive, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    folder_item = fake_drive.get_file("sr-label-artifact", fields="id,name,mimeType,parents,appProperties")
+    folder = label_app._hydrate_folder(fake_drive, context, folder_item)
+
+    response = client.post("/api/label", json=_label_payload(folder, "clean"))
+
+    assert response.status_code == 200
+    assert response.get_json()["queued"] is True
+    _drain_label_jobs(fake_drive)
+    shared_clean_id = fake_drive.find_file_by_name(
+        "project-root",
+        "clean",
+        mime_type=label_app.FOLDER_MIME,
+    )["id"]
+    assert fake_drive.items["sr-label-artifact"]["parents"] == [shared_clean_id]
+
+
 def test_reolink_queue_allows_triplets_without_metadata_json(client):
     response = client.get("/api/queue?source=reolink&site=restaurant-pi-1&limit=10")
 
