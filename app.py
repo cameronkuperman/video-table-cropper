@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, Iterator
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode, urlparse
 
 from flask import (
     Flask,
@@ -1903,11 +1903,44 @@ def _is_valid_uuid(value: Any) -> bool:
         return False
 
 
+def _supabase_rest_url_from_database_url(database_url: str) -> str:
+    value = database_url.strip()
+    if not value:
+        return ""
+    if value.startswith(("http://", "https://")):
+        return value.rstrip("/")
+
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return ""
+
+    host = parsed.hostname or ""
+    project_ref = ""
+    if host.startswith("db.") and host.endswith(".supabase.co"):
+        project_ref = host.split(".", 2)[1]
+    elif host.endswith(".pooler.supabase.com") and parsed.username:
+        username = unquote(parsed.username)
+        if "." in username:
+            project_ref = username.rsplit(".", 1)[-1]
+
+    if not project_ref:
+        return ""
+    return f"https://{project_ref}.supabase.co"
+
+
 def _supabase_rest_config() -> tuple[str, str, str]:
-    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    configured_url = (
+        os.environ.get("SUPABASE_URL", "").strip()
+        or _supabase_rest_url_from_database_url(os.environ.get("DATABASE_URL", ""))
+        or _supabase_rest_url_from_database_url(os.environ.get("DB_URL", ""))
+    )
+    url = configured_url.rstrip("/")
     key = (
         os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
         or os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+        or os.environ.get("DATABASE_SERVICE_ROLE_KEY", "").strip()
+        or os.environ.get("DB_SERVICE_ROLE_KEY", "").strip()
     )
     schema = os.environ.get("SUPABASE_DB_SCHEMA", "public").strip() or "public"
     return url, key, schema

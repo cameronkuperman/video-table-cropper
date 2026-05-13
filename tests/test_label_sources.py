@@ -17,8 +17,12 @@ from queue_metadata import extract_frame_ids_from_item, has_complete_frame_ids
 @pytest.fixture(autouse=True)
 def isolate_supabase_crop_env(monkeypatch):
     monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("DB_URL", raising=False)
     monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
     monkeypatch.delenv("SUPABASE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("DATABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.delenv("DB_SERVICE_ROLE_KEY", raising=False)
     monkeypatch.delenv("SUPABASE_DB_SCHEMA", raising=False)
     label_app._supabase_crop_cache.clear()
     label_app._set_supabase_crop_status(
@@ -28,6 +32,43 @@ def isolate_supabase_crop_env(monkeypatch):
         last_cache_hit=False,
         last_camera_source_id=None,
         last_table_count=0,
+    )
+
+
+def test_supabase_config_accepts_database_url_project_url(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "https://example-ref.supabase.co")
+    monkeypatch.setenv("DATABASE_SERVICE_ROLE_KEY", "service-key")
+
+    assert label_app._supabase_rest_config() == (
+        "https://example-ref.supabase.co",
+        "service-key",
+        "public",
+    )
+
+
+def test_supabase_config_derives_project_url_from_postgres_database_url(monkeypatch):
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql://postgres:password@db.example-ref.supabase.co:5432/postgres",
+    )
+    monkeypatch.setenv("DB_SERVICE_ROLE_KEY", "service-key")
+
+    assert label_app._supabase_rest_config() == (
+        "https://example-ref.supabase.co",
+        "service-key",
+        "public",
+    )
+
+
+def test_supabase_url_takes_precedence_over_database_url(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://primary-ref.supabase.co")
+    monkeypatch.setenv("DATABASE_URL", "https://secondary-ref.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-key")
+
+    assert label_app._supabase_rest_config() == (
+        "https://primary-ref.supabase.co",
+        "service-key",
+        "public",
     )
 
 

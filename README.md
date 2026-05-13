@@ -59,6 +59,13 @@ SUPABASE_DB_SCHEMA=public       # optional
 SUPABASE_CROP_CACHE_TTL_SECONDS=300
 ```
 
+If your deployment already uses database-style variable names, those are
+accepted too. `DATABASE_URL` or `DB_URL` may point at the Supabase Postgres URL;
+the app derives the matching project REST URL from standard Supabase hosts.
+`DATABASE_SERVICE_ROLE_KEY` or `DB_SERVICE_ROLE_KEY` can be used as service-key
+aliases, though `SUPABASE_SECRET_KEY` / `SUPABASE_SERVICE_ROLE_KEY` remain
+preferred when present.
+
 Supabase crop rows are cached briefly in memory and as last-good state under
 `PREPROCESS_STATE_DIR`, so already-preprocessed artifacts remain labelable even
 if Supabase is unavailable. Without Supabase identity, the repo/Drive crop JSON
