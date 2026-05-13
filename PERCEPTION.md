@@ -1,13 +1,13 @@
 # Perception Data — How It Works
 
 Every labeled subfolder can contain a perception artifact alongside the sampled
-images in the group. Legacy 3-frame groups use `perception.json`; current
-10-frame groups use `perception_10frame.json`. It is generated during
+images in the group. Current 10-frame groups use `perception_v2.json`. Legacy
+folders may still contain `perception.json` or `perception_10frame.json`. It is generated during
 `--process` if `ultralytics` is installed, and is carried through untouched
 when the human labels the sample. Training code can use both the images and
 this file.
 
-`perception.json` is **strictly the occupied/unoccupied signal.** Dirty-vs-clean
+The perception artifact is **strictly the occupied/unoccupied signal.** Dirty-vs-clean
 classification is computed elsewhere from the cropped image itself.
 
 The current capture target is **N = 10 frames per group, 3 s/frame** (about 27 s

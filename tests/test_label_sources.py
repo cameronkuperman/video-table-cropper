@@ -1904,8 +1904,8 @@ def test_video_processor_marks_completed_and_moves_raw_video(fake_drive, monkeyp
 def test_processor_sampling_and_perception_artifact_policy():
     assert processor.sample_frame_indices(3) == (0, 1, 2)
     assert processor.sample_frame_indices(10) == (0, 5, 9)
-    assert processor.perception_filename_for_n_frames(3) == "perception.json"
-    assert processor.perception_filename_for_n_frames(10) == "perception_10frame.json"
+    assert processor.perception_filename_for_n_frames(3) is None
+    assert processor.perception_filename_for_n_frames(10) == "perception_v2.json"
     assert processor.perception_filename_for_n_frames(4) is None
 
 

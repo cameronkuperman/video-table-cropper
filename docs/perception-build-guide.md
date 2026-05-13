@@ -1,7 +1,7 @@
-# How to build `perception.json` (preprocessing repo guide)
+# How to build `perception_v2.json` (preprocessing repo guide)
 
 This document is a **self-contained specification** for producing
-`perception.json` files in any repository — language-agnostic, implementation-
+`perception_v2.json` files in any repository — language-agnostic, implementation-
 agnostic. Drop this guide into the preprocessing repo and an engineer can
 build a compatible producer without reading the labeling-side code.
 
@@ -10,12 +10,12 @@ and in every reader.
 
 ---
 
-## 1. What `perception.json` is
+## 1. What `perception_v2.json` is
 
 The perception artifact is a small JSON file that lives **next to the sampled
-cropped table images** in a Drive folder or local directory. Legacy 3-frame
-groups use `perception.json`; 10-frame groups use `perception_10frame.json`.
-There is exactly one perception artifact per
+cropped table images** in a Drive folder or local directory. Current 10-frame
+groups use `perception_v2.json`; legacy folders may still contain
+`perception.json` or `perception_10frame.json`. There is exactly one perception artifact per
 `(table × group)` — i.e. for each combination of one physical table and one
 group of N frames sampled from a camera looking at that table.
 
@@ -342,8 +342,8 @@ All floats rounded to 4 d.p. except scores (3 d.p.) for diff stability.
 ```
 
 Serialize with `indent=2, sort_keys=False`. UTF-8 encoding. Use
-`perception.json` for 3-frame legacy groups and `perception_10frame.json` for
-10-frame groups. Place it in the same folder as the sampled crop images.
+`perception_v2.json` for current 10-frame groups. Place it in the same folder
+as the sampled crop images.
 
 ---
 
@@ -554,13 +554,14 @@ reference implementation.
 
 ## 11. Output handoff conventions
 
-- **Filename:** `perception.json` for legacy 3-frame groups;
-  `perception_10frame.json` for 10-frame groups.
+- **Filename:** `perception_v2.json` for current 10-frame groups. Legacy
+  readers may still accept `perception.json` or `perception_10frame.json`, but
+  new writers should not upload those names.
 - **Location:** same directory as the sampled crop images.
 - **Encoding:** UTF-8.
 - **Pretty-printed:** `indent=2`. Pretty-printing is for human debuggability;
   readers must accept any whitespace.
-- **Atomic write recommended:** write to `perception.json.tmp` then rename.
+- **Atomic write recommended:** write to `perception_v2.json.tmp` then rename.
   Half-written files crash readers.
 - **Idempotent:** producing the same input twice should produce
   byte-identical output (modulo Python `numpy` non-determinism in float

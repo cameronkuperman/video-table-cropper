@@ -74,6 +74,7 @@ MAX_FRAMES_PER_GROUP = 16
 # flat list of frames extracted from a single video file). The Pi-zip path
 # detects N from the manifest instead.
 FRAMES_PER_GROUP_VIDEO = 10
+PERCEPTION_V2_FILE_NAME = "perception_v2.json"
 
 
 def sample_frame_indices(n_frames: int) -> tuple[int, ...]:
@@ -88,9 +89,7 @@ def sample_frame_indices(n_frames: int) -> tuple[int, ...]:
 def perception_filename_for_n_frames(n_frames: int) -> str | None:
     """Perception artifact name for supported group sizes."""
     if n_frames == 10:
-        return "perception_10frame.json"
-    if n_frames == 3:
-        return "perception.json"
+        return PERCEPTION_V2_FILE_NAME
     return None
 
 

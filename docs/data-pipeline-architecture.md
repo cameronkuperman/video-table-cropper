@@ -124,7 +124,7 @@ unlabeled/{video_stem}_{table_id}_t{idx:04d}/
     frame_1.jpg           # 3 seconds later
     ...
     frame_{N-1}.jpg       # 3*(N-1) seconds later (27s at N=10)
-    perception_10frame.json # person-table interaction data for 10-frame groups
+    perception_v2.json      # person-table interaction data for 10-frame groups
 ```
 
 A parallel debug output also goes to:
@@ -320,14 +320,14 @@ Drive project root/
 │       ├── frame_1.jpg
 │       ├── ...
 │       ├── frame_{N-1}.jpg
-│       └── perception_10frame.json
+│       └── perception_v2.json
 │
 ├── clean/                                 # LABELED: table is clean/empty
 │   └── IPC11_2024-01-15_table_top_5_t0000/
 │       ├── frame_0.jpg                    #   same cropped frames, unchanged
 │       ├── ...
 │       ├── frame_{N-1}.jpg
-│       └── perception_10frame.json       #   same perception data, unchanged
+│       └── perception_v2.json            #   same perception data, unchanged
 │
 ├── dirty/                                 # LABELED: table is dirty/needs clearing
 │   └── IPC11_2024-01-15_table_top_5_t0001/

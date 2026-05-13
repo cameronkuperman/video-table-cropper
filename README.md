@@ -42,8 +42,8 @@ Each site should look like:
 ```
 
 For ScreenRecord-backed Reolink sites, `unassociated/` is optional. The labeler
-prefers ready artifacts in `3frame/unlabeled/`, accepts schema-v2
-`perception.json` sidecars as canonical `perception_v2.json`, and uses
+prefers ready artifacts in `3frame/unlabeled/`, accepts legacy schema-v2
+perception sidecars as canonical `perception_v2.json`, and uses
 `10frametrue/<node>/` only to top up missing artifacts in the background. Legacy
 raw group folders in `unassociated/` can still contain a contiguous set of
 `frame_0.jpg` through `frame_{N-1}.jpg` (current target N=10; legacy data may
@@ -75,7 +75,7 @@ fallbacks remain available for legacy inputs.
 - it does **not** use the general `CH-CHNN -> IPCN` mapping
 - it requires a saved `crop_configs/CH-CHNN.json` per channel before queue generation
 - those saved polygons drive sampled crops (`frame_0.jpg`, `frame_5.jpg`,
-  `frame_9.jpg` for 10-frame groups) plus `perception_10frame.json`, exactly
+  `frame_9.jpg` for 10-frame groups) plus `perception_v2.json`, exactly
   like the original video pipeline
 
 `restaurant-pi-1` stays on the general IPC-mapping behavior.
