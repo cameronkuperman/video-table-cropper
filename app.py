@@ -21,7 +21,7 @@ import tempfile
 import time
 import zipfile
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -171,6 +171,12 @@ THUMB_WIDTH = max(128, int(os.environ.get("LABEL_THUMB_WIDTH", "512") or "512"))
 THUMB_QUALITY = max(40, min(95, int(os.environ.get("LABEL_THUMB_QUALITY", "82") or "82")))
 FOLDER_PREWARM_MAX_WORKERS = max(
     2, min(6, int(os.environ.get("LABEL_FOLDER_PREWARM_WORKERS", "4") or "4"))
+)
+REOLINK_FRAME_DOWNLOAD_WORKERS = max(
+    2, min(10, int(os.environ.get("REOLINK_FRAME_DOWNLOAD_WORKERS", "8") or "8"))
+)
+REOLINK_TABLE_MATERIALIZE_WORKERS = max(
+    1, min(8, int(os.environ.get("REOLINK_TABLE_MATERIALIZE_WORKERS", "4") or "4"))
 )
 LABEL_READY_TARGET_CONFIGURED = _label_ready_target_configured()
 LABEL_READY_TARGET = (
@@ -1745,6 +1751,33 @@ def _existing_generated_artifact_identities(client: DriveClient, context: QueueC
     return identities
 
 
+def _record_generated_reolink_artifacts(
+    *,
+    generated_names: list[str],
+    existing_names: set[str],
+    existing_identities: set[str],
+    raw_name: str,
+    table_polygons: list[tuple[str, list, tuple[int, int, int, int], list]],
+    camera: dict[str, Any],
+    metadata: dict[str, Any] | None,
+    label_source: LabelSource,
+) -> int:
+    generated_name_set = set(generated_names)
+    recorded = 0
+    for table_id, *_rest in table_polygons:
+        unprefixed_name = _derived_reolink_folder_name(raw_name, table_id)
+        prefixed_name = _apply_source_prefix(unprefixed_name, label_source)
+        if unprefixed_name not in generated_name_set and prefixed_name not in generated_name_set:
+            continue
+        existing_names.add(unprefixed_name)
+        existing_names.add(prefixed_name)
+        identity = _artifact_identity(raw_name, _camera_table_metadata(camera, table_id), metadata or {})
+        if identity:
+            existing_identities.add(identity)
+        recorded += 1
+    return recorded
+
+
 def _parse_drive_timestamp(value: object) -> datetime | None:
     if not value:
         return None
@@ -3175,6 +3208,57 @@ def _copy_optional_json_file(
     )
 
 
+def _download_drive_files_parallel(
+    client: DriveClient,
+    file_items: list[dict[str, Any]],
+    output_paths: list[Path],
+) -> list[Path]:
+    """Download independent Drive files concurrently with thread-local clients."""
+    if len(file_items) != len(output_paths):
+        raise ValueError("file_items and output_paths must have the same length")
+    if not file_items:
+        return []
+
+    for path in output_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(file_items) == 1:
+        client.download_file_to_path(str(file_items[0]["id"]), output_paths[0])
+        return output_paths
+
+    def _parallel_drive_client() -> DriveClient:
+        return DriveClient() if type(client) is DriveClient else client
+
+    def _download_one(item: dict[str, Any], output_path: Path) -> Path:
+        _parallel_drive_client().download_file_to_path(str(item["id"]), output_path)
+        return output_path
+
+    max_workers = min(REOLINK_FRAME_DOWNLOAD_WORKERS, len(file_items))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_download_one, item, output_path)
+            for item, output_path in zip(file_items, output_paths)
+        ]
+        for future in as_completed(futures):
+            future.result()
+    return output_paths
+
+
+def _table_drive_client(client: DriveClient) -> DriveClient:
+    return DriveClient() if type(client) is DriveClient else client
+
+
+def _detect_people_for_frames(frame_paths: list[Path], yolo_model: Any) -> list[list[dict[str, Any]]]:
+    from person_detector import assign_track_ids, detect_people_batch, detect_people_in_frame
+
+    if callable(yolo_model):
+        frame_detections = detect_people_batch(frame_paths, yolo_model)
+    else:
+        frame_detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
+    assign_track_ids(frame_detections)
+    return frame_detections
+
+
 def _materialize_screenrecord_true_ten_artifacts(
     client: DriveClient,
     context: QueueContext,
@@ -3188,7 +3272,7 @@ def _materialize_screenrecord_true_ten_artifacts(
     folder plus perception_v2.json built from all ten full frames.
     """
     from PIL import Image
-    from person_detector import assign_track_ids, build_perception_for_table, detect_people_in_frame
+    from person_detector import build_perception_for_table
     from processor import perspective_crop_polygon, save_jpeg, _scale_table_polygons
 
     source_files = {
@@ -3230,11 +3314,8 @@ def _materialize_screenrecord_true_ten_artifacts(
 
     with tempfile.TemporaryDirectory(prefix="screenrecord_10frame_") as tmpdir:
         tmp = Path(tmpdir)
-        frame_paths: list[Path] = []
-        for idx, frame_item in enumerate(frame_items):
-            frame_path = tmp / f"frame_{idx}.jpg"
-            client.download_file_to_path(str(frame_item["id"]), frame_path)
-            frame_paths.append(frame_path)
+        frame_paths = [tmp / f"frame_{idx}.jpg" for idx in range(len(frame_items))]
+        _download_drive_files_parallel(client, frame_items, frame_paths)
 
         with Image.open(frame_paths[0]) as image:
             frame_h, frame_w = image.height, image.width
@@ -3247,8 +3328,7 @@ def _materialize_screenrecord_true_ten_artifacts(
             scaled_polygons = _scale_table_polygons(selected_polygons, ref_w, ref_h, frame_w, frame_h)
 
         yolo_model = _get_yolo_model()
-        frame_detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
-        assign_track_ids(frame_detections)
+        frame_detections = _detect_people_for_frames(frame_paths, yolo_model)
 
         generated_names: list[str] = []
         source_captured_at = list(metadata.get("captured_at_utc") or metadata.get("source_captured_at_utc") or [])
@@ -3259,20 +3339,24 @@ def _materialize_screenrecord_true_ten_artifacts(
         ]
         raw_name = str(raw_folder.get("name") or metadata.get("triplet_stem") or "triplet")
 
-        for table_id, tight_poly, _tight_bbox, zone_poly in scaled_polygons:
+        def _materialize_one_table(
+            table_entry: tuple[str, list, tuple[int, int, int, int], list],
+        ) -> str:
+            table_id, tight_poly, _tight_bbox, zone_poly = table_entry
             table_metadata = _camera_table_metadata(camera, table_id)
             derived_name = _apply_source_prefix(
                 _derived_reolink_folder_name(raw_name, table_id),
                 label_source,
             )
-            dest_folder_id = client.ensure_subfolder(output_parent_id, derived_name)
+            table_client = _table_drive_client(client)
+            dest_folder_id = table_client.ensure_subfolder(output_parent_id, derived_name)
             uploaded_frame_ids: dict[str, str | None] = {}
 
             for output_idx, source_idx in enumerate(selected_source_indices):
                 cropped = perspective_crop_polygon(frame_paths[source_idx], zone_poly)
                 crop_path = tmp / "crops" / f"{derived_name}_f{output_idx}.jpg"
                 save_jpeg(cropped, crop_path)
-                uploaded = client.upload_or_update_file(
+                uploaded = table_client.upload_or_update_file(
                     crop_path,
                     dest_folder_id,
                     file_name=f"frame_{output_idx}.jpg",
@@ -3301,7 +3385,7 @@ def _materialize_screenrecord_true_ten_artifacts(
                 "artifact_identity": _artifact_identity(raw_name, table_metadata, metadata),
                 "perception_file": PERCEPTION_V2_FILE_NAME,
             }
-            client.upsert_bytes(
+            table_client.upsert_bytes(
                 dest_folder_id,
                 "metadata.json",
                 json.dumps(artifact_metadata, indent=2).encode("utf-8"),
@@ -3317,18 +3401,25 @@ def _materialize_screenrecord_true_ten_artifacts(
             perception_path = tmp / "perception" / f"{derived_name}_{PERCEPTION_V2_FILE_NAME}"
             perception_path.parent.mkdir(parents=True, exist_ok=True)
             perception_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
-            client.upload_or_update_file(
+            table_client.upload_or_update_file(
                 perception_path,
                 dest_folder_id,
                 file_name=PERCEPTION_V2_FILE_NAME,
                 mime_type="application/json",
             )
 
-            client.update_file_metadata(
+            table_client.update_file_metadata(
                 dest_folder_id,
                 {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
             )
-            generated_names.append(derived_name)
+            return derived_name
+
+        max_workers = min(REOLINK_TABLE_MATERIALIZE_WORKERS, len(scaled_polygons))
+        if max_workers <= 1:
+            generated_names = [_materialize_one_table(entry) for entry in scaled_polygons]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                generated_names = list(executor.map(_materialize_one_table, scaled_polygons))
 
         return generated_names
 
@@ -3351,7 +3442,7 @@ def _materialize_reolink_table_crops(
     destination folder.
     """
     from PIL import Image
-    from person_detector import assign_track_ids, build_perception_for_table, detect_people_in_frame
+    from person_detector import build_perception_for_table
     from processor import (
         perspective_crop_polygon,
         sample_frame_indices,
@@ -3404,11 +3495,8 @@ def _materialize_reolink_table_crops(
         if using_local:
             frame_paths = list(local_frame_paths)
         else:
-            frame_paths = []
-            for idx, frame_item in enumerate(frame_items):
-                output_path = tmp / f"frame_{idx}.jpg"
-                client.download_file_to_path(frame_item["id"], output_path)
-                frame_paths.append(output_path)
+            frame_paths = [tmp / f"frame_{idx}.jpg" for idx in range(len(frame_items))]
+            _download_drive_files_parallel(client, frame_items, frame_paths)
 
         with Image.open(frame_paths[0]) as image:
             frame_h, frame_w = image.height, image.width
@@ -3425,18 +3513,33 @@ def _materialize_reolink_table_crops(
         frame_detections = None
         if perception_file_name is not None:
             yolo_model = _get_yolo_model()
-            frame_detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
-            assign_track_ids(frame_detections)
+            frame_detections = _detect_people_for_frames(frame_paths, yolo_model)
 
         label_source = _resolve_label_source(context.source, context.site_key)
-        generated_names: list[str] = []
-        for table_id, tight_poly, _tight_bbox, zone_poly in scaled_polygons:
+        source_metadata = None
+        if using_local:
+            if local_metadata_path is not None and local_metadata_path.exists():
+                try:
+                    loaded = json.loads(local_metadata_path.read_text(encoding="utf-8"))
+                    source_metadata = loaded if isinstance(loaded, dict) else {}
+                except (OSError, json.JSONDecodeError):
+                    source_metadata = {}
+            else:
+                source_metadata = {}
+        else:
+            source_metadata = _load_json_file_from_drive(client, source_files.get("metadata.json")) or {}
+
+        def _materialize_one_table(
+            table_entry: tuple[str, list, tuple[int, int, int, int], list],
+        ) -> str:
+            table_id, tight_poly, _tight_bbox, zone_poly = table_entry
             table_metadata = _camera_table_metadata(camera, table_id)
             derived_name = _apply_source_prefix(
                 _derived_reolink_folder_name(raw_folder["name"], table_id),
                 label_source,
             )
-            dest_folder_id = client.ensure_subfolder(context.input_folder_id, derived_name)
+            table_client = _table_drive_client(client)
+            dest_folder_id = table_client.ensure_subfolder(context.input_folder_id, derived_name)
             uploaded_frame_ids: dict[str, str | None] = {
                 f"frame_{i}": None for i in sample_indices
             }
@@ -3446,14 +3549,14 @@ def _materialize_reolink_table_crops(
                 cropped = perspective_crop_polygon(frame_path, zone_poly)
                 crop_path = tmp / "crops" / f"{derived_name}_f{frame_idx}.jpg"
                 save_jpeg(cropped, crop_path)
-                uploaded = client.upload_or_update_file(
+                uploaded = table_client.upload_or_update_file(
                     crop_path,
                     dest_folder_id,
                     file_name=f"frame_{frame_idx}.jpg",
                 )
                 uploaded_frame_ids[f"frame_{frame_idx}"] = str(uploaded["id"])
 
-            client.update_file_metadata(
+            table_client.update_file_metadata(
                 dest_folder_id,
                 {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
             )
@@ -3465,63 +3568,42 @@ def _materialize_reolink_table_crops(
                 perception_path = tmp / "perception" / f"{derived_name}_{perception_file_name}"
                 perception_path.parent.mkdir(parents=True, exist_ok=True)
                 perception_path.write_text(json.dumps(perception, indent=2), encoding="utf-8")
-                client.upload_or_update_file(
+                table_client.upload_or_update_file(
                     perception_path,
                     dest_folder_id,
                     file_name=perception_file_name,
                     mime_type="application/json",
                 )
 
-            if using_local:
-                if local_metadata_path is not None and local_metadata_path.exists():
-                    try:
-                        metadata = json.loads(local_metadata_path.read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError):
-                        metadata = {}
-                    metadata.update(
-                        {
-                            "table_id": table_id,
-                            "table": {"label": table_metadata.get("label") or table_id},
-                            "restaurant_id": table_metadata.get("restaurant_id") or metadata.get("restaurant_id"),
-                            "supabase_table_id": table_metadata.get("table_id"),
-                            "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
-                            "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
-                            "crop_version": table_metadata.get("crop_version"),
-                            "crop_source": table_metadata.get("crop_source"),
-                            "artifact_identity": _artifact_identity(str(raw_folder["name"]), table_metadata, metadata),
-                            "perception_file": perception_file_name,
-                        }
-                    )
-                    client.upsert_bytes(
-                        dest_folder_id,
-                        "metadata.json",
-                        json.dumps(metadata, indent=2).encode("utf-8"),
-                        mime_type="application/json",
-                    )
-            else:
-                metadata = _load_json_file_from_drive(client, source_files.get("metadata.json")) or {}
-                metadata.update(
-                    {
-                        "table_id": table_id,
-                        "table": {"label": table_metadata.get("label") or table_id},
-                        "restaurant_id": table_metadata.get("restaurant_id") or metadata.get("restaurant_id"),
-                        "supabase_table_id": table_metadata.get("table_id"),
-                        "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
-                        "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
-                        "crop_version": table_metadata.get("crop_version"),
-                        "crop_source": table_metadata.get("crop_source"),
-                        "artifact_identity": _artifact_identity(str(raw_folder["name"]), table_metadata, metadata),
-                        "perception_file": perception_file_name,
-                    }
-                )
-                if metadata:
-                    client.upsert_bytes(
-                        dest_folder_id,
-                        "metadata.json",
-                        json.dumps(metadata, indent=2).encode("utf-8"),
-                        mime_type="application/json",
-                    )
-            generated_names.append(derived_name)
+            metadata = dict(source_metadata or {})
+            metadata.update(
+                {
+                    "table_id": table_id,
+                    "table": {"label": table_metadata.get("label") or table_id},
+                    "restaurant_id": table_metadata.get("restaurant_id") or metadata.get("restaurant_id"),
+                    "supabase_table_id": table_metadata.get("table_id"),
+                    "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
+                    "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
+                    "crop_version": table_metadata.get("crop_version"),
+                    "crop_source": table_metadata.get("crop_source"),
+                    "artifact_identity": _artifact_identity(str(raw_folder["name"]), table_metadata, metadata),
+                    "perception_file": perception_file_name,
+                }
+            )
+            table_client.upsert_bytes(
+                dest_folder_id,
+                "metadata.json",
+                json.dumps(metadata, indent=2).encode("utf-8"),
+                mime_type="application/json",
+            )
+            return derived_name
+
+        max_workers = min(REOLINK_TABLE_MATERIALIZE_WORKERS, len(scaled_polygons))
+        if max_workers <= 1:
+            generated_names = [_materialize_one_table(entry) for entry in scaled_polygons]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                generated_names = list(executor.map(_materialize_one_table, scaled_polygons))
 
         return generated_names
 
@@ -3816,14 +3898,23 @@ def _prepare_reolink_unlabeled_queue(
                 metadata,
             )
             raw_generated_count = 0
-            for name in generated_names:
-                existing_names.add(name)
-                existing_identities.update(_existing_generated_artifact_identities(client, context))
+            recorded_generated = _record_generated_reolink_artifacts(
+                generated_names=generated_names,
+                existing_names=existing_names,
+                existing_identities=existing_identities,
+                raw_name=str(true_ten_folder.get("name", "")),
+                table_polygons=missing_table_polygons,
+                camera=_camera,
+                metadata=metadata,
+                label_source=label_source,
+            )
+            for _name in generated_names:
                 unlabeled_count += 1
                 visible_count += 1
                 generated_any = True
                 generated_count += 1
                 raw_generated_count += 1
+            raw_generated_count = max(raw_generated_count, recorded_generated)
 
             if raw_generated_count > 0:
                 _mark_reolink_raw_folder_processed(
@@ -3913,14 +4004,23 @@ def _prepare_reolink_unlabeled_queue(
                     continue
 
                 raw_generated_count = 0
-                for name in generated_names:
-                    existing_names.add(name)
-                    existing_identities.update(_existing_generated_artifact_identities(client, context))
+                recorded_generated = _record_generated_reolink_artifacts(
+                    generated_names=generated_names,
+                    existing_names=existing_names,
+                    existing_identities=existing_identities,
+                    raw_name=str(triplet.get("name", "")),
+                    table_polygons=missing_table_polygons,
+                    camera=_camera,
+                    metadata={},
+                    label_source=label_source,
+                )
+                for _name in generated_names:
                     unlabeled_count += 1
                     visible_count += 1
                     generated_any = True
                     generated_count += 1
                     raw_generated_count += 1
+                raw_generated_count = max(raw_generated_count, recorded_generated)
 
                 if raw_generated_count > 0:
                     _mark_reolink_raw_folder_processed(
@@ -4015,14 +4115,23 @@ def _prepare_reolink_unlabeled_queue(
                 missing_table_polygons,
             )
             raw_generated_count = 0
-            for name in generated_names:
-                existing_names.add(name)
-                existing_identities.update(_existing_generated_artifact_identities(client, context))
+            recorded_generated = _record_generated_reolink_artifacts(
+                generated_names=generated_names,
+                existing_names=existing_names,
+                existing_identities=existing_identities,
+                raw_name=str(raw_folder.get("name", "")),
+                table_polygons=missing_table_polygons,
+                camera=_camera,
+                metadata={},
+                label_source=label_source,
+            )
+            for _name in generated_names:
                 unlabeled_count += 1
                 visible_count += 1
                 generated_any = True
                 generated_count += 1
                 raw_generated_count += 1
+            raw_generated_count = max(raw_generated_count, recorded_generated)
 
             if raw_generated_count > 0:
                 _mark_reolink_raw_folder_processed(
