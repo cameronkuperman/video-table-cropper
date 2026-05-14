@@ -1043,6 +1043,31 @@ def test_cache_warm_shared_lock_blocks_second_worker(tmp_path, monkeypatch):
     label_app._set_cache_warm_state(inflight=False, last_error=None, shared_lock=None, shared_lock_path=None)
 
 
+def test_ready_maintainer_shared_lock_blocks_duplicate_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+
+    token = label_app._acquire_ready_maintainer_shared_lock()
+    assert token is not None
+
+    def fail_drive_client():
+        raise AssertionError("second worker should skip while ready maintainer lock is held")
+
+    monkeypatch.setattr(label_app, "DriveClient", fail_drive_client)
+    try:
+        label_app._run_ready_maintainer_once()
+    finally:
+        label_app._release_ready_maintainer_shared_lock(token)
+
+
+def test_ready_maintainer_auto_start_is_disabled_under_pytest(monkeypatch):
+    calls: list[bool] = []
+    monkeypatch.delenv("LABEL_READY_MAINTAINER_ON_STARTUP", raising=False)
+    monkeypatch.setattr(label_app, "_ensure_ready_maintainer_started", lambda: calls.append(True) or True)
+
+    assert label_app._auto_start_ready_maintainer() is False
+    assert calls == []
+
+
 def test_interactive_preview_prewarm_is_bounded(tmp_path, monkeypatch):
     submitted: list[str] = []
 

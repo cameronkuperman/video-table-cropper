@@ -15,6 +15,7 @@ import math
 import os
 import random
 import re
+import sys
 import hmac
 import secrets
 import tempfile
@@ -547,6 +548,10 @@ _ready_maintainer_executor = ThreadPoolExecutor(max_workers=1)
 _ready_maintainer_lock = Lock()
 _ready_maintainer_started = False
 _READY_MAINTAINER_INTERVAL_SECONDS = 15
+READY_MAINTAINER_LOCK_STALE_SECONDS = max(
+    300,
+    int(os.environ.get("LABEL_READY_MAINTAINER_LOCK_STALE_SECONDS", "3600") or "3600"),
+)
 _ready_maintainer_state: dict[str, Any] = {
     "inflight": False,
     "started": False,
@@ -2105,6 +2110,10 @@ def _cache_warm_shared_lock_path() -> Path:
     return _preprocess_state_dir() / "cache_warm.lock"
 
 
+def _ready_maintainer_shared_lock_path() -> Path:
+    return _preprocess_state_dir() / "ready_maintainer.lock"
+
+
 def _read_cache_warm_shared_lock(path: Path | None = None) -> dict[str, Any] | None:
     lock_path = path or _cache_warm_shared_lock_path()
     try:
@@ -2160,6 +2169,70 @@ def _release_cache_warm_shared_lock(token: dict[str, Any] | None) -> None:
         return
     lock_path = _cache_warm_shared_lock_path()
     existing = _read_cache_warm_shared_lock(lock_path)
+    if existing and existing.get("started_at_epoch") != token.get("started_at_epoch"):
+        return
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _read_ready_maintainer_shared_lock(path: Path | None = None) -> dict[str, Any] | None:
+    lock_path = path or _ready_maintainer_shared_lock_path()
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _acquire_ready_maintainer_shared_lock() -> dict[str, Any] | None:
+    lock_path = _ready_maintainer_shared_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+
+    existing = _read_ready_maintainer_shared_lock(lock_path)
+    if existing is not None:
+        started_at = float(existing.get("started_at_epoch") or 0)
+        if started_at and (now - started_at) > READY_MAINTAINER_LOCK_STALE_SECONDS:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+
+    token = {
+        "pid": os.getpid(),
+        "started_at_epoch": now,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    except FileExistsError:
+        return None
+    except OSError:
+        return None
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(token, sort_keys=True))
+    except OSError:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+        return None
+    return token
+
+
+def _release_ready_maintainer_shared_lock(token: dict[str, Any] | None) -> None:
+    if not token:
+        return
+    lock_path = _ready_maintainer_shared_lock_path()
+    existing = _read_ready_maintainer_shared_lock(lock_path)
     if existing and existing.get("started_at_epoch") != token.get("started_at_epoch"):
         return
     try:
@@ -5002,50 +5075,77 @@ def _ready_maintainer_state_snapshot() -> dict[str, Any]:
 
 
 def _run_ready_maintainer_once() -> None:
+    shared_lock = _acquire_ready_maintainer_shared_lock()
+    if shared_lock is None:
+        return
+
     client = DriveClient()
     generated_total = 0
     last_error = None
-    for label_source in LABEL_SOURCES:
-        _set_ready_maintainer_state(current_queue=label_source.queue_key)
-        try:
-            context = _resolve_queue_context(
-                client,
-                label_source.source,
-                label_source.site_key,
-            )
-            subfolders = _list_source_subfolders(client, context)
-            _ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit=1)
-            visible_count = max(
-                0,
-                len(subfolders)
-                - int(ready_stats["hidden_labeled"])
-                - int(ready_stats["duplicate_signatures"]),
-            )
-            if context.source == VIDEO_SOURCE:
-                if AUTOLABEL_VIDEO_AUTO_PREPROCESS:
-                    _maybe_trigger_video_preprocess(context, visible_count)
-            elif context.source == REOLINK_SOURCE:
-                generated = _prepare_reolink_unlabeled_queue(
+    try:
+        for label_source in LABEL_SOURCES:
+            _set_ready_maintainer_state(current_queue=label_source.queue_key)
+            try:
+                context = _resolve_queue_context(
                     client,
-                    context,
-                    target_unlabeled_count=REOLINK_PREWARM_TARGET,
-                    current_visible_count=visible_count,
+                    label_source.source,
+                    label_source.site_key,
                 )
-                generated_total += generated
-                if generated:
-                    _invalidate_listing_cache(context.queue_key)
-        except CropSetupRequiredError as exc:
-            last_error = str(exc)
-        except Exception as exc:
-            last_error = f"{label_source.queue_key}: {exc}"
+                subfolders = _list_source_subfolders(client, context)
+                _ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit=1)
+                visible_count = max(
+                    0,
+                    len(subfolders)
+                    - int(ready_stats["hidden_labeled"])
+                    - int(ready_stats["duplicate_signatures"]),
+                )
+                if context.source == VIDEO_SOURCE:
+                    if AUTOLABEL_VIDEO_AUTO_PREPROCESS:
+                        _maybe_trigger_video_preprocess(context, visible_count)
+                elif context.source == REOLINK_SOURCE:
+                    generated = _prepare_reolink_unlabeled_queue(
+                        client,
+                        context,
+                        target_unlabeled_count=REOLINK_PREWARM_TARGET,
+                        current_visible_count=visible_count,
+                    )
+                    generated_total += generated
+                    if generated:
+                        _invalidate_listing_cache(context.queue_key)
+            except CropSetupRequiredError as exc:
+                last_error = str(exc)
+            except Exception as exc:
+                last_error = f"{label_source.queue_key}: {exc}"
 
-    _start_cache_warm(None, None, REOLINK_PREWARM_TARGET)
-    _set_ready_maintainer_state(
-        current_queue=None,
-        last_run_at=time.time(),
-        generated=generated_total,
-        last_error=last_error,
-    )
+        _start_cache_warm(None, None, REOLINK_PREWARM_TARGET)
+        _set_ready_maintainer_state(
+            current_queue=None,
+            last_run_at=time.time(),
+            generated=generated_total,
+            last_error=last_error,
+        )
+    finally:
+        _release_ready_maintainer_shared_lock(shared_lock)
+
+
+def _ready_maintainer_startup_enabled() -> bool:
+    if app.testing or "pytest" in sys.modules:
+        return False
+    argv0 = Path(sys.argv[0]).name
+    if argv0 == "main.py" and "--label" not in sys.argv:
+        return False
+    return os.environ.get("LABEL_READY_MAINTAINER_ON_STARTUP", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _auto_start_ready_maintainer() -> bool:
+    if not _ready_maintainer_startup_enabled():
+        return False
+    return _ensure_ready_maintainer_started()
 
 
 def _run_ready_maintainer_loop() -> None:
@@ -5072,6 +5172,9 @@ def _ensure_ready_maintainer_started() -> bool:
         _ready_maintainer_state["started"] = True
     _ready_maintainer_executor.submit(_run_ready_maintainer_loop)
     return True
+
+
+_auto_start_ready_maintainer()
 
 
 def _hydrate_folder_with_fresh_client(

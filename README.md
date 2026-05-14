@@ -168,6 +168,12 @@ to be stopped, call `POST /api/cache/warm/cancel`.
 `LABEL_READY_TARGET` is the only queue-size tuning variable most deployments
 need. When set, it overrides the older per-path target variables for Reolink
 generation, video low-watermark refills, interactive prewarm, and ready scans.
+The web app also starts a ready-maintainer worker on startup by default
+(`LABEL_READY_MAINTAINER_ON_STARTUP=1`), so deployed `app:app` workers keep
+materializing Reolink artifacts and warming thumbnails while the labeler is
+open or idle. Set it to `0` only if a separate preprocessing worker owns that
+job. A shared lock in `PREPROCESS_STATE_DIR` prevents multiple web workers from
+running the ready-maintainer pass at the same time.
 
 Label clicks are recorded to the volume first, held briefly for undo/relabel,
 then pushed to Drive by a background worker. Use `/api/label/jobs/status` to
