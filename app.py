@@ -213,7 +213,7 @@ REOLINK_FRAME_DOWNLOAD_WORKERS = max(
     2, min(10, int(os.environ.get("REOLINK_FRAME_DOWNLOAD_WORKERS", "8") or "8"))
 )
 REOLINK_TABLE_MATERIALIZE_WORKERS = max(
-    1, min(8, int(os.environ.get("REOLINK_TABLE_MATERIALIZE_WORKERS", "4") or "4"))
+    1, min(10, int(os.environ.get("REOLINK_TABLE_MATERIALIZE_WORKERS", "8") or "8"))
 )
 LABEL_READY_TARGET_CONFIGURED = _label_ready_target_configured()
 LABEL_READY_TARGET = (

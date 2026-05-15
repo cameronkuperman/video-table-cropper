@@ -53,7 +53,7 @@ const SUPPRESSED_QUEUE_MAX = 2500;
 const PENDING_LABELS_KEY = 'autolabeler.pendingLabels.v1';
 const PENDING_LABEL_KEEPALIVE_LIMIT = 20;
 const LABEL_UNDO_SECONDS = 30;
-const PREPROCESS_STATUS_TTL_MS = 2500;
+const PREPROCESS_STATUS_TTL_MS = 750;
 
 const cardEl = document.getElementById('card');
 const progressEl = document.getElementById('progress');
@@ -458,10 +458,10 @@ async function refreshPreprocessStatus({ force = false, startMaintainer = false 
     return preprocessStatusRequest;
 }
 
-function startActiveWarmers(loadToken = sourceLoadToken) {
+function startActiveWarmers(loadToken = sourceLoadToken, { force = false } = {}) {
     if (!isCurrentLoad(loadToken)) return;
     const queueKey = activeQueueKey();
-    if (warmupStartedQueueKey === queueKey) return;
+    if (!force && warmupStartedQueueKey === queueKey) return;
     if (activeSource === 'reolink' && !activeSiteKey) return;
     warmupStartedQueueKey = queueKey;
 
@@ -921,8 +921,16 @@ function warmBuffer(loadToken = sourceLoadToken) {
         preloadFolder(folders[idx]).catch(() => {});
     }
 
-    if (hasMore && localReadyCount() < LOW_WATERMARK) {
-        fetchQueue({ limit: REFILL_QUEUE_BATCH_SIZE, loadToken })
+    const backgroundActive = preprocessIsActive();
+    if ((hasMore || backgroundActive) && localReadyCount() < LOW_WATERMARK) {
+        if (localReadyCount() === 0 || backgroundActive) {
+            startActiveWarmers(loadToken, { force: true });
+        }
+        fetchQueue({
+            limit: REFILL_QUEUE_BATCH_SIZE,
+            forceRefresh: !hasMore && backgroundActive,
+            loadToken,
+        })
             .then(() => {
                 if (!isCurrentLoad(loadToken)) return;
                 for (let idx = currentIndex; idx < Math.min(folders.length, currentIndex + WARM_BUFFER_SIZE); idx++) {
@@ -1102,6 +1110,7 @@ async function renderCard(loadToken = sourceLoadToken) {
         const status = await refreshPreprocessStatus({ force: true });
         if (!isCurrentLoad(loadToken)) return;
         if (preprocessIsActive(status)) {
+            startActiveWarmers(loadToken, { force: true });
             cardEl.innerHTML = '<p class="loading">Preparing next triplets...</p>';
             doneEl.style.display = 'none';
             await sleep(queueRetryMs);
@@ -1388,23 +1397,23 @@ async function labelCurrent(label) {
     applyOptimisticLabel(label);
     const loadToken = sourceLoadToken;
     renderCard(loadToken);
+    labeling = false;
+    warmBuffer(loadToken);
 
-    try {
-        const data = await sendLabelOperation(operation, { keepalive: true });
-        showRecentLabelUndo(folder, operation, data);
-        logTiming('labelCurrent', {
-            ms: (performance.now() - startedAt).toFixed(1),
-            label,
-            folderId: folder.folder_id,
-            folderName: folder.folder_name,
-            queueKey: folder.queue_key,
+    sendLabelOperation(operation, { keepalive: true })
+        .then(data => {
+            showRecentLabelUndo(folder, operation, data);
+            logTiming('labelCurrent', {
+                ms: (performance.now() - startedAt).toFixed(1),
+                label,
+                folderId: folder.folder_id,
+                folderName: folder.folder_name,
+                queueKey: folder.queue_key,
+            });
+        })
+        .catch(e => {
+            showError(`Move queued for retry: ${folder.folder_name}: ${e.message}`);
         });
-    } catch (e) {
-        showError(`Move queued for retry: ${folder.folder_name}: ${e.message}`);
-    } finally {
-        labeling = false;
-        warmBuffer(loadToken);
-    }
 }
 
 function skipCurrent() {
