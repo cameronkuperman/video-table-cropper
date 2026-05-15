@@ -1068,6 +1068,27 @@ def test_ready_maintainer_auto_start_is_disabled_under_pytest(monkeypatch):
     assert calls == []
 
 
+def test_preprocess_status_starts_maintainer_only_when_requested(client, monkeypatch):
+    calls: list[bool] = []
+    monkeypatch.setattr(label_app, "_ensure_ready_maintainer_started", lambda: calls.append(True) or True)
+
+    response = client.get("/api/preprocess/status")
+    assert response.status_code == 200
+    assert calls == []
+
+    started_response = client.get("/api/preprocess/status?start=1")
+    assert started_response.status_code == 200
+    assert calls == [True]
+
+
+def test_default_throughput_target_covers_4000_images():
+    assert label_app.LABEL_THROUGHPUT_TARGET_IMAGES >= 4000
+    assert label_app.LABEL_THROUGHPUT_TARGET_FOLDERS >= 1334
+    assert label_app.REOLINK_PREWARM_TARGET >= label_app.LABEL_THROUGHPUT_TARGET_FOLDERS
+    assert label_app.PREWARM_FOLDER_COUNT >= label_app.LABEL_THROUGHPUT_TARGET_FOLDERS
+    assert label_app.QUEUE_BATCH_MAX >= 600
+
+
 def test_interactive_preview_prewarm_is_bounded(tmp_path, monkeypatch):
     submitted: list[str] = []
 

@@ -29,6 +29,7 @@ let recentLabelUndoTimer = null;
 let preprocessStatus = null;
 let preprocessStatusRequest = null;
 let lastPreprocessStatusAt = 0;
+let warmupStartedQueueKey = null;
 let stats = {
     unlabeled: 0,
     clean: 0,
@@ -38,16 +39,17 @@ let stats = {
     discarded: 0,
 };
 
-const INITIAL_QUEUE_BATCH_SIZE = 12;
-const REFILL_QUEUE_BATCH_SIZE = 300;
-const WARM_BUFFER_SIZE = 180;
-const LOW_WATERMARK = 220;
+const INITIAL_QUEUE_BATCH_SIZE = 72;
+const REFILL_QUEUE_BATCH_SIZE = 900;
+const WARM_BUFFER_SIZE = 540;
+const LOW_WATERMARK = 420;
+const BACKGROUND_WARM_LIMIT = 1400;
 const TIMING_LOGS_ENABLED = true;
 const QUEUE_SNAPSHOT_PREFIX = 'autolabeler.queueSnapshot.';
 const QUEUE_SNAPSHOT_SCHEMA_VERSION = 4;
 const QUEUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
-const QUEUE_SNAPSHOT_MAX_FOLDERS = 300;
-const SUPPRESSED_QUEUE_MAX = 1000;
+const QUEUE_SNAPSHOT_MAX_FOLDERS = 1500;
+const SUPPRESSED_QUEUE_MAX = 2500;
 const PENDING_LABELS_KEY = 'autolabeler.pendingLabels.v1';
 const PENDING_LABEL_KEEPALIVE_LIMIT = 20;
 const LABEL_UNDO_SECONDS = 30;
@@ -416,7 +418,7 @@ function preprocessIsActive(status = preprocessStatus) {
     );
 }
 
-async function refreshPreprocessStatus({ force = false } = {}) {
+async function refreshPreprocessStatus({ force = false, startMaintainer = false } = {}) {
     const now = performance.now();
     if (!force && preprocessStatus && (now - lastPreprocessStatusAt) < PREPROCESS_STATUS_TTL_MS) {
         return preprocessStatus;
@@ -425,7 +427,12 @@ async function refreshPreprocessStatus({ force = false } = {}) {
         return preprocessStatusRequest;
     }
 
-    preprocessStatusRequest = fetch('/api/preprocess/status')
+    const params = new URLSearchParams();
+    if (startMaintainer) {
+        params.set('start', '1');
+    }
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    preprocessStatusRequest = fetch(`/api/preprocess/status${suffix}`)
         .then(async res => {
             const data = await readApiJson(res, 'Preprocess status request');
             if (!res.ok || data.error) {
@@ -449,6 +456,23 @@ async function refreshPreprocessStatus({ force = false } = {}) {
             preprocessStatusRequest = null;
         });
     return preprocessStatusRequest;
+}
+
+function startActiveWarmers(loadToken = sourceLoadToken) {
+    if (!isCurrentLoad(loadToken)) return;
+    const queueKey = activeQueueKey();
+    if (warmupStartedQueueKey === queueKey) return;
+    if (activeSource === 'reolink' && !activeSiteKey) return;
+    warmupStartedQueueKey = queueKey;
+
+    refreshPreprocessStatus({ force: true, startMaintainer: true }).catch(() => {});
+
+    const params = new URLSearchParams({ limit: String(BACKGROUND_WARM_LIMIT) });
+    appendSourceParams(params);
+    fetch(`/api/cache/warm?${params.toString()}`, {
+        method: 'POST',
+        headers: jsonPostHeaders(),
+    }).catch(() => {});
 }
 
 function updateBufferStatus() {
@@ -659,6 +683,7 @@ async function fetchQueue({
         suppressedFolderIds = new Set();
         suppressedFrameSignatures = new Set();
         suppressedContentSignatures = new Set();
+        warmupStartedQueueKey = null;
         currentIndex = 0;
         hasMore = true;
         queueRequest = null;
@@ -1290,6 +1315,7 @@ async function init(forceRefresh = false, loadToken = null) {
         if (restored) {
             if (!isCurrentLoad(loadToken)) return;
             await renderCard(loadToken);
+            startActiveWarmers(loadToken);
             refreshStats(loadToken);
             fetchQueue({
                 reset: false,
@@ -1324,6 +1350,7 @@ async function init(forceRefresh = false, loadToken = null) {
             return;
         }
         await renderCard(loadToken);
+        startActiveWarmers(loadToken);
         refreshStats(loadToken);
     } catch (e) {
         if (!isCurrentLoad(loadToken)) return;

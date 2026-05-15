@@ -152,26 +152,62 @@ def _label_ready_target_configured() -> bool:
     return bool(os.environ.get("LABEL_READY_TARGET", "").strip())
 
 
-QUEUE_BATCH_DEFAULT = max(36, int(os.environ.get("LABEL_QUEUE_BATCH_DEFAULT", "72") or "72"))
-QUEUE_BATCH_MAX = max(QUEUE_BATCH_DEFAULT, int(os.environ.get("LABEL_QUEUE_BATCH_MAX", "300") or "300"))
+LABEL_THROUGHPUT_TARGET_IMAGES = max(
+    0,
+    _read_int_env("LABEL_THROUGHPUT_TARGET_IMAGES", 4000),
+)
+LABEL_IMAGES_PER_FOLDER_ESTIMATE = max(
+    1,
+    _read_int_env("LABEL_IMAGES_PER_FOLDER_ESTIMATE", 3),
+)
+LABEL_THROUGHPUT_TARGET_FOLDERS = (
+    math.ceil(LABEL_THROUGHPUT_TARGET_IMAGES / LABEL_IMAGES_PER_FOLDER_ESTIMATE)
+    if LABEL_THROUGHPUT_TARGET_IMAGES
+    else 0
+)
+QUEUE_BATCH_DEFAULT = max(72, int(os.environ.get("LABEL_QUEUE_BATCH_DEFAULT", "180") or "180"))
+QUEUE_BATCH_MAX = max(
+    QUEUE_BATCH_DEFAULT,
+    int(
+        os.environ.get(
+            "LABEL_QUEUE_BATCH_MAX",
+            str(max(600, min(2000, LABEL_THROUGHPUT_TARGET_FOLDERS or 600))),
+        )
+        or "600"
+    ),
+)
 CACHE_CLEANUP_INTERVAL_SECONDS = 300
 INTERACTIVE_PREWARM_FOLDER_CAP = max(
-    12, int(os.environ.get("LABEL_INTERACTIVE_PREWARM_FOLDER_CAP", "400") or "400")
+    12,
+    int(
+        os.environ.get(
+            "LABEL_INTERACTIVE_PREWARM_FOLDER_CAP",
+            str(max(400, min(2000, LABEL_THROUGHPUT_TARGET_FOLDERS or 400))),
+        )
+        or "400"
+    ),
 )
 INTERACTIVE_READY_SCAN_CAP = max(
-    100, int(os.environ.get("LABEL_INTERACTIVE_READY_SCAN_CAP", "500") or "500")
+    100,
+    int(
+        os.environ.get(
+            "LABEL_INTERACTIVE_READY_SCAN_CAP",
+            str(max(1000, min(3000, (LABEL_THROUGHPUT_TARGET_FOLDERS or 500) * 2))),
+        )
+        or "1000"
+    ),
 )
 UNLABELED_LIST_CACHE_SECONDS = max(
     15, int(os.environ.get("LABEL_UNLABELED_CACHE_SECONDS", "300") or "300")
 )
-HYDRATE_MAX_WORKERS = max(2, int(os.environ.get("LABEL_QUEUE_HYDRATE_WORKERS", "12") or "12"))
+HYDRATE_MAX_WORKERS = max(2, int(os.environ.get("LABEL_QUEUE_HYDRATE_WORKERS", "20") or "20"))
 PREVIEW_PREWARM_MAX_WORKERS = max(
-    2, int(os.environ.get("LABEL_PREVIEW_PREWARM_WORKERS", "24") or "24")
+    2, int(os.environ.get("LABEL_PREVIEW_PREWARM_WORKERS", "32") or "32")
 )
 THUMB_WIDTH = max(128, int(os.environ.get("LABEL_THUMB_WIDTH", "512") or "512"))
 THUMB_QUALITY = max(40, min(95, int(os.environ.get("LABEL_THUMB_QUALITY", "82") or "82")))
 FOLDER_PREWARM_MAX_WORKERS = max(
-    2, min(6, int(os.environ.get("LABEL_FOLDER_PREWARM_WORKERS", "4") or "4"))
+    2, min(10, int(os.environ.get("LABEL_FOLDER_PREWARM_WORKERS", "8") or "8"))
 )
 REOLINK_FRAME_DOWNLOAD_WORKERS = max(
     2, min(10, int(os.environ.get("REOLINK_FRAME_DOWNLOAD_WORKERS", "8") or "8"))
@@ -187,10 +223,15 @@ LABEL_READY_TARGET = (
 )
 PREWARM_FOLDER_COUNT = min(
     INTERACTIVE_PREWARM_FOLDER_CAP,
-    max(12, _ready_target_or_legacy_env("LABEL_PREWARM_FOLDER_COUNT", 400)),
+    max(
+        12,
+        LABEL_THROUGHPUT_TARGET_FOLDERS,
+        _ready_target_or_legacy_env("LABEL_PREWARM_FOLDER_COUNT", 400),
+    ),
 )
 REOLINK_PREWARM_TARGET = max(
     PREWARM_FOLDER_COUNT,
+    LABEL_THROUGHPUT_TARGET_FOLDERS,
     _ready_target_or_legacy_env("LABEL_REOLINK_PREWARM_TARGET", 1000),
 )
 INTERACTIVE_REOLINK_PREWARM_TARGET = REOLINK_PREWARM_TARGET
@@ -205,10 +246,14 @@ AUTOLABEL_VIDEO_AUTO_PREPROCESS = os.environ.get(
     "0",
 ).strip().lower() in {"1", "true", "yes", "on"}
 HYDRATED_FOLDER_CACHE_TTL_SECONDS = max(60, int(os.environ.get("LABEL_HYDRATED_CACHE_TTL_SECONDS", "900") or "900"))
-READY_SCAN_MULTIPLIER = max(2, int(os.environ.get("LABEL_READY_SCAN_MULTIPLIER", "12") or "12"))
+READY_SCAN_MULTIPLIER = max(2, int(os.environ.get("LABEL_READY_SCAN_MULTIPLIER", "8") or "8"))
 READY_SCAN_MAX = min(
     INTERACTIVE_READY_SCAN_CAP,
-    max(100, _ready_target_or_legacy_env("LABEL_READY_SCAN_MAX", 180)),
+    max(
+        100,
+        LABEL_THROUGHPUT_TARGET_FOLDERS,
+        _ready_target_or_legacy_env("LABEL_READY_SCAN_MAX", 180),
+    ),
 )
 QUEUE_RETRY_MS = max(100, int(os.environ.get("LABEL_QUEUE_RETRY_MS", "250") or "250"))
 TIMING_LOGS_ENABLED = os.environ.get("LABEL_TIMING_LOGS", "1").strip().lower() not in {
@@ -260,8 +305,8 @@ LABEL_JOB_RECOVERED_ERROR = "Recovered after label worker fix; retrying Drive pu
 LABEL_JOB_ERROR_LIMIT = max(1, int(os.environ.get("LABEL_JOB_ERROR_LIMIT", "25") or "25"))
 LABEL_JOB_MAX_ATTEMPTS = max(1, int(os.environ.get("LABEL_JOB_MAX_ATTEMPTS", "100") or "100"))
 LABEL_JOB_UNDO_SECONDS = max(0, int(os.environ.get("LABEL_JOB_UNDO_SECONDS", "30") or "30"))
-LABEL_JOB_MIN_INTERVAL_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_MIN_INTERVAL_SECONDS", "2.0") or "2.0"))
-LABEL_JOB_JITTER_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_JITTER_SECONDS", "0.5") or "0.5"))
+LABEL_JOB_MIN_INTERVAL_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_MIN_INTERVAL_SECONDS", "0.15") or "0.15"))
+LABEL_JOB_JITTER_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_JITTER_SECONDS", "0.05") or "0.05"))
 LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS = max(
     1.0,
     float(os.environ.get("LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS", "120") or "120"),
@@ -464,10 +509,10 @@ _DEFAULT_CACHE_MAX_MB = "20000" if _RAILWAY_ENV else "1024"
 CACHE_TTL_HOURS = max(1, int(os.environ.get("LABEL_CACHE_TTL_HOURS", _DEFAULT_CACHE_TTL_HOURS) or _DEFAULT_CACHE_TTL_HOURS))
 CACHE_MAX_MB = max(64, int(os.environ.get("LABEL_CACHE_MAX_MB", _DEFAULT_CACHE_MAX_MB) or _DEFAULT_CACHE_MAX_MB))
 CACHE_WARM_ERROR_LIMIT = max(1, int(os.environ.get("LABEL_CACHE_WARM_ERROR_LIMIT", "25") or "25"))
-CACHE_WARM_BATCH_SIZE = max(1, int(os.environ.get("LABEL_CACHE_WARM_BATCH_SIZE", "25") or "25"))
+CACHE_WARM_BATCH_SIZE = max(1, int(os.environ.get("LABEL_CACHE_WARM_BATCH_SIZE", "80") or "80"))
 CACHE_WARM_BATCH_PAUSE_SECONDS = max(
     0.0,
-    float(os.environ.get("LABEL_CACHE_WARM_BATCH_PAUSE_SECONDS", "0.05") or "0.05"),
+    float(os.environ.get("LABEL_CACHE_WARM_BATCH_PAUSE_SECONDS", "0") or "0"),
 )
 CACHE_WARM_LOCK_STALE_SECONDS = max(
     60,
@@ -602,9 +647,6 @@ def _auth_public_endpoint() -> bool:
 
 @app.before_request
 def _require_auth_and_csrf() -> Any | None:
-    if request.endpoint != "static":
-        _ensure_ready_maintainer_started()
-
     if request.method == "OPTIONS" or _auth_public_endpoint():
         return None
 
@@ -5134,11 +5176,11 @@ def _ready_maintainer_startup_enabled() -> bool:
     argv0 = Path(sys.argv[0]).name
     if argv0 == "main.py" and "--label" not in sys.argv:
         return False
-    return os.environ.get("LABEL_READY_MAINTAINER_ON_STARTUP", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
+    return os.environ.get("LABEL_READY_MAINTAINER_ON_STARTUP", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -5172,9 +5214,6 @@ def _ensure_ready_maintainer_started() -> bool:
         _ready_maintainer_state["started"] = True
     _ready_maintainer_executor.submit(_run_ready_maintainer_loop)
     return True
-
-
-_auto_start_ready_maintainer()
 
 
 def _hydrate_folder_with_fresh_client(
@@ -6323,7 +6362,8 @@ def _maybe_trigger_video_preprocess(context: QueueContext, unlabeled_count: int)
 @app.route("/api/preprocess/status")
 def api_preprocess_status():
     """Expose whether a background preprocess run is in flight (useful for UI badges)."""
-    _ensure_ready_maintainer_started()
+    if request.args.get("start", "0") == "1":
+        _ensure_ready_maintainer_started()
     with _video_preprocess_lock:
         video_state = dict(_video_preprocess_state)
     with _reolink_preprocess_lock:
@@ -6352,6 +6392,8 @@ def api_preprocess_status():
             },
             "ready_target": REOLINK_PREWARM_TARGET,
             "label_ready_target_configured": LABEL_READY_TARGET_CONFIGURED,
+            "throughput_target_images": LABEL_THROUGHPUT_TARGET_IMAGES,
+            "throughput_target_folders": LABEL_THROUGHPUT_TARGET_FOLDERS,
             "maintainer": {
                 "inflight": bool(maintainer_state["inflight"]),
                 "started": bool(maintainer_state["started"]),
