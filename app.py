@@ -1447,9 +1447,23 @@ def _supabase_active_crops_for_camera(client: SupabaseCropClient, camera_source_
     return rows
 
 
+def _camera_source_matches_site_key(camera_source: dict[str, Any], site_key: str | None) -> bool:
+    expected = str(site_key or "").strip()
+    if not expected:
+        return True
+    config = camera_source.get("config") if isinstance(camera_source.get("config"), dict) else {}
+    values = {
+        str(config.get("edge_node_id") or "").strip(),
+        str(config.get("edge_camera_key") or "").strip(),
+    }
+    return expected in values or any(f"__{expected}__" in value for value in values if value)
+
+
 def _resolve_supabase_camera_source(
     raw_folder_name: str,
     metadata: dict[str, Any] | None = None,
+    *,
+    site_key: str | None = None,
 ) -> dict[str, Any] | None:
     client = _get_supabase_crop_client()
     if not client.enabled:
@@ -1468,13 +1482,13 @@ def _resolve_supabase_camera_source(
                     "id": f"eq.{explicit_id}",
                 },
             )
-            if camera and camera.get("is_active") is not False:
+            if camera and camera.get("is_active") is not False and _camera_source_matches_site_key(camera, site_key):
                 return camera
         except Exception as exc:
             _set_supabase_crop_status(enabled=True, last_error=str(exc), last_lookup_at=_utc_iso_now())
 
     site_id = str(metadata.get("site_id") or "").strip()
-    node_id = str(metadata.get("node_id") or "").strip()
+    node_id = str(metadata.get("node_id") or "").strip() or str(site_key or "").strip()
     for camera_id in _camera_id_candidates(raw_folder_name, metadata):
         params = {
             "select": "id,node_id,restaurant_id,site_id,camera_id,camera_name,camera_source_id,metadata",
@@ -1506,7 +1520,7 @@ def _resolve_supabase_camera_source(
             except Exception as exc:
                 _set_supabase_crop_status(enabled=True, last_error=str(exc), last_lookup_at=_utc_iso_now())
                 continue
-            if camera and camera.get("is_active") is not False:
+            if camera and camera.get("is_active") is not False and _camera_source_matches_site_key(camera, site_key):
                 return camera
 
     restaurant_id = str(metadata.get("restaurant_id") or "").strip()
@@ -1527,6 +1541,8 @@ def _resolve_supabase_camera_source(
         for camera in candidates:
             if camera.get("is_active") is False:
                 continue
+            if not _camera_source_matches_site_key(camera, site_key):
+                continue
             config = camera.get("config") if isinstance(camera.get("config"), dict) else {}
             values = {
                 str(camera.get("name") or "").strip(),
@@ -1542,13 +1558,15 @@ def _resolve_supabase_camera_source(
 def _resolve_supabase_crop_tables(
     raw_folder_name: str,
     metadata: dict[str, Any] | None = None,
+    *,
+    site_key: str | None = None,
 ) -> tuple[int, dict[str, Any], list[tuple[str, list, tuple[int, int, int, int], list]]] | None:
     client = _get_supabase_crop_client()
     if not client.enabled:
         _set_supabase_crop_status(enabled=False)
         return None
 
-    camera_source = _resolve_supabase_camera_source(raw_folder_name, metadata)
+    camera_source = _resolve_supabase_camera_source(raw_folder_name, metadata, site_key=site_key)
     if not camera_source or not camera_source.get("id"):
         return None
     camera_source_id = str(camera_source["id"])
@@ -1585,7 +1603,7 @@ def _mapped_camera_tables_for_reolink_folder(
     site_key: str | None = None,
     client: DriveClient | None = None,
 ) -> tuple[int, dict[str, Any], list[tuple[str, list, tuple[int, int, int, int], list]]] | None:
-    supabase_match = _resolve_supabase_crop_tables(raw_folder_name, {})
+    supabase_match = _resolve_supabase_crop_tables(raw_folder_name, {}, site_key=site_key)
     if supabase_match is not None:
         return supabase_match
 
@@ -1655,7 +1673,7 @@ def _mapped_camera_tables_for_screenrecord_folder(
     site_key: str | None = None,
     client: DriveClient | None = None,
 ) -> tuple[int, dict[str, Any], list[tuple[str, list, tuple[int, int, int, int], list]]] | None:
-    supabase_match = _resolve_supabase_crop_tables(raw_folder_name, metadata)
+    supabase_match = _resolve_supabase_crop_tables(raw_folder_name, metadata, site_key=site_key)
     if supabase_match is not None:
         return supabase_match
 
