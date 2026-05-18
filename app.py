@@ -225,7 +225,6 @@ PREWARM_FOLDER_COUNT = min(
     INTERACTIVE_PREWARM_FOLDER_CAP,
     max(
         12,
-        LABEL_THROUGHPUT_TARGET_FOLDERS,
         _ready_target_or_legacy_env("LABEL_PREWARM_FOLDER_COUNT", 400),
     ),
 )
@@ -251,9 +250,22 @@ READY_SCAN_MAX = min(
     INTERACTIVE_READY_SCAN_CAP,
     max(
         100,
-        LABEL_THROUGHPUT_TARGET_FOLDERS,
         _ready_target_or_legacy_env("LABEL_READY_SCAN_MAX", 180),
     ),
+)
+QUEUE_HYDRATE_BATCH_SIZE = max(
+    1,
+    int(
+        os.environ.get(
+            "LABEL_QUEUE_HYDRATE_BATCH_SIZE",
+            str(min(max(HYDRATE_MAX_WORKERS, 1), 24)),
+        )
+        or "24"
+    ),
+)
+QUEUE_HYDRATE_BUDGET_MS = max(
+    250.0,
+    float(os.environ.get("LABEL_QUEUE_HYDRATE_BUDGET_MS", "8000") or "8000"),
 )
 QUEUE_RETRY_MS = max(100, int(os.environ.get("LABEL_QUEUE_RETRY_MS", "250") or "250"))
 TIMING_LOGS_ENABLED = os.environ.get("LABEL_TIMING_LOGS", "1").strip().lower() not in {
@@ -4430,6 +4442,10 @@ def _list_source_subfolders(
     if cache_is_fresh and not force_refresh:
         return cached_listing
 
+    if cached_listing is not None and force_refresh:
+        _schedule_listing_refresh(context)
+        return cached_listing
+
     if cached_listing is not None and not force_refresh:
         _schedule_listing_refresh(context)
         return cached_listing
@@ -5317,6 +5333,7 @@ def _collect_ready_folders(
     context: QueueContext,
     limit: int,
 ) -> tuple[list[dict], dict[str, int | float]]:
+    request_started = time.perf_counter()
     ready: list[dict] = []
     fallback: list[dict] = []
     seen_signatures: set[str] = set()
@@ -5330,16 +5347,20 @@ def _collect_ready_folders(
     hydrate_cache_hits = 0
     hydrate_cache_misses = 0
     hydrate_worker_max = 0
+    budget_exhausted = False
     first_unready_idx = len(subfolders)
 
     target_scan = min(len(subfolders), max(limit * READY_SCAN_MULTIPLIER, limit))
     target_scan = min(target_scan, READY_SCAN_MAX)
 
     while scanned < target_scan and len(ready) < limit:
+        if scanned > 0 and (time.perf_counter() - request_started) * 1000 >= QUEUE_HYDRATE_BUDGET_MS:
+            budget_exhausted = True
+            break
         remaining_scan = target_scan - scanned
         batch_span = min(
             remaining_scan,
-            max(HYDRATE_MAX_WORKERS, (limit - len(ready)) * 2),
+            QUEUE_HYDRATE_BATCH_SIZE,
         )
         folder_batch = subfolders[scanned:scanned + batch_span]
         if not folder_batch:
@@ -5390,6 +5411,9 @@ def _collect_ready_folders(
         scanned += len(folder_batch)
         if not ready and len(fallback) >= limit:
             break
+        if (time.perf_counter() - request_started) * 1000 >= QUEUE_HYDRATE_BUDGET_MS:
+            budget_exhausted = True
+            break
 
     prewarm_scan_start = first_unready_idx if first_unready_idx < len(subfolders) else scanned
     folder_prewarm_scheduled = _schedule_folder_hydration_prewarm(
@@ -5413,6 +5437,7 @@ def _collect_ready_folders(
         "duplicate_signatures": duplicate_signatures,
         "nonready": nonready,
         "returned_uncached": 0 if ready else len(fallback),
+        "budget_exhausted": int(budget_exhausted),
     }
 
 
@@ -5866,6 +5891,7 @@ def api_queue():
             cache_hits=ready_stats["hydrate_cache_hits"],
             cache_misses=ready_stats["hydrate_cache_misses"],
             workers=ready_stats["hydrate_worker_max"],
+            budget_exhausted=ready_stats["budget_exhausted"],
             prewarm_folders=ready_stats["folder_prewarm_scheduled"],
             prewarm_files=preview_prewarm_scheduled,
             total_unlabeled=total_unlabeled,

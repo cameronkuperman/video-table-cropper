@@ -1085,8 +1085,37 @@ def test_default_throughput_target_covers_4000_images():
     assert label_app.LABEL_THROUGHPUT_TARGET_IMAGES >= 4000
     assert label_app.LABEL_THROUGHPUT_TARGET_FOLDERS >= 1334
     assert label_app.REOLINK_PREWARM_TARGET >= label_app.LABEL_THROUGHPUT_TARGET_FOLDERS
-    assert label_app.PREWARM_FOLDER_COUNT >= label_app.LABEL_THROUGHPUT_TARGET_FOLDERS
+    assert label_app.PREWARM_FOLDER_COUNT <= label_app.LABEL_THROUGHPUT_TARGET_FOLDERS
+    assert label_app.READY_SCAN_MAX <= label_app.INTERACTIVE_READY_SCAN_CAP
     assert label_app.QUEUE_BATCH_MAX >= 600
+
+
+def test_force_refresh_uses_stale_listing_cache_and_refreshes_in_background(monkeypatch):
+    context = label_app.QueueContext(
+        source=label_app.VIDEO_SOURCE,
+        site_key=None,
+        queue_key=label_app.VIDEO_SOURCE,
+        display_name="Video",
+        input_folder_name="unlabeled",
+        input_folder_id="video-unlabeled",
+        seed_folder_name=None,
+        seed_folder_id=None,
+        folder_ids={},
+        persist_frame_metadata=False,
+    )
+    stale_listing = [{"id": "cached-folder", "name": "cached"}]
+    label_app._set_listing_cache(context.queue_key, stale_listing)
+    monkeypatch.setattr(label_app, "_schedule_listing_refresh", lambda ctx: True)
+
+    def fail_fetch(_client, _context):
+        raise AssertionError("force refresh should not block on Drive when cache exists")
+
+    monkeypatch.setattr(label_app, "_fetch_source_listing", fail_fetch)
+
+    try:
+        assert label_app._list_source_subfolders(object(), context, force_refresh=True) == stale_listing
+    finally:
+        label_app._invalidate_listing_cache(context.queue_key)
 
 
 def test_interactive_preview_prewarm_is_bounded(tmp_path, monkeypatch):
