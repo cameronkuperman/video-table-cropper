@@ -1266,16 +1266,22 @@ async function undoRecentLabel() {
     if (!undoState) return;
     removeRecentLabelUndo(undoState.operation);
     renderRecentLabelUndo();
+
+    forgetSuppressedFolder(undoState.folder);
+    removePendingLabel(undoState.operation);
+    undoOptimisticLabel(undoState.operation.label);
+    const existingIndex = folders.findIndex(folder => folder.folder_id === undoState.folder.folder_id);
+    if (existingIndex === -1) {
+        folders.splice(currentIndex, 0, undoState.folder);
+    }
+    saveQueueSnapshot();
+    await renderCard();
+
     try {
         await cancelLabelOperation(undoState.operation);
-        forgetSuppressedFolder(undoState.folder);
-        removePendingLabel(undoState.operation);
-        undoOptimisticLabel(undoState.operation.label);
-        folders.splice(currentIndex, 0, undoState.folder);
         saveQueueSnapshot();
-        await renderCard();
     } catch (e) {
-        showError(`Could not undo: ${e.message}`);
+        showError(`Undo restore shown, but Drive rollback failed: ${e.message}`);
     }
 }
 

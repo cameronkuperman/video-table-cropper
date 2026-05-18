@@ -244,7 +244,12 @@ class FakeDriveClient:
         return self._copy(file_id)
 
     def update_file_metadata(self, file_id: str, metadata: dict, fields: str = "") -> dict:
-        self.items[file_id].setdefault("appProperties", {}).update(metadata.get("appProperties", {}))
+        app_properties = self.items[file_id].setdefault("appProperties", {})
+        for key, value in (metadata.get("appProperties", {}) or {}).items():
+            if value is None:
+                app_properties.pop(key, None)
+            else:
+                app_properties[key] = value
         return self._copy(file_id)
 
     def move_file(self, file_id: str, new_parent_id: str, remove_parent_id: str | None = None) -> dict:
@@ -1537,6 +1542,66 @@ def test_cancel_pending_label_job_removes_history_and_restores_queue(client, fak
     assert history["queues"]["video"]["labeled"] == {}
     repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
     assert repeat_response.get_json()["folders"][0]["folder_id"] == folder["folder_id"]
+
+
+def test_cancel_after_drive_move_restores_folder_to_unlabeled(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    payload = _label_payload(folder, "clean")
+
+    assert client.post("/api/label", json=payload).status_code == 200
+    assert _drain_label_jobs(fake_drive) == 1
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-clean"]
+
+    cancel_response = client.post("/api/label/cancel", json=payload)
+    assert cancel_response.status_code == 200
+    assert cancel_response.get_json()["restored"] is True
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-unlabeled"]
+    for key in label_app.LABEL_APP_PROPERTY_KEYS:
+        assert key not in fake_drive.items[folder["folder_id"]]["appProperties"]
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs["jobs"]["video:video-triplet"]["status"] == "canceled"
+    assert "restored folder" in jobs["jobs"]["video:video-triplet"]["last_error"]
+    history = json.loads(label_app._label_history_path().read_text(encoding="utf-8"))
+    assert history["queues"]["video"]["labeled"] == {}
+    repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    assert repeat_response.get_json()["folders"][0]["folder_id"] == folder["folder_id"]
+
+
+def test_cancel_succeeds_when_moved_folder_is_already_back_in_input(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    payload = _label_payload(folder, "clean")
+
+    assert client.post("/api/label", json=payload).status_code == 200
+    assert _drain_label_jobs(fake_drive) == 1
+    fake_drive.move_file(folder["folder_id"], "video-unlabeled", remove_parent_id="video-clean")
+
+    cancel_response = client.post("/api/label/cancel", json=payload)
+    assert cancel_response.status_code == 200
+    assert cancel_response.get_json()["restored"] is True
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-unlabeled"]
+    for key in label_app.LABEL_APP_PROPERTY_KEYS:
+        assert key not in fake_drive.items[folder["folder_id"]]["appProperties"]
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs["jobs"]["video:video-triplet"]["status"] == "canceled"
+
+
+def test_cancel_from_different_label_destination_restores_to_unlabeled(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    payload = _label_payload(folder, "clean")
+
+    assert client.post("/api/label", json=payload).status_code == 200
+    assert _drain_label_jobs(fake_drive) == 1
+    fake_drive.move_file(folder["folder_id"], "video-dirty", remove_parent_id="video-clean")
+
+    cancel_response = client.post("/api/label/cancel", json=payload)
+    assert cancel_response.status_code == 200
+    assert cancel_response.get_json()["restored"] is True
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-unlabeled"]
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs["jobs"]["video:video-triplet"]["status"] == "canceled"
 
 
 def test_relabel_pending_job_replaces_label_without_duplicate_move(client, fake_drive):

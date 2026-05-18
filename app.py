@@ -1148,6 +1148,16 @@ def _label_app_properties(label: str, context: QueueContext, labeler_name: str |
     return properties
 
 
+LABEL_APP_PROPERTY_KEYS = (
+    "autolabel_final_label",
+    "autolabel_labeled_at",
+    "autolabel_labeled_by",
+    "autolabel_source",
+    "autolabel_queue_key",
+    "autolabel_site_key",
+)
+
+
 def _table_config_path() -> Path:
     preferred = Path(__file__).parent / "approved_table_rectangles.json"
     if preferred.exists():
@@ -2629,14 +2639,72 @@ def _get_label_job(job_id: str) -> dict[str, Any] | None:
             return dict(job) if isinstance(job, dict) else None
 
 
+def _clear_label_queue_caches(context: QueueContext, folder_id: str) -> None:
+    _invalidate_listing_cache(context.queue_key)
+    with _hydrated_folder_cache_lock:
+        _hydrated_folder_cache.pop(_hydrated_cache_key(context.queue_key, folder_id), None)
+
+
+def _label_destination_parent_ids(context: QueueContext) -> dict[str, str]:
+    return {
+        str(destination_id): destination_label
+        for destination_label, destination_id in context.folder_ids.items()
+        if destination_label in LABEL_DESTINATIONS and destination_id
+    }
+
+
+def _clear_drive_label_metadata(client: DriveClient, folder_id: str, current: dict[str, Any]) -> None:
+    app_properties = dict(current.get("appProperties") or {})
+    clear_properties = {
+        key: None
+        for key in LABEL_APP_PROPERTY_KEYS
+        if key in app_properties
+    }
+    if clear_properties:
+        client.update_file_metadata(
+            folder_id,
+            {"appProperties": clear_properties},
+            fields="id,name,mimeType,parents,appProperties",
+        )
+
+
+def _mark_label_job_canceled(
+    context: QueueContext,
+    folder_id: str,
+    *,
+    note: str | None = None,
+) -> None:
+    job_id = _label_job_key(context, folder_id)
+    with _label_jobs_lock:
+        with _state_file_lock("label_jobs"):
+            state = _load_label_jobs_unlocked()
+            jobs = state.setdefault("jobs", {})
+            job = jobs.get(job_id)
+            if not isinstance(job, dict):
+                job = {
+                    "id": job_id,
+                    "folder_id": folder_id,
+                    "source": context.source,
+                    "site_key": context.site_key,
+                    "queue_key": context.queue_key,
+                }
+                jobs[job_id] = job
+            job["status"] = "canceled"
+            job["updated_at"] = _utc_iso()
+            job["last_error"] = note
+            _save_label_jobs_unlocked(state)
+
+
 def _cancel_label_job(
     context: QueueContext,
     *,
+    client: DriveClient,
     folder_id: str,
+    parent_id: str,
     folder_name: str,
     frame_signature: str,
     content_signature: str,
-) -> bool:
+) -> dict[str, Any]:
     job_id = _label_job_key(context, folder_id)
     canceled = False
     with _label_jobs_lock:
@@ -2651,8 +2719,36 @@ def _cancel_label_job(
                 canceled = True
     if canceled:
         _remove_label_history(context, folder_id, folder_name, frame_signature, content_signature)
-        _invalidate_listing_cache(context.queue_key)
-    return canceled
+        _clear_label_queue_caches(context, folder_id)
+        return {"canceled": True, "restored": False}
+
+    input_parent_ids = _context_input_folder_ids(context)
+    restore_parent_id = parent_id if parent_id in input_parent_ids else context.input_folder_id
+    current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+    current_parents = [str(parent) for parent in current.get("parents", []) if parent]
+    label_parent_ids = _label_destination_parent_ids(context)
+    current_label_parent = next(
+        (parent for parent in current_parents if parent in label_parent_ids),
+        None,
+    )
+
+    if restore_parent_id in current_parents:
+        restored = True
+    elif current_label_parent:
+        client.move_file(folder_id, new_parent_id=restore_parent_id, remove_parent_id=current_label_parent)
+        restored = True
+    else:
+        return {"canceled": False, "restored": False}
+
+    _clear_drive_label_metadata(client, folder_id, current)
+    _mark_label_job_canceled(
+        context,
+        folder_id,
+        note="Undo restored folder from Drive label destination." if current_label_parent else None,
+    )
+    _remove_label_history(context, folder_id, folder_name, frame_signature, content_signature)
+    _clear_label_queue_caches(context, folder_id)
+    return {"canceled": True, "restored": restored}
 
 
 def _label_job_rate_limit_snapshot() -> dict[str, Any]:
@@ -6355,11 +6451,13 @@ def api_label_cancel():
     try:
         data = _request_json_payload()
         folder_id = str(data.get("folder_id", "")).strip()
+        parent_id = str(data.get("parent_id", "")).strip()
         source, site_key = _payload_source_args(data)
         if not folder_id:
             return jsonify({"error": "folder_id required"}), 400
 
-        context = _resolve_queue_context(get_client(), source, site_key)
+        client = get_client()
+        context = _resolve_queue_context(client, source, site_key)
         queue_key = context.queue_key
         raw_frames = data.get("frames") if isinstance(data.get("frames"), dict) else {}
         frames = _frames_from_client_payload(raw_frames)
@@ -6368,16 +6466,21 @@ def api_label_cancel():
             frame_signature = _frame_signature_from_frames(frames)
         folder_name = str(data.get("folder_name") or "").strip()
         content_signature = str(data.get("content_signature") or "").strip()
-        canceled = _cancel_label_job(
+        result = _cancel_label_job(
             context,
+            client=client,
             folder_id=folder_id,
+            parent_id=parent_id,
             folder_name=folder_name,
             frame_signature=frame_signature,
             content_signature=content_signature,
         )
-        if not canceled:
+        if not result["canceled"]:
             return jsonify({"error": "label job is no longer undoable", "code": "not_undoable"}), 409
-        return jsonify({"ok": True, "canceled": True, "source_context": context.to_payload()})
+        response = {"ok": True, "canceled": True, "source_context": context.to_payload()}
+        if result["restored"]:
+            response["restored"] = True
+        return jsonify(response)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except (DriveClientError, RuntimeError, OSError, TypeError) as e:
