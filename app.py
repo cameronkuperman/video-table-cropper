@@ -2398,6 +2398,30 @@ def _label_history_queue(history: dict[str, Any], queue_key: str) -> dict[str, A
     return queue
 
 
+def _label_history_records_for_queue(queue_key: str) -> dict[str, Any]:
+    with _label_history_lock:
+        with _state_file_lock("label_history"):
+            history = _load_label_history_unlocked()
+            queue = (history.get("queues") or {}).get(queue_key) or {}
+            labeled = queue.get("labeled") or {}
+            return dict(labeled) if isinstance(labeled, dict) else {}
+
+
+def _label_history_lookup_in_records(
+    labeled_records: dict[str, Any],
+    context: QueueContext,
+    folder_id: str,
+    folder_name: str,
+    frame_signature: str,
+    content_signature: str = "",
+) -> dict[str, Any] | None:
+    for key in _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature):
+        record = labeled_records.get(key)
+        if isinstance(record, dict):
+            return record
+    return None
+
+
 def _label_history_lookup(
     context: QueueContext,
     folder_id: str,
@@ -2405,16 +2429,15 @@ def _label_history_lookup(
     frame_signature: str,
     content_signature: str = "",
 ) -> dict[str, Any] | None:
-    with _label_history_lock:
-        with _state_file_lock("label_history"):
-            history = _load_label_history_unlocked()
-            queue = (history.get("queues") or {}).get(context.queue_key) or {}
-            labeled = queue.get("labeled") or {}
-            for key in _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature):
-                record = labeled.get(key)
-                if isinstance(record, dict):
-                    return record
-    return None
+    labeled_records = _label_history_records_for_queue(context.queue_key)
+    return _label_history_lookup_in_records(
+        labeled_records,
+        context,
+        folder_id,
+        folder_name,
+        frame_signature,
+        content_signature,
+    )
 
 
 def _record_label_history(
@@ -4459,6 +4482,29 @@ def _list_source_subfolders(
     return list(listing)
 
 
+def _filter_label_history_hidden_subfolders(
+    subfolders: list[dict[str, str]],
+    context: QueueContext,
+    labeled_records: dict[str, Any],
+) -> tuple[list[dict[str, str]], int]:
+    if not labeled_records:
+        return subfolders, 0
+
+    visible: list[dict[str, str]] = []
+    hidden = 0
+    for folder in subfolders:
+        folder_id = str(folder.get("id") or "")
+        folder_name = str(folder.get("name") or "")
+        if _label_history_lookup_in_records(labeled_records, context, folder_id, folder_name, ""):
+            hidden += 1
+            _remove_folder_from_listing_cache(context.queue_key, folder_id)
+            with _hydrated_folder_cache_lock:
+                _hydrated_folder_cache.pop(_hydrated_cache_key(context.queue_key, folder_id), None)
+            continue
+        visible.append(folder)
+    return visible, hidden
+
+
 def _frame_payload_from_files(files: list[dict]) -> dict[str, str | None]:
     file_map = {f["name"]: f["id"] for f in files}
     present_indices = sorted({
@@ -5154,7 +5200,18 @@ def _run_ready_maintainer_once() -> None:
                     label_source.site_key,
                 )
                 subfolders = _list_source_subfolders(client, context)
-                _ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit=1)
+                labeled_records = _label_history_records_for_queue(context.queue_key)
+                subfolders, _history_hidden = _filter_label_history_hidden_subfolders(
+                    subfolders,
+                    context,
+                    labeled_records,
+                )
+                _ready_folders, ready_stats = _collect_ready_folders(
+                    subfolders,
+                    context,
+                    limit=1,
+                    labeled_records=labeled_records,
+                )
                 visible_count = max(
                     0,
                     len(subfolders)
@@ -5336,6 +5393,7 @@ def _collect_ready_folders(
     subfolders: list[dict[str, str]],
     context: QueueContext,
     limit: int,
+    labeled_records: dict[str, Any],
 ) -> tuple[list[dict], dict[str, int | float]]:
     request_started = time.perf_counter()
     ready: list[dict] = []
@@ -5386,7 +5444,8 @@ def _collect_ready_folders(
             if signature and signature in seen_signatures:
                 duplicate_signatures += 1
                 continue
-            history_record = _label_history_lookup(
+            history_record = _label_history_lookup_in_records(
+                labeled_records,
                 context,
                 str(payload.get("folder_id") or ""),
                 str(payload.get("folder_name") or ""),
@@ -5395,6 +5454,12 @@ def _collect_ready_folders(
             )
             if history_record:
                 hidden_labeled += 1
+                _remove_folder_from_listing_cache(context.queue_key, str(payload.get("folder_id") or ""))
+                with _hydrated_folder_cache_lock:
+                    _hydrated_folder_cache.pop(
+                        _hydrated_cache_key(context.queue_key, str(payload.get("folder_id") or "")),
+                        None,
+                    )
                 _schedule_hidden_folder_cleanup(context, str(payload.get("folder_id") or ""))
                 continue
             if signature:
@@ -5827,9 +5892,20 @@ def api_queue():
         list_started = time.perf_counter()
         subfolders = _list_source_subfolders(client, context, force_refresh=force_refresh)
         list_ms = (time.perf_counter() - list_started) * 1000
+        labeled_records = _label_history_records_for_queue(context.queue_key)
+        subfolders, history_hidden = _filter_label_history_hidden_subfolders(
+            subfolders,
+            context,
+            labeled_records,
+        )
         total_unlabeled = len(subfolders)
 
-        ready_folders, ready_stats = _collect_ready_folders(subfolders, context, limit)
+        ready_folders, ready_stats = _collect_ready_folders(
+            subfolders,
+            context,
+            limit,
+            labeled_records,
+        )
         visible_unlabeled_estimate = max(
             0,
             total_unlabeled
@@ -5890,6 +5966,7 @@ def api_queue():
             scanned=ready_stats["scanned"],
             hydrated_valid=ready_stats["hydrated_valid"],
             hidden_labeled=ready_stats["hidden_labeled"],
+            history_hidden=history_hidden,
             duplicate_signatures=ready_stats["duplicate_signatures"],
             visible_unlabeled=visible_unlabeled_estimate,
             cache_hits=ready_stats["hydrate_cache_hits"],
