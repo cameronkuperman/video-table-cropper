@@ -924,6 +924,40 @@ def test_queue_prefers_cached_folders_when_available(client):
     assert payload["folders"][0]["preview_urls"]["frame_0"].startswith("/api/preview/")
 
 
+def test_queue_filters_history_hidden_folders_with_one_history_read(client, fake_drive, monkeypatch):
+    context = label_app._resolve_queue_context(fake_drive, label_app.VIDEO_SOURCE, None)
+    fake_drive._add_folder("video-triplet-2", "ipc3_table-4_t0002", "video-unlabeled")
+    fake_drive._add_triplet_files("video-triplet-2", "video2")
+    label_app._invalidate_listing_cache(context.queue_key)
+
+    for folder in fake_drive.list_folders("video-unlabeled"):
+        label_app._record_label_history(
+            context,
+            str(folder["id"]),
+            str(folder["name"]),
+            "",
+            "discarded",
+        )
+
+    load_count = 0
+    original_load = label_app._load_label_history_unlocked
+
+    def counted_load_label_history():
+        nonlocal load_count
+        load_count += 1
+        return original_load()
+
+    monkeypatch.setattr(label_app, "_load_label_history_unlocked", counted_load_label_history)
+
+    response = client.get("/api/queue?source=video&limit=10")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["folders"] == []
+    assert payload["total_unlabeled"] == 0
+    assert load_count == 1
+
+
 def test_queue_dedupes_duplicate_frame_signatures(client, fake_drive):
     fake_drive._add_folder("video-triplet-copy", "ipc3_table-4_t0001_copy", "video-unlabeled")
     fake_drive.update_file_metadata(
