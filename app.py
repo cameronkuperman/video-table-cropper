@@ -118,6 +118,12 @@ def _frames_from_client_payload(raw_frames: dict[str, Any]) -> dict[str, str | N
     }
 
 
+def _frame_ids_belong_to_files(frames: dict[str, str | None], files: list[dict[str, Any]]) -> bool:
+    file_ids = {str(file.get("id") or "") for file in files}
+    frame_ids = [str(file_id) for file_id in frames.values() if file_id]
+    return bool(frame_ids) and all(file_id in file_ids for file_id in frame_ids)
+
+
 def _ordered_frame_keys(frames: dict[str, Any]) -> list[str]:
     """Return present frame_N keys sorted by N. Use this everywhere that
     iterates a frames dict so the order is deterministic regardless of N."""
@@ -4827,6 +4833,14 @@ def _hydrate_folder(client: DriveClient, context: QueueContext, folder: dict[str
 
     frames = _frame_payload_from_folder(folder)
     if has_complete_frame_ids(frames):
+        if files is None:
+            files = client.list_files(folder["id"])
+        if not _frame_ids_belong_to_files(frames, files):
+            frames = _frame_payload_from_files(files)
+            if not has_complete_frame_ids(frames):
+                return None
+            if context.persist_frame_metadata:
+                _persist_folder_frame_metadata(client, folder, frames)
         return _build_folder_payload(folder, context, frames)
 
     if files is None:

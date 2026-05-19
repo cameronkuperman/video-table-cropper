@@ -235,10 +235,24 @@ class FakeDriveClient:
             self._copy(child_id)
             for child_id in self.children.get(parent_id, [])
             if self.items[child_id].get("mimeType") == label_app.FOLDER_MIME
+            and not self.items[child_id].get("trashed")
         ]
 
     def list_files(self, folder_id: str, fields: str = "") -> list[dict]:
-        return [self._copy(child_id) for child_id in self.children.get(folder_id, [])]
+        return [
+            self._copy(child_id)
+            for child_id in self.children.get(folder_id, [])
+            if not self.items[child_id].get("trashed")
+        ]
+
+    def find_files_by_name(self, folder_id: str, file_name: str, mime_type: str | None = None) -> list[dict]:
+        return [
+            self._copy(child_id)
+            for child_id in self.children.get(folder_id, [])
+            if self.items[child_id]["name"] == file_name
+            and not self.items[child_id].get("trashed")
+            and (mime_type is None or self.items[child_id].get("mimeType") == mime_type)
+        ]
 
     def get_file(self, file_id: str, fields: str = "") -> dict:
         return self._copy(file_id)
@@ -269,6 +283,12 @@ class FakeDriveClient:
         self.trashed.append(file_id)
         return self._copy(file_id)
 
+    def _trash_duplicate_named_files(self, parent_id: str, file_name: str, keep_file_id: str) -> None:
+        for item in self.find_files_by_name(parent_id, file_name):
+            item_id = str(item.get("id") or "")
+            if item_id and item_id != keep_file_id:
+                self.trash_file(item_id)
+
     def download_file_to_path(self, file_id: str, output_path: Path) -> Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(self.items[file_id].get("content", b"fake-image"))
@@ -288,10 +308,12 @@ class FakeDriveClient:
         if existing:
             self.items[existing["id"]]["mimeType"] = mime_type
             self.items[existing["id"]]["content"] = data
+            self._trash_duplicate_named_files(parent_id, file_name, existing["id"])
             return self._copy(existing["id"])
 
         item_id = f"{parent_id}:{file_name}"
         self._add_file(item_id, file_name, parent_id, mime_type=mime_type, content=data)
+        self._trash_duplicate_named_files(parent_id, file_name, item_id)
         return self._copy(item_id)
 
     def upload_or_update_file(
@@ -927,6 +949,58 @@ def test_queue_prefers_cached_folders_when_available(client):
     assert payload["folders"][0]["frame_signature"] == "video-frame0|video-frame1|video-frame2"
     assert payload["folders"][0]["thumb_urls"]["frame_0"].startswith("/api/thumb/")
     assert payload["folders"][0]["preview_urls"]["frame_0"].startswith("/api/preview/")
+
+
+def test_queue_ignores_stale_frame_metadata_from_another_folder(client, fake_drive):
+    fake_drive._add_folder("video-triplet-stale-meta", "ipc3_table-4_t0002", "video-unlabeled")
+    fake_drive._add_triplet_files("video-triplet-stale-meta", "fresh-video")
+    fake_drive.update_file_metadata(
+        "video-triplet-stale-meta",
+        {
+            "appProperties": label_app.build_folder_app_properties(
+                {
+                    "frame_0": "video-frame0",
+                    "frame_1": "video-frame1",
+                    "frame_2": "video-frame2",
+                }
+            )
+        },
+    )
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    stale_folder = next(
+        folder
+        for folder in payload["folders"]
+        if folder["folder_id"] == "video-triplet-stale-meta"
+    )
+    assert stale_folder["frames"] == {
+        "frame_0": "fresh-video-frame0",
+        "frame_1": "fresh-video-frame1",
+        "frame_2": "fresh-video-frame2",
+    }
+    assert stale_folder["frame_signature"] == "fresh-video-frame0|fresh-video-frame1|fresh-video-frame2"
+    assert fake_drive.items["video-triplet-stale-meta"]["appProperties"]["autolabel_frame_0_id"] == "fresh-video-frame0"
+
+
+def test_drive_upsert_trashes_duplicate_same_name_siblings(fake_drive, tmp_path):
+    folder_id = fake_drive.ensure_subfolder("video-unlabeled", "dupe-output")
+    fake_drive._add_file("dupe-frame-old-a", "frame_0.jpg", folder_id, content=b"old-a")
+    fake_drive._add_file("dupe-frame-old-b", "frame_0.jpg", folder_id, content=b"old-b")
+    replacement = tmp_path / "frame_0.jpg"
+    replacement.write_bytes(b"replacement")
+
+    uploaded = fake_drive.upload_or_update_file(replacement, folder_id, file_name="frame_0.jpg")
+    remaining = fake_drive.find_files_by_name(folder_id, "frame_0.jpg")
+
+    assert uploaded["id"] == "dupe-frame-old-a"
+    assert [item["id"] for item in remaining] == ["dupe-frame-old-a"]
+    assert fake_drive.items["dupe-frame-old-a"]["content"] == b"replacement"
+    assert fake_drive.items["dupe-frame-old-b"]["trashed"] is True
 
 
 def test_queue_filters_history_hidden_folders_with_one_history_read(client, fake_drive, monkeypatch):

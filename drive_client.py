@@ -109,7 +109,7 @@ class DriveClient:
         return reasons
 
     @classmethod
-    def _is_retryable_exception(exc: Exception) -> bool:
+    def _is_retryable_exception(cls, exc: Exception) -> bool:
         if isinstance(exc, HttpError):
             status = getattr(getattr(exc, "resp", None), "status", None)
             if status == 403:
@@ -249,6 +249,12 @@ class DriveClient:
     def find_file_by_name(
         self, folder_id: str, file_name: str, mime_type: str | None = None
     ) -> dict[str, Any] | None:
+        files = self.find_files_by_name(folder_id, file_name, mime_type=mime_type)
+        return files[0] if files else None
+
+    def find_files_by_name(
+        self, folder_id: str, file_name: str, mime_type: str | None = None
+    ) -> list[dict[str, Any]]:
         escaped_folder = self._escape_query_value(folder_id)
         escaped_name = self._escape_query_value(file_name)
         query = f"'{escaped_folder}' in parents and name='{escaped_name}' and trashed=false"
@@ -256,8 +262,13 @@ class DriveClient:
             escaped_mime = self._escape_query_value(mime_type)
             query += f" and mimeType='{escaped_mime}'"
 
-        files = self._list_files(query)
-        return files[0] if files else None
+        return self._list_files(query, fields="id,name,mimeType,parents,modifiedTime")
+
+    def _trash_duplicate_named_files(self, parent_id: str, file_name: str, keep_file_id: str) -> None:
+        for item in self.find_files_by_name(parent_id, file_name):
+            item_id = str(item.get("id") or "")
+            if item_id and item_id != keep_file_id:
+                self.trash_file(item_id)
 
     def download_file_content(self, file_id: str) -> bytes:
         def _download_once() -> bytes:
@@ -445,8 +456,12 @@ class DriveClient:
     ) -> dict[str, Any]:
         existing = self.find_file_by_name(parent_id, file_name)
         if existing:
-            return self.update_bytes(existing["id"], data, file_name=file_name, mime_type=mime_type)
-        return self.upload_bytes(data, parent_id=parent_id, file_name=file_name, mime_type=mime_type)
+            updated = self.update_bytes(existing["id"], data, file_name=file_name, mime_type=mime_type)
+            self._trash_duplicate_named_files(parent_id, file_name, str(updated["id"]))
+            return updated
+        uploaded = self.upload_bytes(data, parent_id=parent_id, file_name=file_name, mime_type=mime_type)
+        self._trash_duplicate_named_files(parent_id, file_name, str(uploaded["id"]))
+        return uploaded
 
     def upload_or_update_file(
         self,
@@ -458,8 +473,12 @@ class DriveClient:
         target_name = file_name or local_path.name
         existing = self.find_file_by_name(parent_id, target_name)
         if existing:
-            return self.update_file(existing["id"], local_path, file_name=target_name, mime_type=mime_type)
-        return self.upload_file(local_path, parent_id=parent_id, file_name=target_name, mime_type=mime_type)
+            updated = self.update_file(existing["id"], local_path, file_name=target_name, mime_type=mime_type)
+            self._trash_duplicate_named_files(parent_id, target_name, str(updated["id"]))
+            return updated
+        uploaded = self.upload_file(local_path, parent_id=parent_id, file_name=target_name, mime_type=mime_type)
+        self._trash_duplicate_named_files(parent_id, target_name, str(uploaded["id"]))
+        return uploaded
 
     def update_file_metadata(
         self,
