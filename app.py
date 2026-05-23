@@ -1166,6 +1166,32 @@ def _folder_matches_review_source(folder_name: str, context: QueueContext, bucke
     return not prefix or folder_name.startswith(f"{prefix}-")
 
 
+def _review_folder_matches_context(context: QueueContext, folder_name: str, app_properties: dict[str, Any], bucket: str) -> bool:
+    if bucket not in LABEL_DESTINATIONS:
+        return True
+    if not _folder_matches_review_source(folder_name, context, bucket):
+        return False
+
+    queue_key = str(app_properties.get("autolabel_queue_key") or "").strip()
+    if queue_key:
+        return queue_key == context.queue_key
+
+    source = str(app_properties.get("autolabel_source") or "").strip()
+    if source and source != context.source:
+        return False
+
+    site_key = str(app_properties.get("autolabel_site_key") or "").strip()
+    if site_key and site_key != (context.site_key or ""):
+        return False
+
+    is_reolink_name = "Reolink-" in folder_name
+    if context.source == REOLINK_SOURCE:
+        return is_reolink_name
+    if context.source == VIDEO_SOURCE:
+        return not is_reolink_name
+    return True
+
+
 def _review_channel_hint(folder_name: str, metadata: dict[str, Any] | None = None) -> str:
     for value in _camera_id_candidates(folder_name, metadata):
         channel = _extract_reolink_channel_code(value)
@@ -1278,9 +1304,12 @@ def _review_list_folders(
     context: QueueContext,
     buckets: list[str],
     filters: dict[str, str],
-) -> list[dict[str, Any]]:
+    *,
+    limit: int,
+    cursor: int = 0,
+) -> tuple[list[dict[str, Any]], int | None, int]:
     parent_ids = _review_bucket_parent_ids(context, buckets)
-    results: list[dict[str, Any]] = []
+    candidates: list[tuple[str, str, dict[str, Any]]] = []
     seen_folder_ids: set[str] = set()
     for bucket, parent_id in parent_ids.items():
         for folder in client.list_folders(parent_id, fields="id,name,mimeType,parents,appProperties,modifiedTime"):
@@ -1288,15 +1317,30 @@ def _review_list_folders(
             folder_name = str(folder.get("name") or "")
             if not folder_id or folder_id in seen_folder_ids:
                 continue
-            if not _folder_matches_review_source(folder_name, context, bucket):
+            app_properties = dict(folder.get("appProperties") or {})
+            if not _review_folder_matches_context(context, folder_name, app_properties, bucket):
                 continue
             seen_folder_ids.add(folder_id)
-            payload = _review_payload_for_folder(client, context, folder, bucket, parent_id)
-            if payload is None:
-                continue
-            if _review_payload_matches_filters(payload, filters):
-                results.append(payload)
-    return sorted(results, key=lambda item: str(item.get("modified_time") or ""), reverse=True)
+            candidates.append((bucket, parent_id, folder))
+
+    candidates.sort(key=lambda item: str(item[2].get("modifiedTime") or ""), reverse=True)
+
+    results: list[dict[str, Any]] = []
+    next_cursor: int | None = None
+    index = max(0, cursor)
+    while index < len(candidates):
+        bucket, parent_id, folder = candidates[index]
+        index += 1
+        payload = _review_payload_for_folder(client, context, folder, bucket, parent_id)
+        if payload is None:
+            continue
+        if _review_payload_matches_filters(payload, filters):
+            results.append(payload)
+        if len(results) >= limit:
+            next_cursor = index if index < len(candidates) else None
+            break
+
+    return results, next_cursor, len(candidates)
 
 
 def _review_allowed_parent_ids(context: QueueContext) -> set[str]:
@@ -1308,10 +1352,22 @@ def _review_current_parent(current: dict[str, Any]) -> str | None:
     return parents[0] if parents else None
 
 
+def _review_bucket_for_parent(context: QueueContext, parent_id: str) -> str | None:
+    for bucket, bucket_parent_id in _review_bucket_parent_ids(context, list(REVIEW_BUCKETS)).items():
+        if bucket_parent_id == parent_id:
+            return bucket
+    return None
+
+
 def _review_validate_folder_parent(context: QueueContext, current: dict[str, Any]) -> str:
     parent_id = _review_current_parent(current)
     if not parent_id or parent_id not in _review_allowed_parent_ids(context):
         raise ValueError("folder is not in a reviewable Drive bucket")
+    bucket = _review_bucket_for_parent(context, parent_id)
+    folder_name = str(current.get("name") or "")
+    app_properties = dict(current.get("appProperties") or {})
+    if not bucket or not _review_folder_matches_context(context, folder_name, app_properties, bucket):
+        raise ValueError("folder does not belong to the selected review source")
     return parent_id
 
 
@@ -6379,14 +6435,20 @@ def api_review_folders():
             "frame_count": str(request.args.get("frame_count") or "").strip(),
             "folder_source_type": str(request.args.get("folder_source_type") or "").strip(),
         }
-        folders = _review_list_folders(client, context, buckets, filters)
-        page = folders[cursor:cursor + limit]
-        next_cursor = cursor + limit if cursor + limit < len(folders) else None
+        page, next_cursor, candidate_total = _review_list_folders(
+            client,
+            context,
+            buckets,
+            filters,
+            limit=limit,
+            cursor=cursor,
+        )
         return jsonify(
             {
                 "folders": page,
                 "next_cursor": next_cursor,
-                "total": len(folders),
+                "total": candidate_total,
+                "total_is_candidate_count": True,
                 "source_context": context.to_payload(),
                 "buckets": buckets,
             }
@@ -6503,11 +6565,13 @@ def api_review_compare():
             if len(bit) >= 3
         ]
 
-        candidates = _review_list_folders(
+        candidates, _next_cursor, _candidate_total = _review_list_folders(
             client,
             context,
             list(REVIEW_LEGACY_DEFAULT_BUCKETS),
             {"q": "", "channel": "", "table": "", "frame_count": "", "folder_source_type": ""},
+            limit=120,
+            cursor=0,
         )
         scored: list[tuple[int, dict[str, Any]]] = []
         for candidate in candidates:
