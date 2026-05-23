@@ -79,6 +79,7 @@ class FakeDriveClient:
         self.created_subfolders: list[tuple[str, str, str]] = []
         self.moves: list[tuple[str, str, str | None]] = []
         self.trashed: list[str] = []
+        self.permanent_deleted: list[str] = []
         self._seed()
 
     def _seed(self) -> None:
@@ -282,6 +283,10 @@ class FakeDriveClient:
         self.items[file_id]["trashed"] = True
         self.trashed.append(file_id)
         return self._copy(file_id)
+
+    def delete_file(self, file_id: str) -> None:
+        self.permanent_deleted.append(file_id)
+        self.items.pop(file_id, None)
 
     def _trash_duplicate_named_files(self, parent_id: str, file_name: str, keep_file_id: str) -> None:
         for item in self.find_files_by_name(parent_id, file_name):
@@ -949,6 +954,94 @@ def test_queue_prefers_cached_folders_when_available(client):
     assert payload["folders"][0]["frame_signature"] == "video-frame0|video-frame1|video-frame2"
     assert payload["folders"][0]["thumb_urls"]["frame_0"].startswith("/api/thumb/")
     assert payload["folders"][0]["preview_urls"]["frame_0"].startswith("/api/preview/")
+
+
+def test_review_folders_lists_labeled_and_legacy_buckets(client, fake_drive):
+    fake_drive._add_folder("review-clean", "mimosas-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-clean", "review-clean", include_metadata=True)
+    fake_drive._add_folder("review-dirty", "mimosas-Reolink-CH-CH04_table_top_2_t0004", "video-dirty")
+    fake_drive._add_triplet_files("review-dirty", "review-dirty")
+    fake_drive._add_folder("review-matthews-clean", "matthews-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-matthews-clean", "review-matthews-clean")
+
+    response = client.get(
+        "/api/review/folders?source=reolink&site=restaurant-pi-1"
+        "&mode=labeled&bucket=clean,dirty,occupied&limit=20"
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    names = {folder["folder_name"] for folder in payload["folders"]}
+    assert "mimosas-Reolink-CH-CH03_table_top_1_t0002" in names
+    assert "mimosas-Reolink-CH-CH04_table_top_2_t0004" in names
+    assert "matthews-Reolink-CH-CH03_table_top_1_t0002" not in names
+    clean_folder = next(folder for folder in payload["folders"] if folder["folder_id"] == "review-clean")
+    assert clean_folder["bucket"] == "clean"
+    assert clean_folder["current_label"] == "clean"
+    assert clean_folder["channel_hint"] == "CH-CH03"
+    assert clean_folder["table_hint"] == "table_top_1"
+    assert clean_folder["frame_count"] == 3
+
+
+def test_review_folders_filters_by_channel_table_and_frame_count(client, fake_drive):
+    fake_drive._add_folder("review-filter-match", "mimosas-Reolink-CH-CH03_table_top_2_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-filter-match", "review-filter-match")
+    fake_drive._add_folder("review-filter-miss", "mimosas-Reolink-CH-CH04_table_top_1_t0004", "video-clean")
+    fake_drive._add_triplet_files("review-filter-miss", "review-filter-miss")
+
+    response = client.get(
+        "/api/review/folders?source=reolink&site=restaurant-pi-1&mode=labeled"
+        "&bucket=clean&channel=CH-CH03&table=table_top_2&frame_count=3"
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert [folder["folder_id"] for folder in payload["folders"]] == ["review-filter-match"]
+
+
+def test_review_relabel_moves_between_labeled_buckets(client, fake_drive):
+    fake_drive._add_folder("review-relabel", "mimosas-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-relabel", "review-relabel")
+
+    response = client.post(
+        "/api/review/relabel",
+        json={
+            "source": "reolink",
+            "site_key": "restaurant-pi-1",
+            "folder_ids": ["review-relabel"],
+            "target_label": "dirty",
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_drive.items["review-relabel"]["parents"] == ["video-dirty"]
+    assert fake_drive.items["review-relabel"]["appProperties"]["autolabel_final_label"] == "dirty"
+    assert ("review-relabel", "video-dirty", "video-clean") in fake_drive.moves
+
+
+def test_review_trash_soft_trashes_selected_folders(client, fake_drive):
+    fake_drive._add_folder("review-trash", "mimosas-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-trash", "review-trash")
+
+    response = client.post(
+        "/api/review/trash",
+        json={
+            "source": "reolink",
+            "site_key": "restaurant-pi-1",
+            "folder_ids": ["review-trash"],
+            "confirm": "TRASH",
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_drive.items["review-trash"]["trashed"] is True
+    assert fake_drive.trashed == ["review-trash"]
+    assert fake_drive.permanent_deleted == []
+
+
+def test_review_pages_render(client):
+    assert client.get("/cleanup/legacy").status_code == 200
+    assert client.get("/review/labeled").status_code == 200
 
 
 def test_queue_ignores_stale_frame_metadata_from_another_folder(client, fake_drive):

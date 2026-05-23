@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="csrf-token" content="{{ csrf_token }}" />
+<meta name="review-mode" content="{{ review_mode }}" />
+<title>{{ page_title }}</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f1115;
+    color: #eef2f6;
+  }
+  button, input, select { font: inherit; }
+  button {
+    border: 0;
+    border-radius: 8px;
+    padding: 9px 12px;
+    background: #2d5fff;
+    color: #fff;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  button.secondary { background: #242a33; color: #d9e0e8; }
+  button.danger { background: #8c2734; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  a { color: #8fc5ff; }
+  .shell {
+    width: min(1480px, calc(100vw - 32px));
+    margin: 0 auto;
+    padding: 22px 0 34px;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  h1 { font-size: 1.25rem; margin: 0 0 5px; }
+  .muted { color: #98a2af; font-size: 0.86rem; }
+  .toolbar {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(120px, 1fr));
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid #29313c;
+    border-radius: 8px;
+    background: #171b22;
+    margin-bottom: 14px;
+  }
+  label {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    color: #9ea8b5;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  input, select {
+    width: 100%;
+    min-height: 38px;
+    border: 1px solid #303946;
+    border-radius: 8px;
+    background: #0f1319;
+    color: #eef2f6;
+    padding: 8px 10px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: flex-end;
+  }
+  .status {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    min-height: 28px;
+    margin-bottom: 12px;
+    color: #a8b2bf;
+    font-size: 0.86rem;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    border: 1px solid #29313c;
+    border-radius: 8px;
+    background: #161a21;
+    overflow: hidden;
+  }
+  .card.selected { border-color: #5c8dff; }
+  .card-head {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 9px;
+    padding: 10px;
+    border-bottom: 1px solid #262e39;
+  }
+  .folder-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.78rem;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 6px;
+  }
+  .chip {
+    border: 1px solid #303946;
+    border-radius: 999px;
+    color: #aeb8c5;
+    padding: 3px 7px;
+    font-size: 0.72rem;
+  }
+  .frames {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    padding: 8px;
+  }
+  .frame {
+    aspect-ratio: 4 / 3;
+    background: #0d1015;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .card-actions {
+    display: flex;
+    gap: 7px;
+    padding: 0 8px 9px;
+  }
+  .card-actions button { flex: 1; padding: 8px; font-size: 0.82rem; }
+  .compare {
+    display: none;
+    border-top: 1px solid #262e39;
+    padding: 9px;
+  }
+  .compare.open { display: block; }
+  .compare-row {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    gap: 8px;
+    align-items: center;
+    margin-top: 7px;
+  }
+  .compare-row img {
+    width: 76px;
+    aspect-ratio: 4 / 3;
+    object-fit: contain;
+    background: #0d1015;
+    border-radius: 5px;
+  }
+  @media (max-width: 920px) {
+    .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    header { align-items: flex-start; flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <h1>{{ page_title }}</h1>
+        <div class="muted" id="page-subtitle"></div>
+      </div>
+      <div class="actions">
+        <a href="/">Label Queue</a>
+        <a href="/crop-editor">Crop Editor</a>
+      </div>
+    </header>
+
+    <section class="toolbar">
+      <label>Source
+        <select id="source"></select>
+      </label>
+      <label>Site
+        <select id="site"></select>
+      </label>
+      <label>Bucket
+        <select id="bucket" multiple size="5"></select>
+      </label>
+      <label>Type
+        <select id="folder-source-type">
+          <option value="">All</option>
+          <option value="legacy">Legacy</option>
+          <option value="screenrecord">ScreenRecord</option>
+          <option value="generated">Generated</option>
+          <option value="labeled">Labeled</option>
+        </select>
+      </label>
+      <label>Channel
+        <input id="channel" placeholder="CH-CH03 or IPC4" />
+      </label>
+      <label>Table
+        <input id="table" placeholder="table_top_1" />
+      </label>
+      <label>Search
+        <input id="query" placeholder="folder text" />
+      </label>
+      <label>Frames
+        <input id="frame-count" inputmode="numeric" placeholder="3 or 10" />
+      </label>
+      <div class="actions">
+        <button id="load">Load</button>
+        <button id="select-visible" class="secondary">Select Visible</button>
+        <button id="clear-selection" class="secondary">Clear</button>
+        <select id="target-label">
+          <option value="clean">clean</option>
+          <option value="dirty">dirty</option>
+          <option value="occupied">occupied</option>
+          <option value="label_later">label_later</option>
+          <option value="discarded">discarded</option>
+        </select>
+        <button id="relabel-selected" class="secondary">Relabel</button>
+        <button id="trash-selected" class="danger">Trash</button>
+      </div>
+    </section>
+
+    <div class="status">
+      <span id="status">Idle</span>
+      <span id="selection-status">0 selected</span>
+    </div>
+    <section id="grid" class="grid"></section>
+    <div class="actions" style="justify-content:center;margin-top:16px;">
+      <button id="load-more" class="secondary" disabled>Load More</button>
+    </div>
+  </main>
+  <script src="/static/review.js"></script>
+</body>
+</html>

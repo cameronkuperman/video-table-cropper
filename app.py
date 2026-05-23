@@ -1113,6 +1113,218 @@ def _request_json_payload() -> dict[str, Any]:
     return data
 
 
+REVIEW_UNLABELED_BUCKET = "unlabeled"
+REVIEW_SCREENRECORD_BUCKET = "screenrecord_3frame_unlabeled"
+REVIEW_BUCKETS = (REVIEW_UNLABELED_BUCKET, REVIEW_SCREENRECORD_BUCKET, *LABEL_DESTINATIONS)
+REVIEW_LABELED_DEFAULT_BUCKETS = ("clean", "dirty", "occupied")
+REVIEW_LEGACY_DEFAULT_BUCKETS = (
+    REVIEW_UNLABELED_BUCKET,
+    REVIEW_SCREENRECORD_BUCKET,
+    "clean",
+    "dirty",
+    "occupied",
+)
+
+
+def _parse_csv_arg(name: str, default: tuple[str, ...] = ()) -> list[str]:
+    values: list[str] = []
+    for raw in request.args.getlist(name):
+        for part in str(raw).split(","):
+            value = part.strip()
+            if value:
+                values.append(value)
+    return values or list(default)
+
+
+def _review_bucket_parent_ids(context: QueueContext, buckets: list[str]) -> dict[str, str]:
+    parent_ids: dict[str, str] = {}
+    for bucket in buckets:
+        if bucket == REVIEW_UNLABELED_BUCKET:
+            parent_ids[bucket] = context.input_folder_id
+        elif bucket == REVIEW_SCREENRECORD_BUCKET:
+            screenrecord_id = context.folder_ids.get(SCREENRECORD_THREE_FRAME_UNLABELED_KEY)
+            if screenrecord_id:
+                parent_ids[bucket] = screenrecord_id
+        elif bucket in LABEL_DESTINATIONS:
+            parent_ids[bucket] = context.folder_ids[bucket]
+        else:
+            raise ValueError(f"Unknown review bucket: {bucket}")
+    return parent_ids
+
+
+def _review_source_prefix(context: QueueContext) -> str:
+    try:
+        return _resolve_label_source(context.source, context.site_key).folder_prefix
+    except ValueError:
+        return ""
+
+
+def _folder_matches_review_source(folder_name: str, context: QueueContext, bucket: str) -> bool:
+    if bucket not in LABEL_DESTINATIONS:
+        return True
+    prefix = _review_source_prefix(context)
+    return not prefix or folder_name.startswith(f"{prefix}-")
+
+
+def _review_channel_hint(folder_name: str, metadata: dict[str, Any] | None = None) -> str:
+    for value in _camera_id_candidates(folder_name, metadata):
+        channel = _extract_reolink_channel_code(value)
+        if channel:
+            return channel
+        ipc = re.search(r"IPC[\s_-]*(\d+)", value, re.IGNORECASE)
+        if ipc:
+            return f"IPC{int(ipc.group(1))}"
+    return ""
+
+
+def _review_table_hint(folder_name: str, metadata: dict[str, Any] | None = None) -> str:
+    if isinstance(metadata, dict):
+        table = metadata.get("table")
+        if isinstance(table, dict):
+            for key in ("label", "id", "table_id"):
+                value = str(table.get(key) or "").strip()
+                if value:
+                    return value
+        for key in ("table_label", "supabase_table_id", "table_camera_crops_id"):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value
+    base, _suffix = _split_triplet_suffix(folder_name)
+    match = re.search(r"_(table[^_]*(?:_[^_]+)*)$", base, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _review_source_type(
+    context: QueueContext,
+    bucket: str,
+    parent_id: str,
+    folder_name: str,
+    payload: dict[str, Any],
+) -> str:
+    screenrecord_id = context.folder_ids.get(SCREENRECORD_THREE_FRAME_UNLABELED_KEY)
+    if (
+        bucket == REVIEW_SCREENRECORD_BUCKET
+        or (screenrecord_id and parent_id == screenrecord_id)
+        or payload.get("source_label") == SCREENRECORD_TRUE_TEN_FOLDER_NAME
+        or payload.get("perception_file_name") == PERCEPTION_V2_FILE_NAME
+    ):
+        return "screenrecord"
+    if bucket in LABEL_DESTINATIONS:
+        return "labeled"
+    if context.source == REOLINK_SOURCE and "Reolink-" in folder_name:
+        return "legacy"
+    return "generated"
+
+
+def _review_payload_for_folder(
+    client: DriveClient,
+    context: QueueContext,
+    folder: dict[str, Any],
+    bucket: str,
+    parent_id: str,
+) -> dict[str, Any] | None:
+    payload = _hydrate_folder(client, context, folder)
+    if payload is None:
+        return None
+    files = client.list_files(str(folder["id"]))
+    files_by_name = _file_by_name(files)
+    metadata = _load_json_file_from_drive(client, files_by_name.get("metadata.json"))
+    folder_name = str(payload.get("folder_name") or folder.get("name") or "")
+    frame_count = len(_ordered_frame_keys(payload.get("frames") or {}))
+    source_type = _review_source_type(context, bucket, parent_id, folder_name, payload)
+    payload.update(
+        {
+            "bucket": bucket,
+            "current_label": bucket if bucket in LABEL_DESTINATIONS else None,
+            "review_source_type": source_type,
+            "channel_hint": _review_channel_hint(folder_name, metadata),
+            "table_hint": _review_table_hint(folder_name, metadata),
+            "frame_count": frame_count,
+            "modified_time": folder.get("modifiedTime"),
+            "metadata_file_id": payload.get("metadata_file_id") or (files_by_name.get("metadata.json") or {}).get("id"),
+        }
+    )
+    return payload
+
+
+def _review_payload_matches_filters(payload: dict[str, Any], filters: dict[str, str]) -> bool:
+    folder_name = str(payload.get("folder_name") or "").lower()
+    q = filters.get("q", "").lower()
+    if q and q not in folder_name:
+        return False
+    channel = filters.get("channel", "").lower()
+    if channel and channel not in str(payload.get("channel_hint") or "").lower() and channel not in folder_name:
+        return False
+    table = filters.get("table", "").lower()
+    if table and table not in str(payload.get("table_hint") or "").lower() and table not in folder_name:
+        return False
+    source_type = filters.get("folder_source_type", "").lower()
+    if source_type and source_type not in {"all", str(payload.get("review_source_type") or "").lower()}:
+        return False
+    frame_count = filters.get("frame_count", "")
+    if frame_count:
+        try:
+            if int(frame_count) != int(payload.get("frame_count") or 0):
+                return False
+        except ValueError:
+            raise ValueError("frame_count must be an integer")
+    return True
+
+
+def _review_list_folders(
+    client: DriveClient,
+    context: QueueContext,
+    buckets: list[str],
+    filters: dict[str, str],
+) -> list[dict[str, Any]]:
+    parent_ids = _review_bucket_parent_ids(context, buckets)
+    results: list[dict[str, Any]] = []
+    seen_folder_ids: set[str] = set()
+    for bucket, parent_id in parent_ids.items():
+        for folder in client.list_folders(parent_id, fields="id,name,mimeType,parents,appProperties,modifiedTime"):
+            folder_id = str(folder.get("id") or "")
+            folder_name = str(folder.get("name") or "")
+            if not folder_id or folder_id in seen_folder_ids:
+                continue
+            if not _folder_matches_review_source(folder_name, context, bucket):
+                continue
+            seen_folder_ids.add(folder_id)
+            payload = _review_payload_for_folder(client, context, folder, bucket, parent_id)
+            if payload is None:
+                continue
+            if _review_payload_matches_filters(payload, filters):
+                results.append(payload)
+    return sorted(results, key=lambda item: str(item.get("modified_time") or ""), reverse=True)
+
+
+def _review_allowed_parent_ids(context: QueueContext) -> set[str]:
+    return set(_review_bucket_parent_ids(context, list(REVIEW_BUCKETS)).values())
+
+
+def _review_current_parent(current: dict[str, Any]) -> str | None:
+    parents = [str(parent) for parent in current.get("parents", []) if parent]
+    return parents[0] if parents else None
+
+
+def _review_validate_folder_parent(context: QueueContext, current: dict[str, Any]) -> str:
+    parent_id = _review_current_parent(current)
+    if not parent_id or parent_id not in _review_allowed_parent_ids(context):
+        raise ValueError("folder is not in a reviewable Drive bucket")
+    return parent_id
+
+
+def _review_signature_for_current_folder(client: DriveClient, folder_id: str) -> tuple[str, dict[str, str | None], str]:
+    current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+    frames = _frame_payload_from_folder(current)
+    if not has_complete_frame_ids(frames):
+        frames = _frame_payload_from_files(client.list_files(folder_id))
+    frame_signature = _frame_signature_from_frames(frames) if has_complete_frame_ids(frames) else ""
+    folder_name = str(current.get("name") or "")
+    return folder_name, frames, frame_signature
+
+
 def _log_label_route_error(
     error: object,
     *,
@@ -5858,6 +6070,24 @@ def index():
     return render_template("label.html")
 
 
+@app.route("/cleanup/legacy")
+def legacy_cleanup():
+    return render_template(
+        "review.html",
+        review_mode="legacy",
+        page_title="Legacy Cleanup",
+    )
+
+
+@app.route("/review/labeled")
+def labeled_review():
+    return render_template(
+        "review.html",
+        review_mode="labeled",
+        page_title="Labeled Review",
+    )
+
+
 @app.route("/crop-editor")
 def crop_editor():
     site_key = request.args.get("site", MATTHEWS_SITE_KEY)
@@ -6128,6 +6358,175 @@ def api_folder_frames(folder_id: str):
             frames = _frame_payload_from_files(client.list_files(folder_id))
         return jsonify(frames)
     except DriveClientError as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/review/folders")
+def api_review_folders():
+    try:
+        client = get_client()
+        source, site_key = _request_source_args()
+        context = _resolve_queue_context(client, source, site_key)
+        mode = str(request.args.get("mode") or "labeled").strip().lower()
+        default_buckets = REVIEW_LEGACY_DEFAULT_BUCKETS if mode == "legacy" else REVIEW_LABELED_DEFAULT_BUCKETS
+        buckets = _parse_csv_arg("bucket", default_buckets)
+        limit = max(1, min(120, int(request.args.get("limit", "30") or "30")))
+        cursor = max(0, int(request.args.get("cursor", "0") or "0"))
+        filters = {
+            "q": str(request.args.get("q") or "").strip(),
+            "channel": str(request.args.get("channel") or "").strip(),
+            "table": str(request.args.get("table") or "").strip(),
+            "frame_count": str(request.args.get("frame_count") or "").strip(),
+            "folder_source_type": str(request.args.get("folder_source_type") or "").strip(),
+        }
+        folders = _review_list_folders(client, context, buckets, filters)
+        page = folders[cursor:cursor + limit]
+        next_cursor = cursor + limit if cursor + limit < len(folders) else None
+        return jsonify(
+            {
+                "folders": page,
+                "next_cursor": next_cursor,
+                "total": len(folders),
+                "source_context": context.to_payload(),
+                "buckets": buckets,
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/review/relabel", methods=["POST"])
+def api_review_relabel():
+    try:
+        data = _request_json_payload()
+        source, site_key = _payload_source_args(data)
+        target_label = str(data.get("target_label") or data.get("label") or "").strip().lower()
+        folder_ids = [str(item).strip() for item in (data.get("folder_ids") or []) if str(item).strip()]
+        if target_label not in LABEL_DESTINATIONS:
+            return jsonify({"error": f"target_label must be one of {', '.join(LABEL_DESTINATIONS)}"}), 400
+        if not folder_ids:
+            return jsonify({"error": "folder_ids required"}), 400
+        if len(folder_ids) > 200:
+            return jsonify({"error": "at most 200 folders can be relabeled at once"}), 400
+
+        client = get_client()
+        context = _resolve_queue_context(client, source, site_key)
+        destination_id = context.folder_ids[target_label]
+        results: list[dict[str, Any]] = []
+        for folder_id in folder_ids:
+            current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+            current_parent = _review_validate_folder_parent(context, current)
+            if current_parent != destination_id:
+                client.move_file(folder_id, new_parent_id=destination_id, remove_parent_id=current_parent)
+            label_metadata = dict(current.get("appProperties") or {})
+            label_metadata.update(_label_app_properties(target_label, context))
+            client.update_file_metadata(
+                folder_id,
+                {"appProperties": label_metadata},
+                fields="id,name,mimeType,parents,appProperties",
+            )
+            folder_name, frames, frame_signature = _review_signature_for_current_folder(client, folder_id)
+            content_signature = _content_signature_from_frames(frames) if has_complete_frame_ids(frames) else ""
+            _record_label_history(
+                context,
+                folder_id,
+                folder_name,
+                frame_signature,
+                target_label,
+                content_signature,
+            )
+            _clear_label_queue_caches(context, folder_id)
+            results.append({"folder_id": folder_id, "label": target_label, "moved": current_parent != destination_id})
+        return jsonify({"ok": True, "updated": len(results), "results": results, "source_context": context.to_payload()})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError, OSError, TypeError) as e:
+        return jsonify({"error": str(e), "code": "review_relabel_failed"}), 500
+
+
+@app.route("/api/review/trash", methods=["POST"])
+def api_review_trash():
+    try:
+        data = _request_json_payload()
+        source, site_key = _payload_source_args(data)
+        folder_ids = [str(item).strip() for item in (data.get("folder_ids") or []) if str(item).strip()]
+        confirm = str(data.get("confirm") or "").strip()
+        if confirm != "TRASH":
+            return jsonify({"error": "confirm must be TRASH"}), 400
+        if not folder_ids:
+            return jsonify({"error": "folder_ids required"}), 400
+        if len(folder_ids) > 200:
+            return jsonify({"error": "at most 200 folders can be trashed at once"}), 400
+
+        client = get_client()
+        context = _resolve_queue_context(client, source, site_key)
+        results: list[dict[str, Any]] = []
+        for folder_id in folder_ids:
+            current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+            _review_validate_folder_parent(context, current)
+            folder_name, frames, frame_signature = _review_signature_for_current_folder(client, folder_id)
+            content_signature = _content_signature_from_frames(frames) if has_complete_frame_ids(frames) else ""
+            client.trash_file(folder_id)
+            _remove_label_history(context, folder_id, folder_name, frame_signature, content_signature)
+            _clear_label_queue_caches(context, folder_id)
+            results.append({"folder_id": folder_id, "trashed": True})
+        return jsonify({"ok": True, "trashed": len(results), "results": results, "source_context": context.to_payload()})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError, OSError, TypeError) as e:
+        return jsonify({"error": str(e), "code": "review_trash_failed"}), 500
+
+
+@app.route("/api/review/compare")
+def api_review_compare():
+    try:
+        client = get_client()
+        source, site_key = _request_source_args()
+        context = _resolve_queue_context(client, source, site_key)
+        folder_id = str(request.args.get("folder_id") or "").strip()
+        if not folder_id:
+            return jsonify({"error": "folder_id required"}), 400
+
+        current = client.get_file(folder_id, fields="id,name,parents,appProperties,modifiedTime")
+        _review_validate_folder_parent(context, current)
+        current_parent = _review_current_parent(current) or ""
+        current_payload = _review_payload_for_folder(client, context, current, "current", current_parent)
+        if current_payload is None:
+            return jsonify({"matches": [], "folder": None})
+        channel = str(current_payload.get("channel_hint") or "").lower()
+        table = str(current_payload.get("table_hint") or "").lower()
+        name_bits = [
+            bit.lower()
+            for bit in re.split(r"[^A-Za-z0-9]+", str(current_payload.get("folder_name") or ""))
+            if len(bit) >= 3
+        ]
+
+        candidates = _review_list_folders(
+            client,
+            context,
+            list(REVIEW_LEGACY_DEFAULT_BUCKETS),
+            {"q": "", "channel": "", "table": "", "frame_count": "", "folder_source_type": ""},
+        )
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for candidate in candidates:
+            if candidate.get("folder_id") == folder_id:
+                continue
+            score = 0
+            candidate_name = str(candidate.get("folder_name") or "").lower()
+            if channel and channel == str(candidate.get("channel_hint") or "").lower():
+                score += 5
+            if table and table == str(candidate.get("table_hint") or "").lower():
+                score += 4
+            score += min(3, sum(1 for bit in name_bits if bit in candidate_name))
+            if score > 0:
+                scored.append((score, candidate))
+        scored.sort(key=lambda item: (item[0], str(item[1].get("modified_time") or "")), reverse=True)
+        return jsonify({"folder": current_payload, "matches": [item for _score, item in scored[:12]]})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError) as e:
         return jsonify({"error": str(e)}), 500
 
 
