@@ -182,7 +182,8 @@ async function loadFolders({ append = false } = {}) {
             state.selected.clear();
         }
         renderFolders(append);
-        el.status.textContent = `${data.total || 0} matching folders`;
+        const totalLabel = data.total_is_candidate_count ? 'candidate folders' : 'matching folders';
+        el.status.textContent = `${data.total || 0} ${totalLabel}`;
         el.loadMore.disabled = state.nextCursor == null;
     } catch (error) {
         el.status.textContent = error.message;
