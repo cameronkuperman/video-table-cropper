@@ -80,7 +80,7 @@ To build `perception.json` for one `(table × group)` you need:
    window. The build code must accept any N in `[2, 16]` so it scales.
 
 2. **For each frame: a list of person detections** from a YOLO segmentation
-   model (we use YOLOv8m-seg, class=`person`, confidence threshold 0.15).
+   model (default `yolo26x-seg.pt`, class=`person`, confidence threshold 0.15).
    Each detection includes:
    - A pixel-level boolean **mask** the size of the full frame.
    - A **bounding box** `[x1, y1, x2, y2]` in full-frame pixel coordinates.
@@ -546,7 +546,7 @@ reference implementation.
 | `TRACK_LOOKBACK` | 3 | K — frames considered as candidates in tracking |
 | `TRACK_MAX_DIST` | 0.2 | max normalized centroid distance per inter-frame gap |
 | `TRACK_IOU_BONUS` | 0.5 | weight added to track-match score for bbox IoU |
-| YOLO model | `yolov8m-seg.pt` | medium variant; nano/small are faster, less accurate |
+| YOLO model | `yolo26x-seg.pt` | configurable with `YOLO_MODEL_NAME`; smaller YOLO26 variants are faster |
 | YOLO confidence | 0.15 | per-detection minimum |
 | YOLO classes | `[0]` | person only |
 

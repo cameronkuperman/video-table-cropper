@@ -40,7 +40,7 @@ that 3 frames over 9 s couldn't capture.
 For each source group of N frames:
 
   Step 1 — Detection (full frame, per frame)
-    Run YOLOv8-seg on each full frame.
+    Run YOLO segmentation on each full frame.
     For every detected person, store: mask, bbox, centroid (normalized 0–1), confidence.
 
   Step 2 — Tracking (across N frames)
@@ -162,7 +162,7 @@ For each source group of N frames:
 | `overlap_frac_of_table` | What fraction of **the table area** they cover |
 | `distance_norm` | Centroid distance from table centroid, normalized by frame diagonal |
 | `displacement_from_prev` | How far they moved since the previous frame (normalized). `null` on first appearance. |
-| `score` | YOLOv8 detection confidence |
+| `score` | YOLO detection confidence |
 | `bbox_below_table_frac` | Fraction of the bbox vertical extent that lies below the table's bottom edge. **Strong sitting signal**: legs under the table. |
 | `bbox_aspect_ratio` | Bbox h/w. Standing ~2.5+, sitting ~1.0–1.5, leaning/bending ~0.5–1.0. |
 
@@ -314,9 +314,9 @@ To enable, install ultralytics:
 pip install ultralytics
 ```
 
-Then re-run `--process`. YOLOv8m-seg weights (~52 MB) auto-download on first
+Then re-run `--process`. The configured YOLO weights auto-download on first
 run. Smaller variants (`yolov8n-seg.pt`, `yolov8s-seg.pt`) are faster and less
-accurate; edit `load_yolo_model()` in `person_detector.py` to switch.
+accurate; set `YOLO_MODEL_NAME` to switch without editing code.
 
 ---
 

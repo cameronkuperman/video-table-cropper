@@ -13,7 +13,7 @@ Raw Video (Drive)
 [1] Frame Extraction ---- ffmpeg, 1 frame every 3s (N=10 → ~30s window per group)
       |
       v
-[2] YOLO Detection ------ YOLOv8m-seg on FULL FRAMES (not crops)
+[2] YOLO Detection ------ YOLO segmentation on FULL FRAMES (not crops)
       |
       v
 [3] Tracking ------------ match same person across N frames (centroid + IoU, K=3 lookback)
@@ -50,7 +50,7 @@ Raw Video (Drive)
 
 **YOLO runs on full uncropped frames. Not on table crops.**
 
-- **Model:** `yolov8m-seg.pt` (YOLOv8 medium, segmentation variant)
+- **Model:** `yolo26x-seg.pt` by default, configurable with `YOLO_MODEL_NAME`
 - **Size:** ~52 MB, auto-downloads on first run
 - **Classes:** person only (class 0)
 - **Confidence threshold:** 0.15
