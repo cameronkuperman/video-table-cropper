@@ -1237,7 +1237,136 @@ def test_review_trash_soft_trashes_selected_folders(client, fake_drive):
 
 def test_review_pages_render(client):
     assert client.get("/cleanup/legacy").status_code == 200
+    assert client.get("/cleanup/crops").status_code == 200
     assert client.get("/review/labeled").status_code == 200
+
+
+def test_crop_cleanup_inventory_shows_supabase_and_fallback_groups(client, fake_drive, monkeypatch):
+    class FakeSupabase:
+        enabled = True
+
+        def select(self, table, params):
+            if table == "camera_sources":
+                return [
+                    {
+                        "id": "camera-source-uuid",
+                        "name": "CH-CH04",
+                        "restaurant_id": "restaurant-uuid",
+                        "is_active": True,
+                        "config": {"edge_node_id": "restaurant-pi-1", "edge_camera_id": "CH-CH04"},
+                    }
+                ]
+            if table == "table_camera_crops":
+                return [
+                    {
+                        "id": "crop-uuid",
+                        "restaurant_id": "restaurant-uuid",
+                        "camera_source_id": "camera-source-uuid",
+                        "table_id": "table-uuid",
+                        "polygon": [[0, 0], [40, 0], [40, 40], [0, 40]],
+                        "frame_width": 80,
+                        "frame_height": 60,
+                        "version": 4,
+                        "source": "supabase_table_camera_crops",
+                        "is_active": True,
+                    }
+                ]
+            if table == "tables":
+                return [
+                    {
+                        "id": "table-uuid",
+                        "restaurant_id": "restaurant-uuid",
+                        "host_facing_label": "Table 9",
+                        "table_number": "9",
+                        "internal_name": "table_top_9",
+                    }
+                ]
+            return []
+
+    label_app._supabase_crop_cache.clear()
+    monkeypatch.setattr(label_app, "_get_supabase_crop_client", lambda: FakeSupabase())
+    fake_drive._add_folder("json-clean-a", "mimosas-Reolink-CH-CH04_table_top_9_t0001", "video-clean")
+    fake_drive._add_triplet_files("json-clean-a", "json-clean-a")
+    fake_drive._add_folder("json-dirty-a", "mimosas-Reolink-CH-CH04_table_top_9_t0002", "video-dirty")
+    fake_drive._add_triplet_files("json-dirty-a", "json-dirty-a")
+    fake_drive._add_folder("supabase-clean", "mimosas-Reolink-CH-CH04_table_top_9_t0003", "video-clean")
+    fake_drive._add_triplet_files("supabase-clean", "supabase-clean")
+    fake_drive._add_file(
+        "supabase-clean-metadata",
+        "metadata.json",
+        "supabase-clean",
+        mime_type="application/json",
+        content=json.dumps(
+            {
+                "table_camera_crops_id": "crop-uuid",
+                "supabase_table_id": "table-uuid",
+                "crop_source": "supabase_table_camera_crops",
+            }
+        ).encode("utf-8"),
+    )
+
+    response = client.get("/api/cleanup/crops/inventory?source=reolink&site=restaurant-pi-1")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["counts"]["supabase_crops"] == 1
+    assert payload["supabase_crops"][0]["table_camera_crops_id"] == "crop-uuid"
+    assert payload["supabase_crops"][0]["reference"]["preview_url"].startswith("/api/preview/")
+    assert payload["counts"]["fallback_groups"] == 1
+    fallback_group = payload["fallback_groups"][0]
+    assert set(fallback_group["folder_ids"]) == {"json-clean-a", "json-dirty-a"}
+    assert fallback_group["folder_count"] == 2
+    assert "supabase-clean" not in fallback_group["folder_ids"]
+
+
+def test_crop_cleanup_trash_soft_trashes_only_validated_fallback_folders(client, fake_drive):
+    fake_drive._add_folder("json-clean-trash", "mimosas-Reolink-CH-CH04_table_top_8_t0001", "video-clean")
+    fake_drive._add_triplet_files("json-clean-trash", "json-clean-trash")
+    fake_drive._add_folder("json-dirty-trash", "mimosas-Reolink-CH-CH04_table_top_8_t0002", "video-dirty")
+    fake_drive._add_triplet_files("json-dirty-trash", "json-dirty-trash")
+    fake_drive._add_folder("supabase-do-not-trash", "mimosas-Reolink-CH-CH04_table_top_8_t0003", "video-clean")
+    fake_drive._add_triplet_files("supabase-do-not-trash", "supabase-do-not-trash")
+    fake_drive._add_file(
+        "supabase-do-not-trash-metadata",
+        "metadata.json",
+        "supabase-do-not-trash",
+        mime_type="application/json",
+        content=json.dumps(
+            {
+                "table_camera_crops_id": "crop-uuid",
+                "supabase_table_id": "table-uuid",
+                "crop_source": "supabase_table_camera_crops",
+            }
+        ).encode("utf-8"),
+    )
+
+    rejected = client.post(
+        "/api/cleanup/crops/trash",
+        json={
+            "source": "reolink",
+            "site_key": "restaurant-pi-1",
+            "folder_ids": ["json-clean-trash", "supabase-do-not-trash"],
+            "confirm": "TRASH",
+        },
+    )
+
+    assert rejected.status_code == 400
+    assert fake_drive.trashed == []
+
+    accepted = client.post(
+        "/api/cleanup/crops/trash",
+        json={
+            "source": "reolink",
+            "site_key": "restaurant-pi-1",
+            "folder_ids": ["json-clean-trash", "json-dirty-trash"],
+            "confirm": "TRASH",
+        },
+    )
+
+    assert accepted.status_code == 200
+    assert set(fake_drive.trashed) == {"json-clean-trash", "json-dirty-trash"}
+    assert fake_drive.items["supabase-do-not-trash"]["trashed"] is False
+    assert fake_drive.permanent_deleted == []
 
 
 def test_queue_ignores_stale_frame_metadata_from_another_folder(client, fake_drive):

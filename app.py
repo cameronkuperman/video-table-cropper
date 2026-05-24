@@ -1136,6 +1136,8 @@ REVIEW_LEGACY_DEFAULT_BUCKETS = (
     "dirty",
     "occupied",
 )
+CROP_CLEANUP_DEFAULT_BUCKETS = REVIEW_BUCKETS
+CROP_CLEANUP_FALLBACK_KINDS = {"fallback_json", "drive_crop_config"}
 
 
 def _parse_csv_arg(name: str, default: tuple[str, ...] = ()) -> list[str]:
@@ -1408,6 +1410,193 @@ def _review_list_folders(
             break
 
     return results, next_cursor, len(candidates)
+
+
+def _cleanup_channel_hint_from_camera(camera: dict[str, Any]) -> str:
+    config = camera.get("config") if isinstance(camera.get("config"), dict) else {}
+    for value in (
+        config.get("edge_camera_id"),
+        config.get("edge_camera_key"),
+        camera.get("name"),
+    ):
+        channel = _review_channel_hint(str(value or ""))
+        if channel:
+            if channel.upper().startswith("IPC"):
+                match = re.search(r"IPC(\d+)", channel, re.IGNORECASE)
+                if match:
+                    return f"CH-CH{int(match.group(1)):02d}"
+            return channel
+    return ""
+
+
+def _cleanup_reference_for_channel(client: DriveClient, context: QueueContext, channel_hint: str) -> dict[str, Any] | None:
+    if context.source != REOLINK_SOURCE or not context.site_key or not channel_hint:
+        return None
+    try:
+        channel_code = _normalize_reolink_channel_code(channel_hint) or channel_hint
+        return _find_reolink_reference_frame(client, context.site_key, channel_code)
+    except Exception:
+        return None
+
+
+def _cleanup_supabase_crop_cards(client: DriveClient, context: QueueContext) -> list[dict[str, Any]]:
+    supabase_client = _get_supabase_crop_client()
+    if not supabase_client.enabled:
+        return []
+    try:
+        cameras = supabase_client.select(
+            "camera_sources",
+            {
+                "select": "id,name,restaurant_id,is_active,config",
+                "limit": "1000",
+            },
+        )
+    except Exception:
+        return []
+
+    cards: list[dict[str, Any]] = []
+    for camera in cameras:
+        if camera.get("is_active") is False or not _camera_source_matches_site_key(camera, context.site_key):
+            continue
+        camera_source_id = str(camera.get("id") or "").strip()
+        if not camera_source_id:
+            continue
+        crops = _supabase_active_crops_for_camera(supabase_client, camera_source_id)
+        if not crops:
+            continue
+        table_rows = _supabase_table_rows_by_id(
+            supabase_client,
+            [str(crop.get("table_id") or "") for crop in crops],
+        )
+        channel_hint = _cleanup_channel_hint_from_camera(camera)
+        reference = _cleanup_reference_for_channel(client, context, channel_hint)
+        for idx, crop in enumerate(crops):
+            raw_polygon = crop.get("polygon")
+            polygon: list[list[float]] = []
+            if isinstance(raw_polygon, list):
+                for point in raw_polygon:
+                    if isinstance(point, (list, tuple)) and len(point) == 2:
+                        polygon.append([float(point[0]), float(point[1])])
+            table_row = table_rows.get(str(crop.get("table_id") or ""))
+            label = _supabase_table_label(table_row, crop, idx)
+            cards.append(
+                {
+                    "kind": "supabase",
+                    "id": str(crop.get("id") or f"{camera_source_id}:{idx}"),
+                    "label": label,
+                    "table_hint": _safe_table_slug(label, f"table_{idx + 1}"),
+                    "channel_hint": channel_hint,
+                    "camera_source_id": camera_source_id,
+                    "camera_name": camera.get("name"),
+                    "restaurant_id": crop.get("restaurant_id") or camera.get("restaurant_id"),
+                    "table_id": crop.get("table_id"),
+                    "table_camera_crops_id": crop.get("id"),
+                    "crop_version": crop.get("version"),
+                    "crop_source": crop.get("source") or "supabase_table_camera_crops",
+                    "polygon": polygon,
+                    "frame_width": crop.get("frame_width") or (reference or {}).get("width"),
+                    "frame_height": crop.get("frame_height") or (reference or {}).get("height"),
+                    "reference": reference,
+                }
+            )
+    return cards
+
+
+def _cleanup_group_key(context: QueueContext, payload: dict[str, Any]) -> str:
+    channel = str(payload.get("channel_hint") or "unknown-channel").strip().lower()
+    table = str(payload.get("table_hint") or payload.get("folder_name") or "unknown-table").strip().lower()
+    crop_kind = str(payload.get("crop_source_kind") or "fallback_json").strip().lower()
+    return "|".join([context.queue_key, crop_kind, channel, table])
+
+
+def _cleanup_folder_matches_context(context: QueueContext, folder_name: str, app_properties: dict[str, Any], bucket: str) -> bool:
+    if not _review_folder_matches_context(context, folder_name, app_properties, bucket):
+        return False
+    queue_key = str(app_properties.get("autolabel_queue_key") or "").strip()
+    if queue_key:
+        return queue_key == context.queue_key
+    prefix = _review_source_prefix(context)
+    if prefix and folder_name.startswith(f"{prefix}-"):
+        return True
+    is_reolink_name = "Reolink-" in folder_name
+    if context.source == REOLINK_SOURCE:
+        return is_reolink_name
+    if context.source == VIDEO_SOURCE:
+        return not is_reolink_name
+    return True
+
+
+def _cleanup_fallback_groups(
+    client: DriveClient,
+    context: QueueContext,
+    buckets: list[str],
+    filters: dict[str, str],
+) -> list[dict[str, Any]]:
+    parent_ids = _review_bucket_parent_ids(context, buckets)
+    groups: dict[str, dict[str, Any]] = {}
+    seen_folder_ids: set[str] = set()
+    for bucket, parent_id in parent_ids.items():
+        for folder in client.list_folders(parent_id, fields="id,name,mimeType,parents,appProperties,modifiedTime"):
+            folder_id = str(folder.get("id") or "")
+            folder_name = str(folder.get("name") or "")
+            if not folder_id or folder_id in seen_folder_ids:
+                continue
+            app_properties = dict(folder.get("appProperties") or {})
+            if not _cleanup_folder_matches_context(context, folder_name, app_properties, bucket):
+                continue
+            seen_folder_ids.add(folder_id)
+            payload = _review_payload_for_folder(client, context, folder, bucket, parent_id)
+            if payload is None or str(payload.get("crop_source_kind") or "") not in CROP_CLEANUP_FALLBACK_KINDS:
+                continue
+            if not _review_payload_matches_filters(payload, filters):
+                continue
+            group_key = _cleanup_group_key(context, payload)
+            group = groups.setdefault(
+                group_key,
+                {
+                    "group_id": group_key,
+                    "crop_source_kind": payload.get("crop_source_kind"),
+                    "crop_label": (payload.get("crop_provenance") or {}).get("label"),
+                    "channel_hint": payload.get("channel_hint"),
+                    "table_hint": payload.get("table_hint"),
+                    "folder_ids": [],
+                    "folder_count": 0,
+                    "bucket_counts": {},
+                    "representative": payload,
+                    "folders": [],
+                },
+            )
+            group["folder_ids"].append(folder_id)
+            group["folder_count"] += 1
+            group["bucket_counts"][bucket] = int(group["bucket_counts"].get(bucket, 0)) + 1
+            group["folders"].append(payload)
+            if str(folder.get("modifiedTime") or "") > str((group["representative"] or {}).get("modified_time") or ""):
+                group["representative"] = payload
+    return sorted(
+        groups.values(),
+        key=lambda group: (
+            str(group.get("channel_hint") or ""),
+            str(group.get("table_hint") or ""),
+            -int(group.get("folder_count") or 0),
+        ),
+    )
+
+
+def _cleanup_card_matches_filters(card: dict[str, Any], filters: dict[str, str]) -> bool:
+    q = filters.get("q", "").lower()
+    haystack = " ".join(
+        str(card.get(key) or "")
+        for key in ("label", "table_hint", "channel_hint", "camera_name", "table_camera_crops_id")
+    ).lower()
+    if q and q not in haystack:
+        return False
+    channel = filters.get("channel", "").lower()
+    if channel and channel not in str(card.get("channel_hint") or "").lower():
+        return False
+    table = filters.get("table", "").lower()
+    if table and table not in str(card.get("table_hint") or "").lower() and table not in str(card.get("label") or "").lower():
+        return False
+    return True
 
 
 def _review_allowed_parent_ids(context: QueueContext) -> set[str]:
@@ -6424,6 +6613,11 @@ def legacy_cleanup():
     )
 
 
+@app.route("/cleanup/crops")
+def crop_cleanup():
+    return render_template("crop_cleanup.html")
+
+
 @app.route("/review/labeled")
 def labeled_review():
     return render_template(
@@ -6747,6 +6941,117 @@ def api_review_folders():
         return jsonify({"error": str(e)}), 400
     except (DriveClientError, RuntimeError) as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cleanup/crops/inventory")
+def api_cleanup_crops_inventory():
+    try:
+        client = get_client()
+        source, site_key = _request_source_args()
+        context = _resolve_queue_context(client, source, site_key)
+        buckets = _parse_csv_arg("bucket", CROP_CLEANUP_DEFAULT_BUCKETS)
+        filters = {
+            "q": str(request.args.get("q") or "").strip(),
+            "channel": str(request.args.get("channel") or "").strip(),
+            "table": str(request.args.get("table") or "").strip(),
+            "frame_count": str(request.args.get("frame_count") or "").strip(),
+            "folder_source_type": str(request.args.get("folder_source_type") or "").strip(),
+            "crop_source_kind": str(request.args.get("crop_source_kind") or "").strip(),
+        }
+        supabase_cards = [
+            card
+            for card in _cleanup_supabase_crop_cards(client, context)
+            if _cleanup_card_matches_filters(card, filters)
+        ]
+        fallback_groups = _cleanup_fallback_groups(client, context, buckets, filters)
+        return jsonify(
+            {
+                "source_context": context.to_payload(),
+                "supabase_crops": supabase_cards,
+                "fallback_groups": fallback_groups,
+                "buckets": buckets,
+                "counts": {
+                    "supabase_crops": len(supabase_cards),
+                    "fallback_groups": len(fallback_groups),
+                    "fallback_folders": sum(int(group.get("folder_count") or 0) for group in fallback_groups),
+                },
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cleanup/crops/trash", methods=["POST"])
+def api_cleanup_crops_trash():
+    try:
+        data = _request_json_payload()
+        source, site_key = _payload_source_args(data)
+        folder_ids = [str(item).strip() for item in (data.get("folder_ids") or []) if str(item).strip()]
+        confirm = str(data.get("confirm") or "").strip()
+        if confirm != "TRASH":
+            return jsonify({"error": "confirm must be TRASH"}), 400
+        if not folder_ids:
+            return jsonify({"error": "folder_ids required"}), 400
+        if len(folder_ids) > 500:
+            return jsonify({"error": "at most 500 folders can be trashed at once"}), 400
+
+        client = get_client()
+        context = _resolve_queue_context(client, source, site_key)
+        validated: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for folder_id in folder_ids:
+            current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+            try:
+                parent_id = _review_validate_folder_parent(context, current)
+                bucket = _review_bucket_for_parent(context, parent_id) or "current"
+                if not _cleanup_folder_matches_context(
+                    context,
+                    str(current.get("name") or ""),
+                    dict(current.get("appProperties") or {}),
+                    bucket,
+                ):
+                    raise ValueError("folder does not belong to the selected cleanup source")
+                payload = _review_payload_for_folder(client, context, current, bucket, parent_id)
+                if payload is None or str(payload.get("crop_source_kind") or "") not in CROP_CLEANUP_FALLBACK_KINDS:
+                    raise ValueError("folder is not a fallback/manual JSON crop artifact")
+                validated.append({"folder_id": folder_id, "parent_id": parent_id, "payload": payload})
+            except Exception as exc:
+                rejected.append({"folder_id": folder_id, "error": str(exc)})
+
+        if rejected:
+            return jsonify({"error": "one or more folders are not safe to trash", "rejected": rejected}), 400
+
+        results: list[dict[str, Any]] = []
+        for item in validated:
+            folder_id = item["folder_id"]
+            payload = item["payload"]
+            folder_name, frames, frame_signature = _review_signature_for_current_folder(client, folder_id)
+            content_signature = _content_signature_from_frames(frames) if has_complete_frame_ids(frames) else ""
+            client.trash_file(folder_id)
+            _remove_label_history(context, folder_id, folder_name, frame_signature, content_signature)
+            _clear_label_queue_caches(context, folder_id)
+            results.append(
+                {
+                    "folder_id": folder_id,
+                    "folder_name": payload.get("folder_name") or folder_name,
+                    "trashed": True,
+                    "crop_source_kind": payload.get("crop_source_kind"),
+                }
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "trashed": len(results),
+                "results": results,
+                "source_context": context.to_payload(),
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError, OSError, TypeError) as e:
+        return jsonify({"error": str(e), "code": "cleanup_crop_trash_failed"}), 500
 
 
 @app.route("/api/review/relabel", methods=["POST"])

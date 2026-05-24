@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="csrf-token" content="{{ csrf_token }}" />
+<title>Crop Cleanup</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #101318;
+    color: #eef2f6;
+  }
+  button, input, select { font: inherit; }
+  button {
+    border: 0;
+    border-radius: 8px;
+    padding: 9px 12px;
+    background: #2d5fff;
+    color: #fff;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  button.secondary { background: #252c36; color: #d9e0e8; }
+  button.danger { background: #9a2a39; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  a { color: #8fc5ff; }
+  .shell { width: min(1540px, calc(100vw - 32px)); margin: 0 auto; padding: 22px 0 36px; }
+  header { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; }
+  h1 { font-size: 1.25rem; margin: 0 0 5px; }
+  h2 { font-size: 1rem; margin: 18px 0 10px; }
+  .muted { color: #9aa6b4; font-size: 0.86rem; }
+  .toolbar {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(120px, 1fr));
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid #29313c;
+    border-radius: 8px;
+    background: #171c24;
+    margin-bottom: 12px;
+  }
+  label {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    color: #a4afbd;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  input, select {
+    width: 100%;
+    min-height: 38px;
+    border: 1px solid #303946;
+    border-radius: 8px;
+    background: #0f1319;
+    color: #eef2f6;
+    padding: 8px 10px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+  .status { min-height: 26px; color: #a8b2bf; font-size: 0.86rem; margin-bottom: 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 12px; }
+  .card {
+    border: 1px solid #29313c;
+    border-radius: 8px;
+    background: #161b23;
+    overflow: hidden;
+  }
+  .card-head { padding: 10px; border-bottom: 1px solid #262e39; }
+  .card-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.82rem;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+  .chip {
+    border: 1px solid #303946;
+    border-radius: 999px;
+    color: #aeb8c5;
+    padding: 3px 7px;
+    font-size: 0.72rem;
+  }
+  .frames { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 8px; }
+  .frame, .reference {
+    position: relative;
+    aspect-ratio: 4 / 3;
+    background: #0d1015;
+    overflow: hidden;
+  }
+  .frame img, .reference img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .reference svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+  .reference polygon {
+    fill: rgba(64, 196, 130, 0.18);
+    stroke: #40c482;
+    stroke-width: 4;
+    vector-effect: non-scaling-stroke;
+  }
+  .card-actions { display: flex; gap: 7px; padding: 0 8px 9px; }
+  .card-actions button { flex: 1; padding: 8px; font-size: 0.82rem; }
+  details { border-top: 1px solid #262e39; padding: 8px 10px 10px; }
+  summary { cursor: pointer; color: #c2ccd8; font-size: 0.84rem; }
+  .folder-list { margin: 8px 0 0; padding: 0; list-style: none; color: #9faab7; font-size: 0.78rem; }
+  .folder-list li { padding: 4px 0; border-top: 1px solid #202832; }
+  @media (max-width: 980px) {
+    .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    header { align-items: flex-start; flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <h1>Crop Cleanup</h1>
+        <div class="muted">Compare production Supabase crops against old JSON/fallback Drive artifacts before trashing.</div>
+      </div>
+      <div class="actions">
+        <a href="/">Label Queue</a>
+        <a href="/cleanup/legacy">Legacy Cleanup</a>
+        <a href="/crop-editor">Crop Editor</a>
+      </div>
+    </header>
+
+    <section class="toolbar">
+      <label>Source
+        <select id="source"></select>
+      </label>
+      <label>Site
+        <select id="site"></select>
+      </label>
+      <label>Bucket
+        <select id="bucket" multiple size="5"></select>
+      </label>
+      <label>Channel
+        <input id="channel" placeholder="CH-CH03 or IPC4" />
+      </label>
+      <label>Table
+        <input id="table" placeholder="table_top_1" />
+      </label>
+      <label>Search
+        <input id="query" placeholder="folder, table, crop id" />
+      </label>
+      <div class="actions">
+        <button id="load">Load</button>
+      </div>
+    </section>
+
+    <div id="status" class="status">Idle</div>
+
+    <h2>Production Supabase Crops</h2>
+    <section id="supabase-grid" class="grid"></section>
+
+    <h2>Old JSON / Fallback Artifacts</h2>
+    <section id="fallback-grid" class="grid"></section>
+  </main>
+  <script src="/static/crop_cleanup.js"></script>
+</body>
+</html>
