@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "startCommand": "sh -c 'gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 4 --timeout 180 app:app'",
+    "startCommand": "sh -c 'if [ \"${RAILWAY_SERVICE_NAME:-}\" = \"creative-vibrancy\" ] || [ -n \"${PREPROCESS_SOURCES:-}\" ]; then python main.py --preprocess-until-empty --sources ${PREPROCESS_SOURCES:-reolink}; else gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 4 --timeout 180 app:app; fi'",
     "healthcheckPath": "/healthz",
     "healthcheckTimeout": 300
   }
