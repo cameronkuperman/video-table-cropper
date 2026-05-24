@@ -1256,6 +1256,49 @@ def _review_source_type(
     return "generated"
 
 
+def _review_crop_provenance(
+    context: QueueContext,
+    metadata: dict[str, Any] | None,
+    source_type: str,
+) -> dict[str, Any]:
+    metadata = metadata or {}
+    crop_source = str(metadata.get("crop_source") or "").strip()
+    table_camera_crops_id = str(metadata.get("table_camera_crops_id") or "").strip()
+    supabase_table_id = str(metadata.get("supabase_table_id") or "").strip()
+    camera_source_id = str(metadata.get("camera_source_id") or "").strip()
+    crop_version = metadata.get("crop_version")
+
+    if table_camera_crops_id or supabase_table_id or crop_source == "supabase_table_camera_crops":
+        kind = "supabase"
+        label = "Supabase crop"
+    elif crop_source == "manual_crop_config" or (
+        context.source == REOLINK_SOURCE and context.site_key and _site_uses_manual_crop_configs(context.site_key)
+    ):
+        kind = "drive_crop_config"
+        label = "Drive crop config JSON"
+    elif crop_source:
+        kind = crop_source
+        label = crop_source.replace("_", " ")
+    elif source_type in {"legacy", "generated", "labeled", "screenrecord"}:
+        kind = "fallback_json"
+        label = "Fallback JSON"
+    else:
+        kind = "unknown"
+        label = "Unknown crop source"
+
+    return {
+        "kind": kind,
+        "label": label,
+        "is_supabase": kind == "supabase",
+        "is_fallback": kind in {"fallback_json", "drive_crop_config"},
+        "crop_source": crop_source or None,
+        "table_camera_crops_id": table_camera_crops_id or None,
+        "supabase_table_id": supabase_table_id or None,
+        "camera_source_id": camera_source_id or None,
+        "crop_version": crop_version,
+    }
+
+
 def _review_payload_for_folder(
     client: DriveClient,
     context: QueueContext,
@@ -1272,11 +1315,20 @@ def _review_payload_for_folder(
     folder_name = str(payload.get("folder_name") or folder.get("name") or "")
     frame_count = len(_ordered_frame_keys(payload.get("frames") or {}))
     source_type = _review_source_type(context, bucket, parent_id, folder_name, payload)
+    crop_provenance = _review_crop_provenance(context, metadata, source_type)
     payload.update(
         {
             "bucket": bucket,
             "current_label": bucket if bucket in LABEL_DESTINATIONS else None,
             "review_source_type": source_type,
+            "crop_provenance": crop_provenance,
+            "crop_source_kind": crop_provenance["kind"],
+            "has_supabase_crop": crop_provenance["is_supabase"],
+            "is_fallback_crop": crop_provenance["is_fallback"],
+            "table_camera_crops_id": crop_provenance["table_camera_crops_id"],
+            "supabase_table_id": crop_provenance["supabase_table_id"],
+            "camera_source_id": crop_provenance["camera_source_id"],
+            "crop_version": crop_provenance["crop_version"],
             "channel_hint": _review_channel_hint(folder_name, metadata),
             "table_hint": _review_table_hint(folder_name, metadata),
             "frame_count": frame_count,
@@ -1300,6 +1352,9 @@ def _review_payload_matches_filters(payload: dict[str, Any], filters: dict[str, 
         return False
     source_type = filters.get("folder_source_type", "").lower()
     if source_type and source_type not in {"all", str(payload.get("review_source_type") or "").lower()}:
+        return False
+    crop_source_kind = filters.get("crop_source_kind", "").lower()
+    if crop_source_kind and crop_source_kind not in {"all", str(payload.get("crop_source_kind") or "").lower()}:
         return False
     frame_count = filters.get("frame_count", "")
     if frame_count:
@@ -4043,7 +4098,7 @@ def _materialize_screenrecord_true_ten_batch(
                 "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
                 "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
                 "crop_version": table_metadata.get("crop_version"),
-                "crop_source": table_metadata.get("crop_source"),
+                "crop_source": table_metadata.get("crop_source") or candidate.camera.get("source") or "fallback_json",
                 "artifact_identity": _artifact_identity(raw_name, table_metadata, metadata),
                 "perception_file": PERCEPTION_V2_FILE_NAME,
             }
@@ -4292,7 +4347,7 @@ def _materialize_reolink_table_crops(
                     "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
                     "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
                     "crop_version": table_metadata.get("crop_version"),
-                    "crop_source": table_metadata.get("crop_source"),
+                    "crop_source": table_metadata.get("crop_source") or camera.get("source") or "fallback_json",
                     "artifact_identity": _artifact_identity(str(raw_folder["name"]), table_metadata, metadata),
                     "perception_file": perception_file_name,
                 }
@@ -6668,6 +6723,7 @@ def api_review_folders():
             "table": str(request.args.get("table") or "").strip(),
             "frame_count": str(request.args.get("frame_count") or "").strip(),
             "folder_source_type": str(request.args.get("folder_source_type") or "").strip(),
+            "crop_source_kind": str(request.args.get("crop_source_kind") or "").strip(),
         }
         page, next_cursor, candidate_total = _review_list_folders(
             client,
@@ -6803,15 +6859,28 @@ def api_review_compare():
             client,
             context,
             list(REVIEW_LEGACY_DEFAULT_BUCKETS),
-            {"q": "", "channel": "", "table": "", "frame_count": "", "folder_source_type": ""},
+            {
+                "q": "",
+                "channel": "",
+                "table": "",
+                "frame_count": "",
+                "folder_source_type": "",
+                "crop_source_kind": "",
+            },
             limit=120,
             cursor=0,
         )
         scored: list[tuple[int, dict[str, Any]]] = []
+        current_kind = str(current_payload.get("crop_source_kind") or "")
         for candidate in candidates:
             if candidate.get("folder_id") == folder_id:
                 continue
             score = 0
+            candidate_kind = str(candidate.get("crop_source_kind") or "")
+            if current_kind == "supabase" and candidate_kind in {"fallback_json", "drive_crop_config"}:
+                score += 12
+            elif current_kind in {"fallback_json", "drive_crop_config"} and candidate_kind == "supabase":
+                score += 12
             candidate_name = str(candidate.get("folder_name") or "").lower()
             if channel and channel == str(candidate.get("channel_hint") or "").lower():
                 score += 5

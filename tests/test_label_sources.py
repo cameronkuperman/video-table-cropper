@@ -1085,7 +1085,22 @@ def test_queue_prefers_cached_folders_when_available(client):
 
 def test_review_folders_lists_labeled_and_legacy_buckets(client, fake_drive):
     fake_drive._add_folder("review-clean", "mimosas-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
-    fake_drive._add_triplet_files("review-clean", "review-clean", include_metadata=True)
+    fake_drive._add_triplet_files("review-clean", "review-clean")
+    fake_drive._add_file(
+        "review-clean-metadata",
+        "metadata.json",
+        "review-clean",
+        mime_type="application/json",
+        content=json.dumps(
+            {
+                "table_camera_crops_id": "crop-uuid",
+                "supabase_table_id": "table-uuid",
+                "camera_source_id": "camera-source-uuid",
+                "crop_version": 7,
+                "crop_source": "supabase_table_camera_crops",
+            }
+        ).encode("utf-8"),
+    )
     fake_drive._add_folder("review-dirty", "mimosas-Reolink-CH-CH04_table_top_2_t0004", "video-dirty")
     fake_drive._add_triplet_files("review-dirty", "review-dirty")
     fake_drive._add_folder("review-matthews-clean", "matthews-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
@@ -1106,8 +1121,20 @@ def test_review_folders_lists_labeled_and_legacy_buckets(client, fake_drive):
     assert clean_folder["bucket"] == "clean"
     assert clean_folder["current_label"] == "clean"
     assert clean_folder["channel_hint"] == "CH-CH03"
-    assert clean_folder["table_hint"] == "table_top_1"
+    assert clean_folder["table_hint"] == "table-uuid"
     assert clean_folder["frame_count"] == 3
+    assert clean_folder["crop_source_kind"] == "supabase"
+    assert clean_folder["has_supabase_crop"] is True
+    assert clean_folder["crop_provenance"]["table_camera_crops_id"] == "crop-uuid"
+
+    fallback_response = client.get(
+        "/api/review/folders?source=reolink&site=restaurant-pi-1"
+        "&mode=labeled&bucket=clean,dirty,occupied&crop_source_kind=fallback_json&limit=20"
+    )
+    fallback_payload = fallback_response.get_json()
+
+    assert fallback_response.status_code == 200
+    assert {folder["folder_id"] for folder in fallback_payload["folders"]} == {"review-dirty"}
 
 
 def test_review_folders_filters_by_channel_table_and_frame_count(client, fake_drive):

@@ -16,6 +16,7 @@ const el = {
     site: document.getElementById('site'),
     bucket: document.getElementById('bucket'),
     folderSourceType: document.getElementById('folder-source-type'),
+    cropSourceKind: document.getElementById('crop-source-kind'),
     channel: document.getElementById('channel'),
     table: document.getElementById('table'),
     query: document.getElementById('query'),
@@ -71,6 +72,7 @@ function reviewParams(cursor = 0) {
         ['table', el.table],
         ['q', el.query],
         ['frame_count', el.frameCount],
+        ['crop_source_kind', el.cropSourceKind],
     ]) {
         const value = input.value.trim();
         if (value) {
@@ -120,6 +122,7 @@ function renderFolder(folder) {
     const chips = [
         folder.bucket,
         folder.review_source_type,
+        folder.crop_provenance?.label || folder.crop_source_kind,
         folder.channel_hint,
         folder.table_hint,
         `${folder.frame_count || 0} frames`,
@@ -276,6 +279,7 @@ async function compareFolder(card) {
                   <div class="chips">
                     <span class="chip">${escapeHtml(match.bucket)}</span>
                     <span class="chip">${escapeHtml(match.review_source_type)}</span>
+                    <span class="chip">${escapeHtml(match.crop_provenance?.label || match.crop_source_kind || 'unknown crop source')}</span>
                   </div>
                 </div>
               </div>

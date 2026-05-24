@@ -45,7 +45,7 @@
   .muted { color: #98a2af; font-size: 0.86rem; }
   .toolbar {
     display: grid;
-    grid-template-columns: repeat(7, minmax(120px, 1fr));
+    grid-template-columns: repeat(8, minmax(120px, 1fr));
     gap: 10px;
     padding: 12px;
     border: 1px solid #29313c;
@@ -208,6 +208,15 @@
           <option value="screenrecord">ScreenRecord</option>
           <option value="generated">Generated</option>
           <option value="labeled">Labeled</option>
+        </select>
+      </label>
+      <label>Crop Source
+        <select id="crop-source-kind">
+          <option value="">All</option>
+          <option value="supabase">Supabase</option>
+          <option value="fallback_json">Fallback JSON</option>
+          <option value="drive_crop_config">Drive crop config</option>
+          <option value="unknown">Unknown</option>
         </select>
       </label>
       <label>Channel
