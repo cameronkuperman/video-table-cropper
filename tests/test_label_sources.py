@@ -659,6 +659,131 @@ def test_screenrecord_true_ten_generation_creates_three_crops_and_perception(mon
     assert perception["n_frames"] == 10
 
 
+def test_screenrecord_true_ten_generation_batches_yolo_across_folders(monkeypatch, tmp_path):
+    import person_detector
+
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    fake._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake._add_folder("sr-10-node", "restaurant-pi-1", "sr-10-root")
+    fake._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+    for raw_id, triplet_index in (("sr-raw-a", 15), ("sr-raw-b", 16)):
+        fake._add_folder(raw_id, f"IPC4_t{triplet_index:04d}", "sr-10-node")
+        for idx in range(10):
+            fake._add_file(
+                f"{raw_id}-frame-{idx}",
+                f"frame_{idx}.jpg",
+                raw_id,
+                content=_jpeg_bytes(color=(idx * 10, triplet_index, 40)),
+            )
+        fake._add_file(
+            f"{raw_id}-metadata",
+            "metadata.json",
+            raw_id,
+            mime_type="application/json",
+            content=json.dumps(
+                {"camera_id": "IPC4", "triplet_stem": "IPC4", "triplet_index": triplet_index}
+            ).encode("utf-8"),
+        )
+
+    batch_sizes: list[int] = []
+    monkeypatch.setattr(label_app, "_get_yolo_model", lambda: (lambda *_args, **_kwargs: None))
+    monkeypatch.setattr(
+        person_detector,
+        "detect_people_batch",
+        lambda frame_paths, *_args, **_kwargs: batch_sizes.append(len(frame_paths)) or [[] for _ in frame_paths],
+    )
+    monkeypatch.setattr(
+        label_app,
+        "_mapped_camera_tables_for_screenrecord_folder",
+        lambda *_args, **_kwargs: (
+            4,
+            {"camera_number": 4, "image_width": 80, "image_height": 60},
+            [("table_top_1", [(0, 0), (40, 0), (40, 40), (0, 40)], (0, 0, 40, 40), [(0, 0), (50, 0), (50, 50), (0, 50)])],
+        ),
+    )
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1,
+    )
+
+    assert generated == 2
+    assert batch_sizes == [20]
+    assert fake.find_file_by_name("r-3frame-unlabeled", "mimosas-IPC4_table_top_1_t0015", mime_type=label_app.FOLDER_MIME)
+    assert fake.find_file_by_name("r-3frame-unlabeled", "mimosas-IPC4_table_top_1_t0016", mime_type=label_app.FOLDER_MIME)
+
+
+def test_screenrecord_true_ten_partial_generation_does_not_mark_processed(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    fake._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake._add_folder("sr-10-node", "restaurant-pi-1", "sr-10-root")
+    fake._add_folder("sr-raw-partial", "IPC4_t0017", "sr-10-node")
+    for idx in range(10):
+        fake._add_file(
+            f"sr-partial-frame-{idx}",
+            f"frame_{idx}.jpg",
+            "sr-raw-partial",
+            content=_jpeg_bytes(color=(idx * 10, 70, 40)),
+        )
+    fake._add_file(
+        "sr-partial-metadata",
+        "metadata.json",
+        "sr-raw-partial",
+        mime_type="application/json",
+        content=json.dumps({"camera_id": "IPC4", "triplet_stem": "IPC4", "triplet_index": 17}).encode("utf-8"),
+    )
+    fake._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+    table_polygons = [
+        ("table_top_1", [(0, 0), (40, 0), (40, 40), (0, 40)], (0, 0, 40, 40), [(0, 0), (50, 0), (50, 50), (0, 50)]),
+        ("table_top_2", [(40, 0), (79, 0), (79, 40), (40, 40)], (40, 0, 79, 40), [(30, 0), (79, 0), (79, 50), (30, 50)]),
+    ]
+    monkeypatch.setattr(
+        label_app,
+        "_mapped_camera_tables_for_screenrecord_folder",
+        lambda *_args, **_kwargs: (
+            4,
+            {"camera_number": 4, "image_width": 80, "image_height": 60},
+            table_polygons,
+        ),
+    )
+    monkeypatch.setattr(
+        label_app,
+        "_materialize_screenrecord_true_ten_batch",
+        lambda *_args, **_kwargs: {"sr-raw-partial": ["mimosas-IPC4_table_top_1_t0017"]},
+    )
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1,
+    )
+    state = label_app._load_preprocess_state()
+
+    assert generated == 1
+    assert not label_app._reolink_raw_folder_processed(
+        state,
+        context,
+        label_app._screenrecord_state_raw_folder(fake.get_file("sr-raw-partial")),
+    )
+
+
 def test_screenrecord_generation_dedupes_existing_metadata_identity(monkeypatch, tmp_path):
     fake = FakeDriveClient()
     monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")

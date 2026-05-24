@@ -50,8 +50,8 @@ Raw Video (Drive)
 
 **YOLO runs on full uncropped frames. Not on table crops.**
 
-- **Model:** `yolo26x-seg.pt` by default, configurable with `YOLO_MODEL_NAME`
-- **Size:** ~52 MB, auto-downloads on first run
+- **Model:** `yolo26l-seg.pt` by default, configurable with `YOLO_MODEL_NAME`
+- **Size:** auto-downloads on first run
 - **Classes:** person only (class 0)
 - **Confidence threshold:** 0.15
 - **Per-frame output:** list of person detections, each containing:

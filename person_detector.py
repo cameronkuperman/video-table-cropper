@@ -61,7 +61,7 @@ MAX_GAP_TO_FILL = 1
 
 # ── Model loading ──────────────────────────────────────────────────────────
 
-DEFAULT_YOLO_MODEL_NAME = "yolo26x-seg.pt"
+DEFAULT_YOLO_MODEL_NAME = "yolo26l-seg.pt"
 
 
 def load_yolo_model(model_name: str | None = None):
@@ -69,7 +69,7 @@ def load_yolo_model(model_name: str | None = None):
     Load the configured YOLO segmentation model. Returns None if ultralytics is not installed.
     On first run, downloads the configured model weights.
 
-    Override with YOLO_MODEL_NAME. Default: yolo26x-seg.pt.
+    Override with YOLO_MODEL_NAME. Default: yolo26l-seg.pt.
     """
     if not _YOLO_AVAILABLE:
         print("  [perception] ultralytics not installed — skipping person detection.")

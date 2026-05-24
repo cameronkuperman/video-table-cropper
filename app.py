@@ -221,6 +221,18 @@ REOLINK_FRAME_DOWNLOAD_WORKERS = max(
 REOLINK_TABLE_MATERIALIZE_WORKERS = max(
     1, min(10, int(os.environ.get("REOLINK_TABLE_MATERIALIZE_WORKERS", "8") or "8"))
 )
+REOLINK_TRUE_TEN_BATCH_SIZE = max(
+    1,
+    int(os.environ.get("REOLINK_TRUE_TEN_BATCH_SIZE", "4") or "4"),
+)
+REOLINK_YOLO_BATCH_FRAMES = max(
+    1,
+    int(os.environ.get("REOLINK_YOLO_BATCH_FRAMES", "40") or "40"),
+)
+REOLINK_PREPROCESS_MAX_SECONDS = max(
+    0.0,
+    float(os.environ.get("REOLINK_PREPROCESS_MAX_SECONDS", "0") or "0"),
+)
 LABEL_READY_TARGET_CONFIGURED = _label_ready_target_configured()
 LABEL_READY_TARGET = (
     max(1, _read_int_env("LABEL_READY_TARGET", 1000))
@@ -3790,11 +3802,55 @@ def _detect_people_for_frames(frame_paths: list[Path], yolo_model: Any) -> list[
     from person_detector import assign_track_ids, detect_people_batch, detect_people_in_frame
 
     if callable(yolo_model):
-        frame_detections = detect_people_batch(frame_paths, yolo_model)
+        frame_detections: list[list[dict[str, Any]]] = []
+        for batch_start in range(0, len(frame_paths), REOLINK_YOLO_BATCH_FRAMES):
+            batch = frame_paths[batch_start:batch_start + REOLINK_YOLO_BATCH_FRAMES]
+            frame_detections.extend(detect_people_batch(batch, yolo_model))
     else:
         frame_detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
     assign_track_ids(frame_detections)
     return frame_detections
+
+
+def _detect_people_for_frame_groups(
+    frame_groups: list[list[Path]],
+    yolo_model: Any,
+) -> list[list[list[dict[str, Any]]]]:
+    from person_detector import assign_track_ids, detect_people_batch, detect_people_in_frame
+
+    if not frame_groups:
+        return []
+    if callable(yolo_model):
+        flat_paths = [frame_path for frame_paths in frame_groups for frame_path in frame_paths]
+        flat_detections: list[list[dict[str, Any]]] = []
+        for batch_start in range(0, len(flat_paths), REOLINK_YOLO_BATCH_FRAMES):
+            batch = flat_paths[batch_start:batch_start + REOLINK_YOLO_BATCH_FRAMES]
+            flat_detections.extend(detect_people_batch(batch, yolo_model))
+        grouped: list[list[list[dict[str, Any]]]] = []
+        offset = 0
+        for frame_paths in frame_groups:
+            detections = flat_detections[offset:offset + len(frame_paths)]
+            assign_track_ids(detections)
+            grouped.append(detections)
+            offset += len(frame_paths)
+        return grouped
+
+    grouped = []
+    for frame_paths in frame_groups:
+        detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
+        assign_track_ids(detections)
+        grouped.append(detections)
+    return grouped
+
+
+@dataclass
+class _ScreenRecordTrueTenCandidate:
+    raw_folder: dict[str, Any]
+    state_folder: dict[str, Any]
+    source_files: dict[str, dict[str, Any]]
+    metadata: dict[str, Any]
+    camera: dict[str, Any]
+    missing_table_polygons: list[tuple[str, list, tuple[int, int, int, int], list]]
 
 
 def _materialize_screenrecord_true_ten_artifacts(
@@ -3804,15 +3860,6 @@ def _materialize_screenrecord_true_ten_artifacts(
     missing_table_polygons: list[tuple[str, list, tuple[int, int, int, int], list]],
     metadata: dict[str, Any],
 ) -> list[str]:
-    """Build final labeler artifacts from a ScreenRecord 10frametrue folder.
-
-    The source is ten full frames. The output is a compact 3-frame table crop
-    folder plus perception_v2.json built from all ten full frames.
-    """
-    from PIL import Image
-    from person_detector import build_perception_for_table
-    from processor import perspective_crop_polygon, save_jpeg, _scale_table_polygons
-
     source_files = {
         item["name"]: item
         for item in client.list_files(
@@ -3820,10 +3867,6 @@ def _materialize_screenrecord_true_ten_artifacts(
             fields="id,name,mimeType,parents,appProperties",
         )
     }
-    frame_items = [source_files.get(f"frame_{idx}.jpg") for idx in range(10)]
-    if any(item is None for item in frame_items):
-        return []
-
     mapped = _mapped_camera_tables_for_screenrecord_folder(
         str(raw_folder.get("name") or ""),
         metadata,
@@ -3846,42 +3889,117 @@ def _materialize_screenrecord_true_ten_artifacts(
     if not selected_polygons:
         return []
 
+    candidate = _ScreenRecordTrueTenCandidate(
+        raw_folder=raw_folder,
+        state_folder=_screenrecord_state_raw_folder(raw_folder),
+        source_files=source_files,
+        metadata=metadata,
+        camera=camera,
+        missing_table_polygons=selected_polygons,
+    )
+    results = _materialize_screenrecord_true_ten_batch(client, context, [candidate])
+    return results.get(str(raw_folder.get("id") or ""), [])
+
+
+def _materialize_screenrecord_true_ten_batch(
+    client: DriveClient,
+    context: QueueContext,
+    candidates: list[_ScreenRecordTrueTenCandidate],
+) -> dict[str, list[str]]:
+    """Build final labeler artifacts from ScreenRecord 10frametrue folders.
+
+    Each source folder has ten full frames. The output remains the existing
+    compact 3-frame table crop folder plus perception_v2.json built from all ten
+    full frames. This batches downloads and YOLO across folders while preserving
+    per-folder artifact semantics.
+    """
+    from PIL import Image
+    from person_detector import build_perception_for_table
+    from processor import perspective_crop_polygon, save_jpeg, _scale_table_polygons
+
+    if not candidates:
+        return {}
+
     label_source = _resolve_label_source(context.source, context.site_key)
     output_parent_id = _screenrecord_output_unlabeled_folder_id(client, context)
     selected_source_indices = [0, 5, 9]
+    timings: dict[str, float] = {}
+    total_started = time.perf_counter()
 
-    with tempfile.TemporaryDirectory(prefix="screenrecord_10frame_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="screenrecord_10frame_batch_") as tmpdir:
         tmp = Path(tmpdir)
-        frame_paths = [tmp / f"frame_{idx}.jpg" for idx in range(len(frame_items))]
-        _download_drive_files_parallel(client, frame_items, frame_paths)
+        work: list[dict[str, Any]] = []
+        all_frame_items: list[dict[str, Any]] = []
+        all_frame_paths: list[Path] = []
+        for candidate_index, candidate in enumerate(candidates):
+            frame_items = [candidate.source_files.get(f"frame_{idx}.jpg") for idx in range(10)]
+            if any(item is None for item in frame_items):
+                continue
+            frame_paths = [
+                tmp / f"candidate_{candidate_index}" / f"frame_{idx}.jpg"
+                for idx in range(len(frame_items))
+            ]
+            all_frame_items.extend([item for item in frame_items if item is not None])
+            all_frame_paths.extend(frame_paths)
+            work.append({"candidate": candidate, "frame_paths": frame_paths})
 
-        with Image.open(frame_paths[0]) as image:
-            frame_h, frame_w = image.height, image.width
-        img_shape = (frame_h, frame_w)
+        if not work:
+            return {}
 
-        ref_w = int(camera.get("image_width") or camera.get("frame_width") or camera.get("width") or frame_w)
-        ref_h = int(camera.get("image_height") or camera.get("frame_height") or camera.get("height") or frame_h)
-        scaled_polygons = selected_polygons
-        if ref_w != frame_w or ref_h != frame_h:
-            scaled_polygons = _scale_table_polygons(selected_polygons, ref_w, ref_h, frame_w, frame_h)
+        download_started = time.perf_counter()
+        _download_drive_files_parallel(client, all_frame_items, all_frame_paths)
+        timings["download_ms"] = (time.perf_counter() - download_started) * 1000
 
+        for item in work:
+            frame_paths = item["frame_paths"]
+            candidate = item["candidate"]
+            with Image.open(frame_paths[0]) as image:
+                frame_h, frame_w = image.height, image.width
+            img_shape = (frame_h, frame_w)
+            ref_w = int(
+                candidate.camera.get("image_width")
+                or candidate.camera.get("frame_width")
+                or candidate.camera.get("width")
+                or frame_w
+            )
+            ref_h = int(
+                candidate.camera.get("image_height")
+                or candidate.camera.get("frame_height")
+                or candidate.camera.get("height")
+                or frame_h
+            )
+            scaled_polygons = candidate.missing_table_polygons
+            if ref_w != frame_w or ref_h != frame_h:
+                scaled_polygons = _scale_table_polygons(
+                    candidate.missing_table_polygons,
+                    ref_w,
+                    ref_h,
+                    frame_w,
+                    frame_h,
+                )
+            item["img_shape"] = img_shape
+            item["scaled_polygons"] = scaled_polygons
+
+        yolo_started = time.perf_counter()
         yolo_model = _get_yolo_model()
-        frame_detections = _detect_people_for_frames(frame_paths, yolo_model)
+        grouped_detections = _detect_people_for_frame_groups(
+            [item["frame_paths"] for item in work],
+            yolo_model,
+        )
+        timings["yolo_ms"] = (time.perf_counter() - yolo_started) * 1000
+        for item, detections in zip(work, grouped_detections):
+            item["frame_detections"] = detections
 
-        generated_names: list[str] = []
-        source_captured_at = list(metadata.get("captured_at_utc") or metadata.get("source_captured_at_utc") or [])
-        selected_captured_at = [
-            source_captured_at[idx]
-            for idx in selected_source_indices
-            if idx < len(source_captured_at)
-        ]
-        raw_name = str(raw_folder.get("name") or metadata.get("triplet_stem") or "triplet")
-
-        def _materialize_one_table(
-            table_entry: tuple[str, list, tuple[int, int, int, int], list],
-        ) -> str:
+        def _materialize_one_table(item: dict[str, Any], table_entry: tuple[str, list, tuple[int, int, int, int], list]) -> tuple[str, str]:
+            candidate: _ScreenRecordTrueTenCandidate = item["candidate"]
+            frame_paths: list[Path] = item["frame_paths"]
+            frame_detections = item["frame_detections"]
+            img_shape = item["img_shape"]
             table_id, tight_poly, _tight_bbox, zone_poly = table_entry
-            table_metadata = _camera_table_metadata(camera, table_id)
+            table_metadata = _camera_table_metadata(candidate.camera, table_id)
+            metadata = candidate.metadata
+            raw_folder = candidate.raw_folder
+            raw_name = str(raw_folder.get("name") or metadata.get("triplet_stem") or "triplet")
             derived_name = _apply_source_prefix(
                 _derived_reolink_folder_name(raw_name, table_id),
                 label_source,
@@ -3901,6 +4019,12 @@ def _materialize_screenrecord_true_ten_artifacts(
                 )
                 uploaded_frame_ids[f"frame_{output_idx}"] = str(uploaded["id"])
 
+            source_captured_at = list(metadata.get("captured_at_utc") or metadata.get("source_captured_at_utc") or [])
+            selected_captured_at = [
+                source_captured_at[idx]
+                for idx in selected_source_indices
+                if idx < len(source_captured_at)
+            ]
             artifact_metadata = {
                 **metadata,
                 "frame_count": 3,
@@ -3950,16 +4074,61 @@ def _materialize_screenrecord_true_ten_artifacts(
                 dest_folder_id,
                 {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
             )
-            return derived_name
+            return str(raw_folder.get("id") or ""), derived_name
 
-        max_workers = min(REOLINK_TABLE_MATERIALIZE_WORKERS, len(scaled_polygons))
+        materialize_started = time.perf_counter()
+        tasks = [
+            (item, table_entry)
+            for item in work
+            for table_entry in item["scaled_polygons"]
+        ]
+        generated_by_folder: dict[str, list[str]] = {
+            str(item["candidate"].raw_folder.get("id") or ""): []
+            for item in work
+        }
+        max_workers = min(REOLINK_TABLE_MATERIALIZE_WORKERS, len(tasks))
         if max_workers <= 1:
-            generated_names = [_materialize_one_table(entry) for entry in scaled_polygons]
+            for item, table_entry in tasks:
+                try:
+                    folder_id, generated_name = _materialize_one_table(item, table_entry)
+                    generated_by_folder.setdefault(folder_id, []).append(generated_name)
+                except Exception as exc:
+                    raw_folder = item["candidate"].raw_folder
+                    print(f"[screenrecord-true-ten] failed to materialize {raw_folder.get('name')}: {exc}")
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                generated_names = list(executor.map(_materialize_one_table, scaled_polygons))
+                futures = {
+                    executor.submit(_materialize_one_table, item, table_entry): item
+                    for item, table_entry in tasks
+                }
+                for future in as_completed(futures):
+                    try:
+                        folder_id, generated_name = future.result()
+                    except Exception as exc:
+                        raw_folder = futures[future]["candidate"].raw_folder
+                        print(f"[screenrecord-true-ten] failed to materialize {raw_folder.get('name')}: {exc}")
+                        continue
+                    generated_by_folder.setdefault(folder_id, []).append(generated_name)
+        timings["materialize_ms"] = (time.perf_counter() - materialize_started) * 1000
 
-        return generated_names
+        total_ms = (time.perf_counter() - total_started) * 1000
+        generated_count = sum(len(names) for names in generated_by_folder.values())
+        folders_per_min = (len(work) / (total_ms / 60000.0)) if total_ms > 0 else 0.0
+        _log_timing(
+            "screenrecord_true_ten_batch",
+            total_ms=f"{total_ms:.1f}",
+            download_ms=f"{timings.get('download_ms', 0.0):.1f}",
+            yolo_ms=f"{timings.get('yolo_ms', 0.0):.1f}",
+            materialize_ms=f"{timings.get('materialize_ms', 0.0):.1f}",
+            folders=len(work),
+            frames=len(all_frame_paths),
+            tables=len(tasks),
+            generated=generated_count,
+            yolo_batch_frames=REOLINK_YOLO_BATCH_FRAMES,
+            folders_per_min=f"{folders_per_min:.2f}",
+            queue=context.queue_key,
+        )
+        return generated_by_folder
 
 
 def _materialize_reolink_table_crops(
@@ -4336,6 +4505,7 @@ def _prepare_reolink_unlabeled_queue(
     context: QueueContext,
     target_unlabeled_count: int,
     current_visible_count: int | None = None,
+    deadline_monotonic: float | None = None,
 ) -> int:
     if context.source != REOLINK_SOURCE:
         return 0
@@ -4370,98 +4540,146 @@ def _prepare_reolink_unlabeled_queue(
 
         # ScreenRecord-native path: use ready 3-frame artifacts first, then
         # materialize missing artifacts from root-level 10frametrue folders.
-        for true_ten_folder in _list_screenrecord_true_ten_folders(client, context):
-            if visible_count >= target_unlabeled_count:
+        true_ten_scan_started = time.perf_counter()
+        true_ten_folders = _list_screenrecord_true_ten_folders(client, context)
+        true_ten_scanned = 0
+        true_ten_candidates = 0
+        true_ten_index = 0
+        while true_ten_index < len(true_ten_folders) and visible_count < target_unlabeled_count:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                 break
 
-            state_folder = _screenrecord_state_raw_folder(true_ten_folder)
-            if _reolink_raw_folder_processed(preprocess_state, context, state_folder):
-                continue
+            batch_candidates: list[_ScreenRecordTrueTenCandidate] = []
+            while (
+                true_ten_index < len(true_ten_folders)
+                and len(batch_candidates) < REOLINK_TRUE_TEN_BATCH_SIZE
+                and visible_count < target_unlabeled_count
+            ):
+                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                    break
+                true_ten_folder = true_ten_folders[true_ten_index]
+                true_ten_index += 1
+                true_ten_scanned += 1
 
-            source_files = {
-                item["name"]: item
-                for item in client.list_files(
-                    true_ten_folder["id"],
-                    fields="id,name,mimeType,parents,appProperties",
-                )
-            }
-            metadata = _load_json_file_from_drive(client, source_files.get("metadata.json"))
-            if not metadata:
-                continue
+                state_folder = _screenrecord_state_raw_folder(true_ten_folder)
+                if _reolink_raw_folder_processed(preprocess_state, context, state_folder):
+                    continue
 
-            mapped = _mapped_camera_tables_for_screenrecord_folder(
-                str(true_ten_folder.get("name", "")),
-                metadata,
-                site_key=context.site_key,
-                client=client,
-            )
-            if mapped is None:
-                continue
-
-            _channel_number, _camera, table_polygons = mapped
-            missing_table_polygons = [
-                entry
-                for entry in table_polygons
-                if (
-                    _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0])
-                    not in existing_names
-                    and _apply_source_prefix(
-                        _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0]),
-                        label_source,
+                source_files = {
+                    item["name"]: item
+                    for item in client.list_files(
+                        true_ten_folder["id"],
+                        fields="id,name,mimeType,parents,appProperties",
                     )
-                    not in existing_names
-                    and _artifact_identity(
-                        str(true_ten_folder.get("name", "")),
-                        _camera_table_metadata(_camera, entry[0]),
-                        metadata,
+                }
+                metadata = _load_json_file_from_drive(client, source_files.get("metadata.json"))
+                if not metadata:
+                    continue
+
+                mapped = _mapped_camera_tables_for_screenrecord_folder(
+                    str(true_ten_folder.get("name", "")),
+                    metadata,
+                    site_key=context.site_key,
+                    client=client,
+                )
+                if mapped is None:
+                    continue
+
+                _channel_number, _camera, table_polygons = mapped
+                missing_table_polygons = [
+                    entry
+                    for entry in table_polygons
+                    if (
+                        _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0])
+                        not in existing_names
+                        and _apply_source_prefix(
+                            _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0]),
+                            label_source,
+                        )
+                        not in existing_names
+                        and _artifact_identity(
+                            str(true_ten_folder.get("name", "")),
+                            _camera_table_metadata(_camera, entry[0]),
+                            metadata,
+                        )
+                        not in existing_identities
                     )
-                    not in existing_identities
+                ]
+                if not missing_table_polygons:
+                    _mark_reolink_raw_folder_processed(
+                        preprocess_state,
+                        context,
+                        state_folder,
+                        status="complete",
+                        generated=0,
+                    )
+                    continue
+
+                batch_candidates.append(
+                    _ScreenRecordTrueTenCandidate(
+                        raw_folder=true_ten_folder,
+                        state_folder=state_folder,
+                        source_files=source_files,
+                        metadata=metadata,
+                        camera=_camera,
+                        missing_table_polygons=missing_table_polygons,
+                    )
                 )
-            ]
-            if not missing_table_polygons:
-                _mark_reolink_raw_folder_processed(
-                    preprocess_state,
-                    context,
-                    state_folder,
-                    status="complete",
-                    generated=0,
-                )
+                true_ten_candidates += 1
+
+            if not batch_candidates:
                 continue
 
-            generated_names = _materialize_screenrecord_true_ten_artifacts(
+            generated_by_folder = _materialize_screenrecord_true_ten_batch(
                 client,
                 context,
-                true_ten_folder,
-                missing_table_polygons,
-                metadata,
+                batch_candidates,
             )
-            raw_generated_count = 0
-            recorded_generated = _record_generated_reolink_artifacts(
-                generated_names=generated_names,
-                existing_names=existing_names,
-                existing_identities=existing_identities,
-                raw_name=str(true_ten_folder.get("name", "")),
-                table_polygons=missing_table_polygons,
-                camera=_camera,
-                metadata=metadata,
-                label_source=label_source,
-            )
-            for _name in generated_names:
-                unlabeled_count += 1
-                visible_count += 1
-                generated_any = True
-                generated_count += 1
-                raw_generated_count += 1
-            raw_generated_count = max(raw_generated_count, recorded_generated)
-
-            if raw_generated_count > 0:
-                _mark_reolink_raw_folder_processed(
-                    preprocess_state,
-                    context,
-                    state_folder,
-                    status="complete",
-                    generated=raw_generated_count,
+            for candidate in batch_candidates:
+                true_ten_folder = candidate.raw_folder
+                generated_names = generated_by_folder.get(str(true_ten_folder.get("id") or ""), [])
+                raw_generated_count = 0
+                recorded_generated = _record_generated_reolink_artifacts(
+                    generated_names=generated_names,
+                    existing_names=existing_names,
+                    existing_identities=existing_identities,
+                    raw_name=str(true_ten_folder.get("name", "")),
+                    table_polygons=candidate.missing_table_polygons,
+                    camera=candidate.camera,
+                    metadata=candidate.metadata,
+                    label_source=label_source,
                 )
+                for _name in generated_names:
+                    unlabeled_count += 1
+                    visible_count += 1
+                    generated_any = True
+                    generated_count += 1
+                    raw_generated_count += 1
+                raw_generated_count = max(raw_generated_count, recorded_generated)
+
+                if raw_generated_count >= len(candidate.missing_table_polygons):
+                    _mark_reolink_raw_folder_processed(
+                        preprocess_state,
+                        context,
+                        candidate.state_folder,
+                        status="complete",
+                        generated=raw_generated_count,
+                    )
+
+        true_ten_scan_ms = (time.perf_counter() - true_ten_scan_started) * 1000
+        if true_ten_scanned or true_ten_candidates:
+            _log_timing(
+                "screenrecord_true_ten_scan",
+                total_ms=f"{true_ten_scan_ms:.1f}",
+                scanned=true_ten_scanned,
+                candidates=true_ten_candidates,
+                generated=generated_count,
+                batch_size=REOLINK_TRUE_TEN_BATCH_SIZE,
+                target=target_unlabeled_count,
+                visible=visible_count,
+                deadline_hit=int(deadline_monotonic is not None and time.monotonic() >= deadline_monotonic),
+                queue=context.queue_key,
+            )
 
         if visible_count >= target_unlabeled_count:
             if generated_any:
@@ -4475,9 +4693,13 @@ def _prepare_reolink_unlabeled_queue(
         # process each triplet from local files, then delete the zip when
         # every triplet inside it has reached a terminal state.
         for zip_batch in _iterate_unassociated_zip_batches(client, context):
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                break
             if visible_count >= target_unlabeled_count:
                 break
             for triplet in zip_batch.triplets:
+                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                    break
                 if visible_count >= target_unlabeled_count:
                     break
                 triplet_id = triplet["id"]
@@ -4580,6 +4802,8 @@ def _prepare_reolink_unlabeled_queue(
         raw_folders = _list_reolink_raw_folders(client, context)
 
         for raw_folder in raw_folders:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                break
             if visible_count >= target_unlabeled_count:
                 break
 
@@ -4702,18 +4926,28 @@ def drain_reolink_preprocessing(
     """Materialize all missing Reolink per-table folders and then stop."""
     drive = client or DriveClient()
     requested_site_keys = site_keys or [site.site_key for site in REOLINK_SITES]
+    deadline_monotonic = (
+        time.monotonic() + REOLINK_PREPROCESS_MAX_SECONDS
+        if REOLINK_PREPROCESS_MAX_SECONDS > 0
+        else None
+    )
     summary: dict[str, Any] = {
         "sites": {},
         "generated": 0,
         "errors": {},
+        "max_seconds": REOLINK_PREPROCESS_MAX_SECONDS,
     }
     for site_key in requested_site_keys:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            summary["stopped_reason"] = "max_seconds"
+            break
         try:
             context = _resolve_queue_context(drive, REOLINK_SOURCE, site_key)
             generated = _prepare_reolink_unlabeled_queue(
                 drive,
                 context,
                 target_unlabeled_count=1_000_000_000,
+                deadline_monotonic=deadline_monotonic,
             )
             summary["sites"][site_key] = {"generated": generated}
             summary["generated"] += generated
@@ -7093,6 +7327,9 @@ def api_preprocess_status():
                 "sites": [site.site_key for site in REOLINK_SITES],
                 "inflight": bool(reolink_inflight),
                 "inflight_queues": reolink_inflight,
+                "true_ten_batch_size": REOLINK_TRUE_TEN_BATCH_SIZE,
+                "yolo_batch_frames": REOLINK_YOLO_BATCH_FRAMES,
+                "preprocess_max_seconds": REOLINK_PREPROCESS_MAX_SECONDS,
                 "supabase_crops": _supabase_crop_status_snapshot(),
             },
             "ready_target": REOLINK_PREWARM_TARGET,

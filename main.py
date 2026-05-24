@@ -8,7 +8,7 @@ AutoLabeler modes:
   python main.py --label     start Flask UI at localhost:8080 to label
                              images and move them to clean/dirty/occupied/
 
-  python main.py --preprocess-until-empty --sources all
+  python main.py --preprocess-until-empty --sources reolink
                              drain deploy worker preprocessing and exit
 """
 
@@ -73,9 +73,20 @@ def _tables_json_or_exit() -> Path:
     return tables_json
 
 
+def _effective_preprocess_sources(cli_sources: str) -> str:
+    override = os.environ.get("PREPROCESS_SOURCES", "").strip().lower()
+    if not override:
+        return cli_sources
+    if override not in {"all", "video", "reolink"}:
+        print("Error: PREPROCESS_SOURCES must be one of: all, video, reolink")
+        sys.exit(1)
+    return override
+
+
 def cmd_preprocess_until_empty(sources: str) -> None:
     from drive_client import DriveClient, DriveClientError
 
+    sources = _effective_preprocess_sources(sources)
     root_id = _root_id_or_exit()
     client = DriveClient()
     summary: dict[str, object] = {"sources": sources}
