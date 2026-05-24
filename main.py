@@ -27,13 +27,11 @@ load_local_env()
 
 
 def cmd_process() -> None:
-    from drive_client import DriveClient, DriveClientError
+    from drive_client import DriveClientError
     from processor import run_processor
+    from storage_client import create_storage_client
 
-    root_id = os.environ.get("DRIVE_PROJECT_ROOT_FOLDER_ID", "").strip()
-    if not root_id:
-        print("Error: DRIVE_PROJECT_ROOT_FOLDER_ID is not set in .env")
-        sys.exit(1)
+    root_id = _root_id_or_exit()
 
     # Find the table JSON (prefer approved_table_rectangles.json)
     base = Path(__file__).parent
@@ -47,17 +45,20 @@ def cmd_process() -> None:
     print(f"Using table config: {tables_json.name}")
 
     try:
-        client = DriveClient()
+        client = create_storage_client()
         run_processor(root_id, tables_json, client)
     except DriveClientError as e:
-        print(f"Drive error: {e}")
+        print(f"Storage error: {e}")
         sys.exit(1)
 
 
 def _root_id_or_exit() -> str:
-    root_id = os.environ.get("DRIVE_PROJECT_ROOT_FOLDER_ID", "").strip()
-    if not root_id:
-        print("Error: DRIVE_PROJECT_ROOT_FOLDER_ID is not set in .env")
+    from storage_client import storage_root_id
+
+    try:
+        root_id = storage_root_id()
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
         sys.exit(1)
     return root_id
 
@@ -74,10 +75,11 @@ def _tables_json_or_exit() -> Path:
 
 
 def cmd_preprocess_until_empty(sources: str) -> None:
-    from drive_client import DriveClient, DriveClientError
+    from drive_client import DriveClientError
+    from storage_client import create_storage_client
 
     root_id = _root_id_or_exit()
-    client = DriveClient()
+    client = create_storage_client()
     summary: dict[str, object] = {"sources": sources}
 
     try:
@@ -92,7 +94,7 @@ def cmd_preprocess_until_empty(sources: str) -> None:
 
             summary["reolink"] = drain_reolink_preprocessing(client)
     except DriveClientError as e:
-        print(f"Drive error: {e}")
+        print(f"Storage error: {e}")
         sys.exit(1)
 
     print(json.dumps(summary, indent=2, sort_keys=True))

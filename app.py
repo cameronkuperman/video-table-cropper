@@ -56,6 +56,7 @@ from queue_metadata import (
     frame_slot_keys,
     has_complete_frame_ids,
 )
+from storage_client import create_storage_client, storage_root_id
 
 _FRAME_FILENAME_RE = re.compile(r"^frame_(\d+)\.jpg$")
 
@@ -718,9 +719,13 @@ def _log_timing(event: str, **fields: object) -> None:
 def get_client() -> DriveClient:
     client = getattr(g, "_drive_client", None)
     if client is None:
-        client = DriveClient()
+        client = _new_storage_client()
         g._drive_client = client
     return client
+
+
+def _new_storage_client() -> DriveClient:
+    return create_storage_client(DriveClient)
 
 
 def _ensure_cache_dir() -> Path:
@@ -758,10 +763,7 @@ def _ensure_cache_dir() -> Path:
 
 
 def _root_id() -> str:
-    root = os.environ.get("DRIVE_PROJECT_ROOT_FOLDER_ID", "").strip()
-    if not root:
-        raise RuntimeError("DRIVE_PROJECT_ROOT_FOLDER_ID is not set in .env")
-    return root
+    return storage_root_id()
 
 
 def _default_reolink_site_key() -> str | None:
@@ -2926,7 +2928,7 @@ def _label_jobs_status_payload(
 ) -> dict[str, Any]:
     verification = None
     if verify:
-        verification = _verify_succeeded_label_jobs(client or DriveClient())
+        verification = _verify_succeeded_label_jobs(client or _new_storage_client())
 
     with _label_jobs_lock:
         with _state_file_lock("label_jobs"):
@@ -3152,7 +3154,7 @@ def _drain_label_jobs_once(client: DriveClient | None = None, *, force_due: bool
     job_id = str(job.get("id") or "")
     try:
         if active_client is None:
-            active_client = DriveClient()
+            active_client = _new_storage_client()
         _mark_label_job_attempt()
         _push_label_job_to_drive(active_client, job)
     except Exception as exc:
@@ -3497,7 +3499,7 @@ def _download_drive_files_parallel(
         return output_paths
 
     def _parallel_drive_client() -> DriveClient:
-        return DriveClient() if type(client) is DriveClient else client
+        return _new_storage_client() if type(client) is DriveClient else client
 
     def _download_one(item: dict[str, Any], output_path: Path) -> Path:
         _parallel_drive_client().download_file_to_path(str(item["id"]), output_path)
@@ -3515,7 +3517,7 @@ def _download_drive_files_parallel(
 
 
 def _table_drive_client(client: DriveClient) -> DriveClient:
-    return DriveClient() if type(client) is DriveClient else client
+    return _new_storage_client() if type(client) is DriveClient else client
 
 
 def _detect_people_for_frames(frame_paths: list[Path], yolo_model: Any) -> list[list[dict[str, Any]]]:
@@ -4432,7 +4434,7 @@ def drain_reolink_preprocessing(
     site_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     """Materialize all missing Reolink per-table folders and then stop."""
-    drive = client or DriveClient()
+    drive = client or _new_storage_client()
     requested_site_keys = site_keys or [site.site_key for site in REOLINK_SITES]
     summary: dict[str, Any] = {
         "sites": {},
@@ -4462,7 +4464,7 @@ def _run_reolink_preprocess_background(
     queue_key: str,
 ) -> None:
     try:
-        drive = DriveClient()
+        drive = _new_storage_client()
         context = _resolve_queue_context(drive, source, site_key)
         generated = _prepare_reolink_unlabeled_queue(
             drive,
@@ -4552,7 +4554,7 @@ def _remove_folder_from_listing_cache(queue_key: str, folder_id: str) -> None:
 
 def _refresh_listing_in_background(context: QueueContext) -> None:
     try:
-        listing = _fetch_source_listing(DriveClient(), context)
+        listing = _fetch_source_listing(_new_storage_client(), context)
         _set_listing_cache(context.queue_key, listing)
     except Exception:
         return
@@ -4893,7 +4895,7 @@ def _ensure_thumb_for_file(file_id: str, client: DriveClient | None = None) -> t
         return thumb_path, True, download_ms, encode_ms
 
     if not cache_path.exists():
-        active_client = client or DriveClient()
+        active_client = client or _new_storage_client()
         download_started = time.perf_counter()
         active_client.download_file_to_path(file_id, cache_path)
         download_ms = (time.perf_counter() - download_started) * 1000
@@ -4911,7 +4913,7 @@ def _ensure_thumb_for_file(file_id: str, client: DriveClient | None = None) -> t
 
 def _warm_thumb(file_id: str) -> None:
     try:
-        thumb_path, _, _, _ = _ensure_thumb_for_file(file_id, DriveClient())
+        thumb_path, _, _, _ = _ensure_thumb_for_file(file_id, _new_storage_client())
         try:
             os.utime(thumb_path, None)
         except OSError:
@@ -4961,7 +4963,7 @@ def _schedule_preview_prewarm(hydrated_folders: list[dict]) -> int:
 
 def _cleanup_hidden_folder(context: QueueContext, folder_id: str) -> None:
     try:
-        client = DriveClient()
+        client = _new_storage_client()
         current = client.get_file(folder_id, fields="id,name,parents,appProperties")
         parents = [str(parent) for parent in current.get("parents", []) if parent]
         if context.input_folder_id not in parents:
@@ -5248,7 +5250,7 @@ def _run_cache_warm_background(
         )
 
     try:
-        client = DriveClient()
+        client = _new_storage_client()
         contexts = _cache_warm_contexts(client, source, site_key)
         _set_cache_warm_state(queues_total=len(contexts))
         for context in contexts:
@@ -5315,7 +5317,7 @@ def _run_ready_maintainer_once() -> None:
     if shared_lock is None:
         return
 
-    client = DriveClient()
+    client = _new_storage_client()
     generated_total = 0
     last_error = None
     try:
@@ -5426,7 +5428,7 @@ def _hydrate_folder_with_fresh_client(
     folder: dict[str, str],
 ) -> dict | None:
     # googleapiclient service objects are safer to keep thread-local.
-    client = DriveClient()
+    client = _new_storage_client()
     return _hydrate_folder(client, context, folder)
 
 
@@ -6255,7 +6257,7 @@ def api_label_jobs_status():
     return jsonify(_label_jobs_status_payload(verify=verify, client=get_client() if verify else None))
 
 
-@app.route("/api/preview/<file_id>")
+@app.route("/api/preview/<path:file_id>")
 def api_preview(file_id: str):
     """Serve a Drive image file, caching it locally."""
     request_started = time.perf_counter()
@@ -6295,7 +6297,7 @@ def api_preview(file_id: str):
     return send_file(cache_path, mimetype="image/jpeg", conditional=True, max_age=3600)
 
 
-@app.route("/api/thumb/<file_id>")
+@app.route("/api/thumb/<path:file_id>")
 def api_thumb(file_id: str):
     """Serve a downscaled JPEG (512px wide by default) for fast buffer warming.
 
@@ -6558,7 +6560,7 @@ def _run_video_preprocess_background(max_videos: int) -> None:
         summary = run_processor(
             project_root_id=_root_id(),
             tables_json_path=tables_json_path,
-            client=DriveClient(),
+            client=_new_storage_client(),
             max_videos=max_videos,
         )
         with _video_preprocess_lock:
