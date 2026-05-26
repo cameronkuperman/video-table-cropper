@@ -33,9 +33,9 @@
   h1 { font-size: 1.25rem; margin: 0 0 5px; }
   h2 { font-size: 1rem; margin: 18px 0 10px; }
   .muted { color: #9aa6b4; font-size: 0.86rem; }
-  .toolbar {
-    display: grid;
-    grid-template-columns: repeat(7, minmax(120px, 1fr));
+	  .toolbar {
+	    display: grid;
+	    grid-template-columns: 1.1fr 1.2fr 1fr 1fr 1.3fr auto;
     gap: 10px;
     padding: 12px;
     border: 1px solid #29313c;
@@ -130,8 +130,8 @@
   <main class="shell">
     <header>
       <div>
-        <h1>Crop Cleanup</h1>
-        <div class="muted">Compare production Supabase crops against old JSON/fallback Drive artifacts before trashing.</div>
+	        <h1>Crop Artifact Cleanup</h1>
+	        <div class="muted">Pick a crop and soft-trash every associated Drive artifact folder.</div>
       </div>
       <div class="actions">
         <a href="/">Label Queue</a>
@@ -147,11 +147,8 @@
       <label>Site
         <select id="site"></select>
       </label>
-      <label>Bucket
-        <select id="bucket" multiple size="5"></select>
-      </label>
-      <label>Channel
-        <input id="channel" placeholder="CH-CH03 or IPC4" />
+	      <label>Channel
+	        <input id="channel" placeholder="CH-CH03 or IPC4" />
       </label>
       <label>Table
         <input id="table" placeholder="table_top_1" />
@@ -166,11 +163,8 @@
 
     <div id="status" class="status">Idle</div>
 
-    <h2>Production Supabase Crops</h2>
-    <section id="supabase-grid" class="grid"></section>
-
-    <h2>Old JSON / Fallback Artifacts</h2>
-    <section id="fallback-grid" class="grid"></section>
+	    <h2>Crop Groups</h2>
+	    <section id="fallback-grid" class="grid"></section>
   </main>
   <script src="/static/crop_cleanup.js"></script>
 </body>

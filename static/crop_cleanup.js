@@ -7,16 +7,14 @@ const state = {
 };
 
 const el = {
-    source: document.getElementById('source'),
-    site: document.getElementById('site'),
-    bucket: document.getElementById('bucket'),
-    channel: document.getElementById('channel'),
-    table: document.getElementById('table'),
-    query: document.getElementById('query'),
-    load: document.getElementById('load'),
-    status: document.getElementById('status'),
-    supabaseGrid: document.getElementById('supabase-grid'),
-    fallbackGrid: document.getElementById('fallback-grid'),
+	source: document.getElementById('source'),
+	site: document.getElementById('site'),
+	channel: document.getElementById('channel'),
+	table: document.getElementById('table'),
+	query: document.getElementById('query'),
+	load: document.getElementById('load'),
+	status: document.getElementById('status'),
+	fallbackGrid: document.getElementById('fallback-grid'),
 };
 
 function escapeHtml(value) {
@@ -28,13 +26,9 @@ function escapeHtml(value) {
         .replaceAll("'", '&#39;');
 }
 
-function selectedBuckets() {
-    return Array.from(el.bucket.selectedOptions).map(option => option.value);
-}
-
 function activeSourcePayload() {
-    return {
-        source: el.source.value || 'reolink',
+	return {
+		source: el.source.value || 'reolink',
         site_key: el.source.value === 'reolink' ? (el.site.value || null) : null,
     };
 }
@@ -43,15 +37,12 @@ function requestParams() {
     const params = new URLSearchParams();
     const sourcePayload = activeSourcePayload();
     params.set('source', sourcePayload.source);
-    if (sourcePayload.site_key) {
-        params.set('site', sourcePayload.site_key);
-    }
-    for (const bucket of selectedBuckets()) {
-        params.append('bucket', bucket);
-    }
-    for (const [key, input] of [
-        ['channel', el.channel],
-        ['table', el.table],
+	if (sourcePayload.site_key) {
+		params.set('site', sourcePayload.site_key);
+	}
+	for (const [key, input] of [
+		['channel', el.channel],
+		['table', el.table],
         ['q', el.query],
     ]) {
         const value = input.value.trim();
@@ -69,14 +60,6 @@ async function readJson(response) {
         throw new Error(data.error || `Request failed (${response.status})`);
     }
     return data;
-}
-
-function setupBuckets() {
-    const buckets = ['unlabeled', 'screenrecord_3frame_unlabeled', 'clean', 'dirty', 'occupied', 'label_later', 'discarded'];
-    const defaults = new Set(buckets);
-    el.bucket.innerHTML = buckets.map(bucket => `
-      <option value="${bucket}" ${defaults.has(bucket) ? 'selected' : ''}>${bucket}</option>
-    `).join('');
 }
 
 async function setupSources() {
@@ -115,8 +98,23 @@ function polygonPoints(points) {
         .join(' ');
 }
 
+function renderReferenceVisual(reference, polygon) {
+	const width = Number(reference.width || 0);
+	const height = Number(reference.height || 0);
+	const hasOverlay = reference.preview_url && width > 0 && height > 0 && (polygon || []).length >= 3;
+	if (!reference.preview_url) {
+		return '';
+	}
+	return `
+	  <div class="reference">
+	    <img loading="lazy" src="${escapeHtml(reference.preview_url)}" alt="" />
+	    ${hasOverlay ? `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet"><polygon points="${escapeHtml(polygonPoints(polygon))}"></polygon></svg>` : ''}
+	  </div>
+	`;
+}
+
 function renderSupabaseCard(crop) {
-    const reference = crop.reference || {};
+	const reference = crop.reference || {};
     const width = Number(crop.frame_width || reference.width || 0);
     const height = Number(crop.frame_height || reference.height || 0);
     const hasOverlay = reference.preview_url && width > 0 && height > 0 && (crop.polygon || []).length >= 3;
@@ -144,34 +142,35 @@ function renderSupabaseCard(crop) {
 }
 
 function renderFallbackGroup(group) {
-    const representative = group.representative || {};
-    const frames = frameEntries(representative);
-    const frameHtml = frames.map(([key, fileId]) => `
-      <a class="frame" href="/api/preview/${encodeURIComponent(fileId)}" target="_blank" title="${escapeHtml(key)}">
-        <img loading="lazy" src="/api/thumb/${encodeURIComponent(fileId)}" alt="${escapeHtml(key)}" />
-      </a>
-    `).join('') || '<div class="frame"><div class="muted" style="padding:10px;">No frame</div></div>';
+	const representative = group.representative || {};
+	const referenceVisual = renderReferenceVisual(group.reference || {}, group.polygon || []);
+	const groupLabel = group.table_hint || group.group_id || 'unknown crop';
+	const frames = frameEntries(representative);
+	const frameHtml = frames.map(([key, fileId]) => `
+	  <a class="frame" href="/api/preview/${encodeURIComponent(fileId)}" target="_blank" title="${escapeHtml(key)}">
+	    <img loading="lazy" src="/api/thumb/${encodeURIComponent(fileId)}" alt="${escapeHtml(key)}" />
+	  </a>
+	`).join('') || '<div class="frame"><div class="muted" style="padding:10px;">No frame</div></div>';
     const bucketSummary = Object.entries(group.bucket_counts || {})
         .map(([bucket, count]) => `${bucket}:${count}`)
         .join(' ');
     const folders = (group.folders || []).map(folder => `
       <li>${escapeHtml(folder.bucket)} · ${escapeHtml(folder.folder_name)} · ${escapeHtml(folder.folder_id)}</li>
     `).join('');
-    return `
-      <article class="card" data-group-id="${escapeHtml(group.group_id)}">
-        <div class="frames">${frameHtml}</div>
-        <div class="card-head">
-          <div class="card-title" title="${escapeHtml(group.table_hint || group.group_id)}">${escapeHtml(group.table_hint || 'unknown table')}</div>
-          <div class="chips">${chipHtml([
-              group.crop_label || group.crop_source_kind,
-              group.channel_hint,
-              `${group.folder_count || 0} folders`,
-              bucketSummary,
+	return `
+	  <article class="card" data-group-id="${escapeHtml(group.group_id)}">
+	    ${referenceVisual || `<div class="frames">${frameHtml}</div>`}
+	    <div class="card-head">
+	      <div class="card-title" title="${escapeHtml(group.table_hint || group.group_id)}">${escapeHtml(group.table_hint || 'unknown table')}</div>
+	      <div class="chips">${chipHtml([
+	          group.channel_hint,
+	          `${group.folder_count || 0} folders`,
+	          bucketSummary,
           ])}</div>
-        </div>
-        <div class="card-actions">
-          <button class="danger" data-action="trash" data-folder-ids="${escapeHtml((group.folder_ids || []).join(','))}">Trash fallback group</button>
-          <button class="secondary" data-action="hide">Keep / Hide</button>
+	    </div>
+	    <div class="card-actions">
+	      <button class="danger" data-action="trash" data-group-label="${escapeHtml(groupLabel)}" data-folder-ids="${escapeHtml((group.folder_ids || []).join(','))}">Trash all Drive folders for this crop</button>
+	      <button class="secondary" data-action="hide">Keep / Hide</button>
         </div>
         <details>
           <summary>Associated Drive folders</summary>
@@ -182,16 +181,12 @@ function renderFallbackGroup(group) {
 }
 
 function render(data) {
-    const supabaseCrops = data.supabase_crops || [];
-    const fallbackGroups = (data.fallback_groups || []).filter(group => !state.hiddenGroups.has(group.group_id));
-    el.supabaseGrid.innerHTML = supabaseCrops.length
-        ? supabaseCrops.map(renderSupabaseCard).join('')
-        : '<div class="muted">No Supabase crops found for this source/site.</div>';
-    el.fallbackGrid.innerHTML = fallbackGroups.length
-        ? fallbackGroups.map(renderFallbackGroup).join('')
-        : '<div class="muted">No fallback/manual JSON artifact groups found.</div>';
-    const counts = data.counts || {};
-    el.status.textContent = `${counts.supabase_crops || 0} Supabase crops · ${counts.fallback_groups || 0} fallback groups · ${counts.fallback_folders || 0} fallback folders`;
+	const fallbackGroups = (data.fallback_groups || []).filter(group => !state.hiddenGroups.has(group.group_id));
+	el.fallbackGrid.innerHTML = fallbackGroups.length
+	    ? fallbackGroups.map(renderFallbackGroup).join('')
+	    : '<div class="muted">No Drive artifact groups found.</div>';
+	const counts = data.counts || {};
+	el.status.textContent = `${counts.fallback_groups || 0} crop groups · ${counts.fallback_folders || 0} Drive folders`;
 }
 
 async function loadInventory() {
@@ -207,11 +202,13 @@ async function loadInventory() {
     }
 }
 
-async function trashGroup(folderIds) {
+async function trashGroup(folderIds, groupLabel) {
     if (!folderIds.length) {
         return;
     }
-    const typed = window.prompt(`Type TRASH to soft-trash ${folderIds.length} associated Drive folder(s).`);
+    const typed = window.prompt(
+        `This will move ${folderIds.length} Drive artifact folder(s) for "${groupLabel}" to Drive trash.\n\nType TRASH to confirm.`
+    );
     if (typed !== 'TRASH') {
         return;
     }
@@ -250,7 +247,7 @@ function bindEvents() {
         }
         if (button.dataset.action === 'trash') {
             const folderIds = String(button.dataset.folderIds || '').split(',').filter(Boolean);
-            trashGroup(folderIds).catch(error => {
+            trashGroup(folderIds, button.dataset.groupLabel || 'this crop').catch(error => {
                 el.status.textContent = error.message;
             });
         }
@@ -258,8 +255,7 @@ function bindEvents() {
 }
 
 async function init() {
-    setupBuckets();
-    bindEvents();
+	bindEvents();
     try {
         await setupSources();
         await loadInventory();

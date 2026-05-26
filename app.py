@@ -1429,11 +1429,109 @@ def _cleanup_channel_hint_from_camera(camera: dict[str, Any]) -> str:
     return ""
 
 
-def _cleanup_reference_for_channel(client: DriveClient, context: QueueContext, channel_hint: str) -> dict[str, Any] | None:
+def _drive_image_dimensions(
+    client: DriveClient,
+    file_id: str,
+    fallback: tuple[int, int] = (0, 0),
+) -> tuple[int, int]:
+    try:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(prefix="drive_image_dimensions_") as tmpdir:
+            reference_path = Path(tmpdir) / "frame.jpg"
+            client.download_file_to_path(file_id, reference_path)
+            with Image.open(reference_path) as image:
+                return image.width, image.height
+    except Exception:
+        return fallback
+
+
+def _reference_payload_for_frame(
+    client: DriveClient,
+    site_key: str,
+    site_label: str,
+    channel_code: str,
+    raw_folder: dict[str, Any],
+    frame_item: dict[str, Any],
+    source: str,
+    fallback_dimensions: tuple[int, int] = (0, 0),
+) -> dict[str, Any]:
+    frame_file_id = str(frame_item["id"])
+    width, height = _drive_image_dimensions(client, frame_file_id, fallback_dimensions)
+    return {
+        "site_key": site_key,
+        "site_label": site_label,
+        "channel_code": channel_code,
+        "raw_folder_id": str(raw_folder["id"]),
+        "raw_folder_name": str(raw_folder.get("name", "")),
+        "frame_file_id": frame_file_id,
+        "preview_url": f"/api/preview/{frame_file_id}",
+        "source": source,
+        "width": width,
+        "height": height,
+    }
+
+
+def _find_reolink_true_ten_reference_frame(
+    client: DriveClient,
+    context: QueueContext,
+    channel_code: str,
+    fallback_dimensions: tuple[int, int] = (0, 0),
+) -> dict[str, Any] | None:
+    if context.source != REOLINK_SOURCE or not context.site_key:
+        return None
+    normalized_channel = _normalize_reolink_channel_code(channel_code or "")
+    if not normalized_channel:
+        return None
+    site = _resolve_site_config(context.site_key)
+    for raw_folder in sorted(
+        _list_screenrecord_true_ten_folders(client, context),
+        key=lambda item: str(item.get("name", "")).lower(),
+        reverse=True,
+    ):
+        if _extract_reolink_channel_code(str(raw_folder.get("name", ""))) != normalized_channel:
+            continue
+        source_files = {
+            item["name"]: item
+            for item in client.list_files(
+                raw_folder["id"],
+                fields="id,name,mimeType,parents,appProperties",
+            )
+        }
+        frame_item = source_files.get("frame_0.jpg")
+        if not frame_item or not frame_item.get("id"):
+            continue
+        return _reference_payload_for_frame(
+            client,
+            context.site_key,
+            site.display_name,
+            normalized_channel,
+            raw_folder,
+            frame_item,
+            SCREENRECORD_TRUE_TEN_FOLDER_NAME,
+            fallback_dimensions,
+        )
+    return None
+
+
+def _cleanup_reference_for_channel(
+    client: DriveClient,
+    context: QueueContext,
+    channel_hint: str,
+    fallback_dimensions: tuple[int, int] = (0, 0),
+) -> dict[str, Any] | None:
     if context.source != REOLINK_SOURCE or not context.site_key or not channel_hint:
         return None
     try:
         channel_code = _normalize_reolink_channel_code(channel_hint) or channel_hint
+        true_ten_reference = _find_reolink_true_ten_reference_frame(
+            client,
+            context,
+            channel_code,
+            fallback_dimensions,
+        )
+        if true_ten_reference is not None:
+            return true_ten_reference
         return _find_reolink_reference_frame(client, context.site_key, channel_code)
     except Exception:
         return None
@@ -1509,6 +1607,66 @@ def _cleanup_group_key(context: QueueContext, payload: dict[str, Any]) -> str:
     return "|".join([context.queue_key, crop_kind, channel, table])
 
 
+def _cleanup_manual_crop_visual(
+    client: DriveClient,
+    context: QueueContext,
+    channel_hint: str,
+    table_hint: str,
+) -> dict[str, Any]:
+    if context.source != REOLINK_SOURCE or not context.site_key or not channel_hint:
+        return {}
+    channel_code = _normalize_reolink_channel_code(channel_hint)
+    if not channel_code:
+        return {}
+    crop_config = _load_saved_crop_config(client, context.site_key, channel_code)
+    if not crop_config:
+        return {}
+
+    reference = crop_config.get("reference") or {}
+    dimensions = (int(reference.get("width") or 0), int(reference.get("height") or 0))
+    wanted = _safe_table_slug(table_hint, "").lower()
+    polygon: list[list[float]] = []
+    if wanted:
+        for idx, crop in enumerate(crop_config.get("crops", [])):
+            crop_name = str(crop.get("name") or f"table_{idx + 1}").strip() or f"table_{idx + 1}"
+            crop_slug = _safe_table_slug(crop_name, f"table_{idx + 1}").lower()
+            if wanted not in {crop_name.lower(), crop_slug}:
+                continue
+            raw_polygon = crop.get("polygon")
+            if isinstance(raw_polygon, list):
+                for point in raw_polygon:
+                    if isinstance(point, (list, tuple)) and len(point) == 2:
+                        polygon.append([float(point[0]), float(point[1])])
+            break
+
+    return {
+        "polygon": polygon,
+        "reference_dimensions": dimensions,
+    }
+
+
+def _cleanup_attach_group_visuals(
+    client: DriveClient,
+    context: QueueContext,
+    groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    for group in groups:
+        channel_hint = str(group.get("channel_hint") or "").strip()
+        table_hint = str(group.get("table_hint") or "").strip()
+        manual_visual = _cleanup_manual_crop_visual(client, context, channel_hint, table_hint)
+        reference = _cleanup_reference_for_channel(
+            client,
+            context,
+            channel_hint,
+            manual_visual.get("reference_dimensions") or (0, 0),
+        )
+        if reference is not None:
+            group["reference"] = reference
+        if manual_visual.get("polygon"):
+            group["polygon"] = manual_visual["polygon"]
+    return groups
+
+
 def _cleanup_folder_matches_context(context: QueueContext, folder_name: str, app_properties: dict[str, Any], bucket: str) -> bool:
     if not _review_folder_matches_context(context, folder_name, app_properties, bucket):
         return False
@@ -1572,7 +1730,7 @@ def _cleanup_fallback_groups(
             group["folders"].append(payload)
             if str(folder.get("modifiedTime") or "") > str((group["representative"] or {}).get("modified_time") or ""):
                 group["representative"] = payload
-    return sorted(
+    sorted_groups = sorted(
         groups.values(),
         key=lambda group: (
             str(group.get("channel_hint") or ""),
@@ -1580,6 +1738,7 @@ def _cleanup_fallback_groups(
             -int(group.get("folder_count") or 0),
         ),
     )
+    return _cleanup_attach_group_visuals(client, context, sorted_groups)
 
 
 def _cleanup_card_matches_filters(card: dict[str, Any], filters: dict[str, str]) -> bool:

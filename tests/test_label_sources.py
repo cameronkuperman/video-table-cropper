@@ -1319,6 +1319,28 @@ def test_crop_cleanup_inventory_shows_supabase_and_fallback_groups(client, fake_
     assert "supabase-clean" not in fallback_group["folder_ids"]
 
 
+def test_crop_cleanup_group_visual_uses_true_ten_reference_and_crop_polygon(client, fake_drive):
+    fake_drive._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake_drive._add_folder("sr-10-matthews", "reolink-matthews-01", "sr-10-root")
+    fake_drive._add_folder("sr-10-ch03", "Reolink-CH-CH03_t9999", "sr-10-matthews")
+    fake_drive._add_file("sr-10-ch03-f0", "frame_0.jpg", "sr-10-ch03", content=_jpeg_bytes(1920, 1080))
+    fake_drive._add_folder("drive-crop-a", "matthews-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("drive-crop-a", "drive-crop-a")
+
+    label_app._source_folder_ids_cache.clear()
+    response = client.get(
+        "/api/cleanup/crops/inventory?source=reolink&site=reolink-matthews-01&table=table_top_1"
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["counts"]["fallback_groups"] == 1
+    group = payload["fallback_groups"][0]
+    assert group["reference"]["source"] == "10frametrue"
+    assert group["reference"]["preview_url"] == "/api/preview/sr-10-ch03-f0"
+    assert group["polygon"] == [[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0]]
+
+
 def test_crop_cleanup_trash_soft_trashes_only_validated_fallback_folders(client, fake_drive):
     fake_drive._add_folder("json-clean-trash", "mimosas-Reolink-CH-CH04_table_top_8_t0001", "video-clean")
     fake_drive._add_triplet_files("json-clean-trash", "json-clean-trash")
