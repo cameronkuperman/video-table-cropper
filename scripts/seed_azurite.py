@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import argparse
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -56,13 +57,30 @@ def _seed_label_folder(client: AzureBlobClient, parent_id: str, folder_name: str
     client.update_file_metadata(folder_id, {"appProperties": build_folder_app_properties(frames)})
 
 
+def _clear_container(client: AzureBlobClient) -> None:
+    for blob in list(client.container.list_blobs()):
+        client.container.delete_blob(str(blob.name))
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Delete all blobs in the target container before seeding.",
+    )
+    args = parser.parse_args()
+
     os.environ.setdefault("STORAGE_BACKEND", "azure")
     os.environ.setdefault("AZURE_STORAGE_CONNECTION_STRING", "UseDevelopmentStorage=true")
     os.environ.setdefault("AZURE_BLOB_CONTAINER", "autolabeler-dev")
     os.environ.setdefault("AZURE_PROJECT_ROOT_PREFIX", "project-root")
 
     client = AzureBlobClient()
+    if args.reset:
+        _clear_container(client)
+        client = AzureBlobClient()
+
     root = client.ensure_subfolder("", os.environ["AZURE_PROJECT_ROOT_PREFIX"].strip("/"))
 
     for name in ("raw_videos", "temp_processing", "unlabeled", "clean", "dirty", "occupied", "label_later", "discarded"):
