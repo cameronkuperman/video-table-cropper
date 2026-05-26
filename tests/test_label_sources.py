@@ -1319,26 +1319,38 @@ def test_crop_cleanup_inventory_shows_supabase_and_fallback_groups(client, fake_
     assert "supabase-clean" not in fallback_group["folder_ids"]
 
 
-def test_crop_cleanup_group_visual_uses_true_ten_reference_and_crop_polygon(client, fake_drive):
+def test_crop_cleanup_group_visual_uses_true_ten_reference_and_crop_polygon(client, fake_drive, monkeypatch):
     fake_drive._add_folder("sr-10-root", "10frametrue", "project-root")
     fake_drive._add_folder("sr-10-matthews", "reolink-matthews-01", "sr-10-root")
-    fake_drive._add_folder("sr-10-ch03", "Reolink-CH-CH03_t9999", "sr-10-matthews")
+    fake_drive._add_folder("sr-10-ch03", "IPC3_t9999", "sr-10-matthews")
     fake_drive._add_file("sr-10-ch03-f0", "frame_0.jpg", "sr-10-ch03", content=_jpeg_bytes(1920, 1080))
     fake_drive._add_folder("drive-crop-a", "matthews-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
     fake_drive._add_triplet_files("drive-crop-a", "drive-crop-a")
+    fake_drive._add_folder("drive-crop-b", "matthews-Reolink-CH-CH03_table_top_2_t0002", "video-clean")
+    fake_drive._add_triplet_files("drive-crop-b", "drive-crop-b")
+    downloaded_reference_ids = []
+    original_download = fake_drive.download_file_to_path
+
+    def counted_download(file_id, output_path):
+        if file_id == "sr-10-ch03-f0":
+            downloaded_reference_ids.append(file_id)
+        return original_download(file_id, output_path)
+
+    monkeypatch.setattr(fake_drive, "download_file_to_path", counted_download)
 
     label_app._source_folder_ids_cache.clear()
-    response = client.get(
-        "/api/cleanup/crops/inventory?source=reolink&site=reolink-matthews-01&table=table_top_1"
-    )
+    response = client.get("/api/cleanup/crops/inventory?source=reolink&site=reolink-matthews-01")
     payload = response.get_json()
 
     assert response.status_code == 200
-    assert payload["counts"]["fallback_groups"] == 1
-    group = payload["fallback_groups"][0]
+    assert payload["counts"]["fallback_groups"] == 2
+    groups = {group["table_hint"]: group for group in payload["fallback_groups"]}
+    group = groups["table_top_1"]
     assert group["reference"]["source"] == "10frametrue"
     assert group["reference"]["preview_url"] == "/api/preview/sr-10-ch03-f0"
     assert group["polygon"] == [[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0]]
+    assert groups["table_top_2"]["reference"]["preview_url"] == "/api/preview/sr-10-ch03-f0"
+    assert downloaded_reference_ids == ["sr-10-ch03-f0"]
 
 
 def test_crop_cleanup_trash_soft_trashes_only_validated_fallback_folders(client, fake_drive):

@@ -1489,8 +1489,6 @@ def _find_reolink_true_ten_reference_frame(
         key=lambda item: str(item.get("name", "")).lower(),
         reverse=True,
     ):
-        if _extract_reolink_channel_code(str(raw_folder.get("name", ""))) != normalized_channel:
-            continue
         source_files = {
             item["name"]: item
             for item in client.list_files(
@@ -1498,6 +1496,10 @@ def _find_reolink_true_ten_reference_frame(
                 fields="id,name,mimeType,parents,appProperties",
             )
         }
+        metadata = _load_json_file_from_drive(client, source_files.get("metadata.json")) or {}
+        raw_channel = _screenrecord_channel_code_from_metadata(str(raw_folder.get("name", "")), metadata)
+        if raw_channel != normalized_channel:
+            continue
         frame_item = source_files.get("frame_0.jpg")
         if not frame_item or not frame_item.get("id"):
             continue
@@ -1650,16 +1652,24 @@ def _cleanup_attach_group_visuals(
     context: QueueContext,
     groups: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    reference_cache: dict[tuple[str, tuple[int, int]], dict[str, Any] | None] = {}
     for group in groups:
         channel_hint = str(group.get("channel_hint") or "").strip()
         table_hint = str(group.get("table_hint") or "").strip()
         manual_visual = _cleanup_manual_crop_visual(client, context, channel_hint, table_hint)
-        reference = _cleanup_reference_for_channel(
-            client,
-            context,
-            channel_hint,
-            manual_visual.get("reference_dimensions") or (0, 0),
+        fallback_dimensions = manual_visual.get("reference_dimensions") or (0, 0)
+        reference_key = (
+            _normalize_reolink_channel_code(channel_hint) or channel_hint,
+            fallback_dimensions,
         )
+        if reference_key not in reference_cache:
+            reference_cache[reference_key] = _cleanup_reference_for_channel(
+                client,
+                context,
+                channel_hint,
+                fallback_dimensions,
+            )
+        reference = reference_cache[reference_key]
         if reference is not None:
             group["reference"] = reference
         if manual_visual.get("polygon"):
