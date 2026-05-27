@@ -215,7 +215,7 @@ async function loadInventory() {
     try {
         const activeData = await fetch(requestUrl(false)).then(readJson);
         render(activeData);
-        el.status.textContent = `${activeData.counts?.supabase_crops || 0} active crops · scanning fallback JSON Drive artifacts...`;
+        el.status.textContent = `${activeData.counts?.supabase_crops || 0} active crops · scanning legacy Drive crop artifacts...`;
         const cleanupData = await fetch(requestUrl(true)).then(readJson);
         render(cleanupData);
     } catch (error) {
