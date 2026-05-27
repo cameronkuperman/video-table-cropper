@@ -1735,7 +1735,7 @@ def test_force_refresh_uses_stale_listing_cache_and_refreshes_in_background(monk
         label_app._invalidate_listing_cache(context.queue_key)
 
 
-def test_force_refresh_without_listing_cache_warms_in_background(monkeypatch):
+def test_force_refresh_without_listing_cache_fetches_synchronously(monkeypatch):
     context = label_app.QueueContext(
         source=label_app.REOLINK_SOURCE,
         site_key="restaurant-pi-1",
@@ -1748,18 +1748,18 @@ def test_force_refresh_without_listing_cache_warms_in_background(monkeypatch):
         folder_ids={},
         persist_frame_metadata=False,
     )
-    scheduled: list[str] = []
+    fresh_listing = [{"id": "fresh-folder", "name": "fresh"}]
     label_app._invalidate_listing_cache(context.queue_key)
-    monkeypatch.setattr(label_app, "_schedule_listing_refresh", lambda ctx: scheduled.append(ctx.queue_key) or True)
+    monkeypatch.setattr(
+        label_app,
+        "_schedule_listing_refresh",
+        lambda _ctx: (_ for _ in ()).throw(AssertionError("cold force refresh should not return empty")),
+    )
 
-    def fail_fetch(_client, _context):
-        raise AssertionError("cold force refresh should warm in background")
-
-    monkeypatch.setattr(label_app, "_fetch_source_listing", fail_fetch)
+    monkeypatch.setattr(label_app, "_fetch_source_listing", lambda _client, _context: fresh_listing)
 
     with label_app.app.test_request_context("/api/queue?source=reolink&site=restaurant-pi-1&refresh=1"):
-        assert label_app._list_source_subfolders(object(), context, force_refresh=True) == []
-        assert scheduled == [context.queue_key]
+        assert label_app._list_source_subfolders(object(), context, force_refresh=True) == fresh_listing
 
 
 def test_interactive_preview_prewarm_is_bounded(tmp_path, monkeypatch):

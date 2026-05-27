@@ -5694,10 +5694,6 @@ def _list_source_subfolders(
         _schedule_listing_refresh(context)
         return cached_listing
 
-    if force_refresh and context.source == REOLINK_SOURCE and has_request_context():
-        _schedule_listing_refresh(context)
-        return []
-
     listing = _fetch_source_listing(client, context)
     _set_listing_cache(context.queue_key, listing)
     return list(listing)
