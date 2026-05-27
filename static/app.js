@@ -945,6 +945,7 @@ function warmBuffer(loadToken = sourceLoadToken) {
 
 function renderFolderCard(folder) {
     currentImagesReady = false;
+    let brokenFrameSkipped = false;
     const frameKeys = displayFrameKeys(folder);
     const sourceLabel = folder.source_label || folder.source || 'unknown';
     const imgHtml = frameKeys.map((key, idx) => {
@@ -1001,6 +1002,28 @@ function renderFolderCard(folder) {
         }
     }
 
+    function skipBrokenFolder(reason) {
+        if (brokenFrameSkipped) return;
+        brokenFrameSkipped = true;
+        currentImagesReady = false;
+        rememberSuppressedFolder(folder);
+        folders.splice(currentIndex, 1);
+        saveQueueSnapshot();
+        if (statusEl) {
+            statusEl.textContent = 'Skipping broken triplet...';
+        }
+        logTiming('skipBrokenFolder', {
+            folderId: folder.folder_id,
+            folderName: folder.folder_name,
+            reason,
+            queueKey: folder.queue_key,
+        });
+        window.setTimeout(() => {
+            renderCard(sourceLoadToken);
+            warmBuffer(sourceLoadToken);
+        }, 250);
+    }
+
     images.forEach(img => {
         const slot = img.closest('.image-slot');
         const markLoaded = () => {
@@ -1018,12 +1041,16 @@ function renderFolderCard(folder) {
                 placeholder.textContent = 'failed';
             }
             updateReadyState();
+            skipBrokenFolder(img.getAttribute('data-full-src') || img.getAttribute('src') || 'image_error');
         }, { once: true });
         if (img.complete && img.naturalWidth > 0) {
             markLoaded();
         }
     });
     updateReadyState();
+    if (images.length !== requiredCount) {
+        skipBrokenFolder('missing_frame_url');
+    }
 }
 
 async function refreshStats(loadToken = sourceLoadToken) {
