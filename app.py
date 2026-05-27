@@ -7132,7 +7132,12 @@ def api_cleanup_crops_inventory():
             for card in _cleanup_supabase_crop_cards(client, context)
             if _cleanup_card_matches_filters(card, filters)
         ]
-        fallback_groups = _cleanup_fallback_groups(client, context, buckets, filters)
+        include_fallback = str(request.args.get("include_fallback") or "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        fallback_groups = _cleanup_fallback_groups(client, context, buckets, filters) if include_fallback else []
         return jsonify(
             {
                 "source_context": context.to_payload(),

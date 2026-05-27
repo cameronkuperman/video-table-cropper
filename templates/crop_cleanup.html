@@ -89,6 +89,14 @@
     font-size: 0.72rem;
   }
   .frames { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 8px; }
+  .crop-meta {
+    display: grid;
+    gap: 4px;
+    padding: 0 10px 10px;
+    color: #9faab7;
+    font-size: 0.76rem;
+    overflow-wrap: anywhere;
+  }
   .frame, .reference {
     position: relative;
     aspect-ratio: 4 / 3;
@@ -130,8 +138,8 @@
   <main class="shell">
     <header>
       <div>
-	        <h1>Crop Artifact Cleanup</h1>
-	        <div class="muted">Pick a crop and soft-trash every associated Drive artifact folder.</div>
+	        <h1>Crop Review</h1>
+	        <div class="muted">Every active crop for the selected restaurant loads automatically.</div>
       </div>
       <div class="actions">
         <a href="/">Label Queue</a>
@@ -144,7 +152,7 @@
       <label>Source
         <select id="source"></select>
       </label>
-      <label>Site
+      <label>Restaurant
         <select id="site"></select>
       </label>
 	      <label>Channel
@@ -157,13 +165,16 @@
         <input id="query" placeholder="folder, table, crop id" />
       </label>
       <div class="actions">
-        <button id="load">Load</button>
+        <button id="load">Refresh</button>
       </div>
     </section>
 
     <div id="status" class="status">Idle</div>
 
-	    <h2>Crop Groups</h2>
+	    <h2>Supabase Crops</h2>
+	    <section id="supabase-grid" class="grid"></section>
+
+	    <h2>Fallback JSON Drive Artifacts</h2>
 	    <section id="fallback-grid" class="grid"></section>
   </main>
   <script src="/static/crop_cleanup.js"></script>

@@ -14,8 +14,11 @@ const el = {
 	query: document.getElementById('query'),
 	load: document.getElementById('load'),
 	status: document.getElementById('status'),
+	supabaseGrid: document.getElementById('supabase-grid'),
 	fallbackGrid: document.getElementById('fallback-grid'),
 };
+
+let reloadTimer = null;
 
 function escapeHtml(value) {
     return String(value ?? '')
@@ -51,6 +54,12 @@ function requestParams() {
         }
     }
     return params;
+}
+
+function requestUrl(includeFallback) {
+    const params = requestParams();
+    params.set('include_fallback', includeFallback ? '1' : '0');
+    return `/api/cleanup/crops/inventory?${params}`;
 }
 
 async function readJson(response) {
@@ -134,8 +143,13 @@ function renderSupabaseCard(crop) {
               crop.channel_hint,
               crop.table_hint,
               crop.crop_version ? `v${crop.crop_version}` : '',
+              crop.camera_name,
           ])}</div>
-          <div class="muted" style="margin-top:6px;">${escapeHtml(crop.table_camera_crops_id || crop.id)}</div>
+        </div>
+        <div class="crop-meta">
+          <div>crop: ${escapeHtml(crop.table_camera_crops_id || crop.id)}</div>
+          <div>camera: ${escapeHtml(crop.camera_source_id || '')}</div>
+          <div>table: ${escapeHtml(crop.table_id || '')}</div>
         </div>
       </article>
     `;
@@ -181,20 +195,29 @@ function renderFallbackGroup(group) {
 }
 
 function render(data) {
+	const supabaseCrops = data.supabase_crops || [];
 	const fallbackGroups = (data.fallback_groups || []).filter(group => !state.hiddenGroups.has(group.group_id));
-	el.fallbackGrid.innerHTML = fallbackGroups.length
-	    ? fallbackGroups.map(renderFallbackGroup).join('')
-	    : '<div class="muted">No Drive artifact groups found.</div>';
+	el.supabaseGrid.innerHTML = supabaseCrops.length
+	    ? supabaseCrops.map(renderSupabaseCard).join('')
+	    : '<div class="muted">No active Supabase crops found for this restaurant.</div>';
+	if (el.fallbackGrid) {
+		el.fallbackGrid.innerHTML = fallbackGroups.length
+		    ? fallbackGroups.map(renderFallbackGroup).join('')
+		    : '';
+	}
 	const counts = data.counts || {};
-	el.status.textContent = `${counts.fallback_groups || 0} crop groups · ${counts.fallback_folders || 0} Drive folders`;
+	el.status.textContent = `${counts.supabase_crops || 0} active crops · ${counts.fallback_groups || 0} fallback groups · ${counts.fallback_folders || 0} Drive folders`;
 }
 
 async function loadInventory() {
-    el.status.textContent = 'Loading cleanup inventory...';
+    el.status.textContent = 'Loading active crops...';
     el.load.disabled = true;
     try {
-        const data = await fetch(`/api/cleanup/crops/inventory?${requestParams()}`).then(readJson);
-        render(data);
+        const activeData = await fetch(requestUrl(false)).then(readJson);
+        render(activeData);
+        el.status.textContent = `${activeData.counts?.supabase_crops || 0} active crops · scanning fallback JSON Drive artifacts...`;
+        const cleanupData = await fetch(requestUrl(true)).then(readJson);
+        render(cleanupData);
     } catch (error) {
         el.status.textContent = error.message;
     } finally {
@@ -232,9 +255,18 @@ async function trashGroup(folderIds, groupLabel) {
 function bindEvents() {
     el.source.addEventListener('change', () => {
         el.site.disabled = el.source.value !== 'reolink';
+        state.hiddenGroups.clear();
+        loadInventory();
     });
+    el.site.addEventListener('change', () => {
+        state.hiddenGroups.clear();
+        loadInventory();
+    });
+    for (const input of [el.channel, el.table, el.query]) {
+        input.addEventListener('input', scheduleReload);
+    }
     el.load.addEventListener('click', loadInventory);
-    el.fallbackGrid.addEventListener('click', event => {
+    el.fallbackGrid?.addEventListener('click', event => {
         const button = event.target.closest('button[data-action]');
         if (!button) {
             return;
@@ -252,6 +284,11 @@ function bindEvents() {
             });
         }
     });
+}
+
+function scheduleReload() {
+    window.clearTimeout(reloadTimer);
+    reloadTimer = window.setTimeout(loadInventory, 250);
 }
 
 async function init() {
