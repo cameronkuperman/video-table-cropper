@@ -203,7 +203,7 @@ function render(data) {
 	if (el.fallbackGrid) {
 		el.fallbackGrid.innerHTML = fallbackGroups.length
 		    ? fallbackGroups.map(renderFallbackGroup).join('')
-		    : '';
+		    : '<div class="muted">No generated Drive artifact folders currently match legacy/fallback crop provenance for this restaurant.</div>';
 	}
 	const counts = data.counts || {};
 	el.status.textContent = `${counts.supabase_crops || 0} active crops · ${counts.fallback_groups || 0} fallback groups · ${counts.fallback_folders || 0} Drive folders`;

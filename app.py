@@ -801,6 +801,8 @@ def _crop_editor_url(site_key: str, channel_code: str | None = None) -> str:
 def _extract_reolink_channel_code(text: str) -> str | None:
     match = re.search(r"CH-CH(\d+)", text, re.IGNORECASE)
     if not match:
+        match = re.search(r"\bCH[\s_-]*(\d+)\b", text, re.IGNORECASE)
+    if not match:
         return None
     return f"CH-CH{int(match.group(1)):02d}"
 
@@ -1694,6 +1696,55 @@ def _cleanup_folder_matches_context(context: QueueContext, folder_name: str, app
     return True
 
 
+def _cleanup_lightweight_payload_for_folder(
+    client: DriveClient,
+    context: QueueContext,
+    folder: dict[str, Any],
+    bucket: str,
+    parent_id: str,
+) -> dict[str, Any] | None:
+    folder_id = str(folder.get("id") or "")
+    folder_name = str(folder.get("name") or "")
+    if not folder_id or not folder_name:
+        return None
+
+    metadata_item = client.find_file_by_name(folder_id, "metadata.json")
+    metadata = _load_json_file_from_drive(client, metadata_item)
+    source_type = _review_source_type(
+        context,
+        bucket,
+        parent_id,
+        folder_name,
+        {"source_label": None, "perception_file_name": None},
+    )
+    crop_provenance = _review_crop_provenance(context, metadata, source_type)
+    if crop_provenance["kind"] not in CROP_CLEANUP_FALLBACK_KINDS:
+        return None
+
+    return {
+        "folder_id": folder_id,
+        "folder_name": folder_name,
+        "parent_id": parent_id,
+        "bucket": bucket,
+        "current_label": bucket if bucket in LABEL_DESTINATIONS else None,
+        "review_source_type": source_type,
+        "crop_provenance": crop_provenance,
+        "crop_source_kind": crop_provenance["kind"],
+        "has_supabase_crop": False,
+        "is_fallback_crop": True,
+        "table_camera_crops_id": crop_provenance["table_camera_crops_id"],
+        "supabase_table_id": crop_provenance["supabase_table_id"],
+        "camera_source_id": crop_provenance["camera_source_id"],
+        "crop_version": crop_provenance["crop_version"],
+        "channel_hint": _review_channel_hint(folder_name, metadata),
+        "table_hint": _review_table_hint(folder_name, metadata),
+        "frame_count": 0,
+        "modified_time": folder.get("modifiedTime"),
+        "metadata_file_id": (metadata_item or {}).get("id"),
+        "frames": {},
+    }
+
+
 def _cleanup_fallback_groups(
     client: DriveClient,
     context: QueueContext,
@@ -1713,8 +1764,8 @@ def _cleanup_fallback_groups(
             if not _cleanup_folder_matches_context(context, folder_name, app_properties, bucket):
                 continue
             seen_folder_ids.add(folder_id)
-            payload = _review_payload_for_folder(client, context, folder, bucket, parent_id)
-            if payload is None or str(payload.get("crop_source_kind") or "") not in CROP_CLEANUP_FALLBACK_KINDS:
+            payload = _cleanup_lightweight_payload_for_folder(client, context, folder, bucket, parent_id)
+            if payload is None:
                 continue
             if not _review_payload_matches_filters(payload, filters):
                 continue

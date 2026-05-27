@@ -1319,6 +1319,26 @@ def test_crop_cleanup_inventory_shows_supabase_and_fallback_groups(client, fake_
     assert "supabase-clean" not in fallback_group["folder_ids"]
 
 
+def test_crop_cleanup_inventory_uses_lightweight_scan_for_legacy_artifacts(client, fake_drive):
+    for index in range(20):
+        folder_id = f"legacy-clean-{index}"
+        fake_drive._add_folder(
+            folder_id,
+            f"mimosas-Reolink-CH-CH03_table_top_{index}_t0002",
+            "video-clean",
+        )
+        fake_drive._add_triplet_files(folder_id, folder_id)
+
+    fake_drive.list_files_calls = 0
+    response = client.get("/api/cleanup/crops/inventory?source=reolink&site=restaurant-pi-1&bucket=clean")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["counts"]["fallback_groups"] == 20
+    assert payload["counts"]["fallback_folders"] == 20
+    assert fake_drive.list_files_calls == 0
+
+
 def test_crop_cleanup_group_visual_uses_true_ten_reference_and_crop_polygon(client, fake_drive, monkeypatch):
     fake_drive._add_folder("sr-10-root", "10frametrue", "project-root")
     fake_drive._add_folder("sr-10-matthews", "reolink-matthews-01", "sr-10-root")
@@ -2620,6 +2640,8 @@ def test_matthews_queue_blocks_when_channel_is_missing_crop_config(client, fake_
 
 
 def test_channel_name_maps_generally_to_matching_ipc_number():
+    assert label_app._extract_reolink_channel_code("Swann CH03") == "CH-CH03"
+    assert label_app._cleanup_channel_hint_from_camera({"name": "Swann CH03"}) == "CH-CH03"
     assert label_app._extract_reolink_channel_number("CH-CH03_t4377") == 3
     assert label_app._extract_reolink_channel_number("Reolink-CH-CH11_t0002") == 11
     assert label_app._derived_reolink_folder_name("CH-CH03_t4377", "table_top_1") == "CH-CH03_table_top_1_t4377"
