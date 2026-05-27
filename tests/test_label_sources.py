@@ -2905,6 +2905,31 @@ def test_reolink_preprocess_records_existing_drive_folders_in_local_state(monkey
     assert fake.items["r-ready"]["parents"] == ["site-restaurant:processed_raw"]
 
 
+def test_reolink_preprocess_skips_unassociated_zips_by_default(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    monkeypatch.setattr(label_app, "REOLINK_PROCESS_UNASSOCIATED_ZIPS", False)
+    monkeypatch.setattr(label_app, "_list_screenrecord_true_ten_folders", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(label_app, "_list_reolink_raw_folders", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(label_app, "_existing_generated_artifact_identities", lambda *_args, **_kwargs: set())
+
+    def fail_iterate(*_args, **_kwargs):
+        raise AssertionError("legacy unassociated zips should not be processed by default")
+
+    monkeypatch.setattr(label_app, "_iterate_unassociated_zip_batches", fail_iterate)
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1_000_000,
+    )
+
+    assert generated == 0
+
+
 def test_reolink_preprocess_failed_materialization_does_not_mark_state(monkeypatch, tmp_path):
     fake = FakeDriveClient()
     monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")

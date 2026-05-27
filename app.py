@@ -229,6 +229,10 @@ REOLINK_YOLO_BATCH_FRAMES = max(
     1,
     int(os.environ.get("REOLINK_YOLO_BATCH_FRAMES", "40") or "40"),
 )
+REOLINK_PROCESS_UNASSOCIATED_ZIPS = os.environ.get(
+    "REOLINK_PROCESS_UNASSOCIATED_ZIPS",
+    "0",
+).strip().lower() in {"1", "true", "yes", "on"}
 REOLINK_PREPROCESS_MAX_SECONDS = max(
     0.0,
     float(os.environ.get("REOLINK_PREPROCESS_MAX_SECONDS", "0") or "0"),
@@ -5283,113 +5287,111 @@ def _prepare_reolink_unlabeled_queue(
                 _invalidate_listing_cache(context.queue_key)
             return generated_count
 
-        # Phase 3: drain zipped unprocessed batches first (older queue from
-        # before the per-triplet upload pattern; lives at <site>/unassociated_zips/).
-        # Each zip is a batch of raw triplets compacted by
-        # scripts/compact_unassociated_to_zips.py. We download, extract,
-        # process each triplet from local files, then delete the zip when
-        # every triplet inside it has reached a terminal state.
-        for zip_batch in _iterate_unassociated_zip_batches(client, context):
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                break
-            if visible_count >= target_unlabeled_count:
-                break
-            for triplet in zip_batch.triplets:
+        # Legacy zip batches are old migration input, not normal queue material.
+        # Keep them available for explicit cleanup/audit, but do not silently
+        # turn them into new label folders unless an operator opts in.
+        if REOLINK_PROCESS_UNASSOCIATED_ZIPS:
+            for zip_batch in _iterate_unassociated_zip_batches(client, context):
                 if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                     break
                 if visible_count >= target_unlabeled_count:
                     break
-                triplet_id = triplet["id"]
-                if _reolink_raw_folder_processed(preprocess_state, context, triplet):
-                    zip_batch.mark_success(triplet_id)
-                    continue
+                for triplet in zip_batch.triplets:
+                    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                        break
+                    if visible_count >= target_unlabeled_count:
+                        break
+                    triplet_id = triplet["id"]
+                    if _reolink_raw_folder_processed(preprocess_state, context, triplet):
+                        zip_batch.mark_success(triplet_id)
+                        continue
 
-                mapped = _mapped_camera_tables_for_reolink_folder(
-                    str(triplet.get("name", "")),
-                    site_key=context.site_key,
-                    client=client,
-                )
-                if mapped is None:
-                    zip_batch.mark_failure(triplet_id)
-                    continue
+                    mapped = _mapped_camera_tables_for_reolink_folder(
+                        str(triplet.get("name", "")),
+                        site_key=context.site_key,
+                        client=client,
+                    )
+                    if mapped is None:
+                        zip_batch.mark_failure(triplet_id)
+                        continue
 
-                _channel_number, _camera, table_polygons = mapped
-                missing_table_polygons = [
-                    entry
-                    for entry in table_polygons
-                    if (
-                        _derived_reolink_folder_name(str(triplet["name"]), entry[0])
-                        not in existing_names
-                        and _apply_source_prefix(
-                            _derived_reolink_folder_name(str(triplet["name"]), entry[0]),
-                            label_source,
+                    _channel_number, _camera, table_polygons = mapped
+                    missing_table_polygons = [
+                        entry
+                        for entry in table_polygons
+                        if (
+                            _derived_reolink_folder_name(str(triplet["name"]), entry[0])
+                            not in existing_names
+                            and _apply_source_prefix(
+                                _derived_reolink_folder_name(str(triplet["name"]), entry[0]),
+                                label_source,
+                            )
+                            not in existing_names
+                            and _artifact_identity(
+                                str(triplet.get("name", "")),
+                                _camera_table_metadata(_camera, entry[0]),
+                                {},
+                            )
+                            not in existing_identities
                         )
-                        not in existing_names
-                        and _artifact_identity(
-                            str(triplet.get("name", "")),
-                            _camera_table_metadata(_camera, entry[0]),
-                            {},
+                    ]
+                    if not missing_table_polygons:
+                        _mark_reolink_raw_folder_processed(
+                            preprocess_state,
+                            context,
+                            triplet,
+                            status="complete",
+                            generated=0,
                         )
-                        not in existing_identities
-                    )
-                ]
-                if not missing_table_polygons:
-                    _mark_reolink_raw_folder_processed(
-                        preprocess_state,
-                        context,
-                        triplet,
-                        status="complete",
-                        generated=0,
-                    )
-                    zip_batch.mark_success(triplet_id)
-                    continue
+                        zip_batch.mark_success(triplet_id)
+                        continue
 
-                try:
-                    generated_names = _materialize_reolink_table_crops(
-                        client,
-                        context,
-                        triplet,
-                        missing_table_polygons,
-                        local_frame_paths=triplet["_local_frame_paths"],
-                        local_metadata_path=triplet.get("_local_metadata_path"),
-                    )
-                except Exception as exc:
-                    print(
-                        f"[zip-batch] crop failed for {triplet.get('name')} ({triplet_id}): {exc}"
-                    )
-                    zip_batch.mark_failure(triplet_id)
-                    continue
+                    try:
+                        generated_names = _materialize_reolink_table_crops(
+                            client,
+                            context,
+                            triplet,
+                            missing_table_polygons,
+                            local_frame_paths=triplet["_local_frame_paths"],
+                            local_metadata_path=triplet.get("_local_metadata_path"),
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[zip-batch] crop failed for {triplet.get('name')} ({triplet_id}): {exc}"
+                        )
+                        zip_batch.mark_failure(triplet_id)
+                        continue
 
-                raw_generated_count = 0
-                recorded_generated = _record_generated_reolink_artifacts(
-                    generated_names=generated_names,
-                    existing_names=existing_names,
-                    existing_identities=existing_identities,
-                    raw_name=str(triplet.get("name", "")),
-                    table_polygons=missing_table_polygons,
-                    camera=_camera,
-                    metadata={},
-                    label_source=label_source,
-                )
-                for _name in generated_names:
-                    unlabeled_count += 1
-                    visible_count += 1
-                    generated_any = True
-                    generated_count += 1
-                    raw_generated_count += 1
-                raw_generated_count = max(raw_generated_count, recorded_generated)
-
-                if raw_generated_count > 0:
-                    _mark_reolink_raw_folder_processed(
-                        preprocess_state,
-                        context,
-                        triplet,
-                        status="complete",
-                        generated=raw_generated_count,
+                    raw_generated_count = 0
+                    recorded_generated = _record_generated_reolink_artifacts(
+                        generated_names=generated_names,
+                        existing_names=existing_names,
+                        existing_identities=existing_identities,
+                        raw_name=str(triplet.get("name", "")),
+                        table_polygons=missing_table_polygons,
+                        camera=_camera,
+                        metadata={},
+                        label_source=label_source,
                     )
-                    zip_batch.mark_success(triplet_id)
-                else:
-                    zip_batch.mark_failure(triplet_id)
+                    for _name in generated_names:
+                        unlabeled_count += 1
+                        visible_count += 1
+                        generated_any = True
+                        generated_count += 1
+                        raw_generated_count += 1
+                    raw_generated_count = max(raw_generated_count, recorded_generated)
+
+                    if raw_generated_count > 0:
+                        _mark_reolink_raw_folder_processed(
+                            preprocess_state,
+                            context,
+                            triplet,
+                            status="complete",
+                            generated=raw_generated_count,
+                        )
+                        zip_batch.mark_success(triplet_id)
+                    else:
+                        zip_batch.mark_failure(triplet_id)
 
         if visible_count >= target_unlabeled_count:
             if generated_any:
