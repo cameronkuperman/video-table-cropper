@@ -25,6 +25,7 @@ def isolate_supabase_crop_env(monkeypatch):
     monkeypatch.delenv("DB_SERVICE_ROLE_KEY", raising=False)
     monkeypatch.delenv("SUPABASE_DB_SCHEMA", raising=False)
     label_app._supabase_crop_cache.clear()
+    label_app._cleanup_reference_cache.clear()
     label_app._set_supabase_crop_status(
         enabled=False,
         last_error=None,
@@ -237,6 +238,16 @@ class FakeDriveClient:
             self._copy(child_id)
             for child_id in self.children.get(parent_id, [])
             if self.items[child_id].get("mimeType") == label_app.FOLDER_MIME
+            and not self.items[child_id].get("trashed")
+        ]
+
+    def list_folders_by_name_contains(self, parent_id: str, text: str, fields: str = "") -> list[dict]:
+        needle = text.lower()
+        return [
+            self._copy(child_id)
+            for child_id in self.children.get(parent_id, [])
+            if self.items[child_id].get("mimeType") == label_app.FOLDER_MIME
+            and needle in self.items[child_id]["name"].lower()
             and not self.items[child_id].get("trashed")
         ]
 
@@ -1370,7 +1381,7 @@ def test_crop_cleanup_group_visual_uses_true_ten_reference_and_crop_polygon(clie
     assert group["reference"]["preview_url"] == "/api/preview/sr-10-ch03-f0"
     assert group["polygon"] == [[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0]]
     assert groups["table_top_2"]["reference"]["preview_url"] == "/api/preview/sr-10-ch03-f0"
-    assert downloaded_reference_ids == ["sr-10-ch03-f0"]
+    assert downloaded_reference_ids == []
 
 
 def test_crop_cleanup_trash_soft_trashes_only_validated_fallback_folders(client, fake_drive):

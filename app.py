@@ -642,6 +642,8 @@ _camera_config_lock = Lock()
 _crop_config_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
 _crop_config_lock = Lock()
 _CROP_CONFIG_CACHE_MISS = object()
+_cleanup_reference_cache: dict[tuple[str, str, str, int, int], dict[str, Any] | None] = {}
+_cleanup_reference_cache_lock = Lock()
 _supabase_crop_cache: dict[str, dict[str, Any]] = {}
 _supabase_crop_cache_lock = Lock()
 _supabase_crop_status: dict[str, Any] = {
@@ -1528,17 +1530,144 @@ def _cleanup_reference_for_channel(
         return None
     try:
         channel_code = _normalize_reolink_channel_code(channel_hint) or channel_hint
-        true_ten_reference = _find_reolink_true_ten_reference_frame(
-            client,
-            context,
-            channel_code,
-            fallback_dimensions,
+        dimensions = (
+            int((fallback_dimensions or (0, 0))[0] or 0),
+            int((fallback_dimensions or (0, 0))[1] or 0),
         )
-        if true_ten_reference is not None:
-            return true_ten_reference
-        return _find_reolink_reference_frame(client, context.site_key, channel_code)
+        cache_key = (context.queue_key, context.site_key, channel_code, dimensions[0], dimensions[1])
+        with _cleanup_reference_cache_lock:
+            if cache_key in _cleanup_reference_cache:
+                return _cleanup_reference_cache[cache_key]
+
+        reference = _cleanup_fast_reference_for_channel(client, context, channel_code, dimensions)
+        with _cleanup_reference_cache_lock:
+            _cleanup_reference_cache[cache_key] = reference
+        return reference
     except Exception:
         return None
+
+
+def _cleanup_channel_search_terms(channel_code: str) -> list[str]:
+    normalized = _normalize_reolink_channel_code(channel_code) or channel_code
+    terms = [normalized]
+    channel_number = _extract_reolink_channel_number(normalized)
+    if channel_number is not None:
+        terms.extend(
+            [
+                f"CH{channel_number:02d}",
+                f"CH{channel_number}",
+                f"IPC{channel_number}",
+                f"IPC{channel_number:02d}",
+            ]
+        )
+    seen: set[str] = set()
+    unique_terms: list[str] = []
+    for term in terms:
+        value = str(term or "").strip()
+        if not value or value.lower() in seen:
+            continue
+        seen.add(value.lower())
+        unique_terms.append(value)
+    return unique_terms
+
+
+def _cleanup_reference_candidate_folders(
+    client: DriveClient,
+    parent_id: str,
+    channel_code: str,
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    folders: list[dict[str, Any]] = []
+    fields = "id,name,mimeType,parents,appProperties,modifiedTime"
+    for term in _cleanup_channel_search_terms(channel_code):
+        if hasattr(client, "list_folders_by_name_contains"):
+            candidates = client.list_folders_by_name_contains(parent_id, term, fields=fields)
+        else:
+            candidates = [
+                folder
+                for folder in client.list_folders(parent_id, fields=fields)
+                if term.lower() in str(folder.get("name") or "").lower()
+            ]
+        for folder in candidates:
+            folder_id = str(folder.get("id") or "")
+            if not folder_id or folder_id in seen:
+                continue
+            seen.add(folder_id)
+            folders.append(folder)
+    return sorted(
+        folders,
+        key=lambda item: (
+            str(item.get("modifiedTime") or ""),
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )
+
+
+def _cleanup_reference_from_parent(
+    client: DriveClient,
+    context: QueueContext,
+    parent_id: str,
+    channel_code: str,
+    source: str,
+    fallback_dimensions: tuple[int, int],
+) -> dict[str, Any] | None:
+    normalized_channel = _normalize_reolink_channel_code(channel_code) or channel_code
+    for raw_folder in _cleanup_reference_candidate_folders(client, parent_id, normalized_channel):
+        folder_name = str(raw_folder.get("name") or "")
+        folder_channel = _extract_reolink_channel_code(folder_name)
+        if folder_channel and folder_channel != normalized_channel:
+            continue
+        frame_item = client.find_file_by_name(str(raw_folder["id"]), "frame_0.jpg")
+        if not frame_item or not frame_item.get("id"):
+            continue
+        return {
+            "site_key": context.site_key or "",
+            "site_label": context.display_name,
+            "channel_code": normalized_channel,
+            "raw_folder_id": str(raw_folder["id"]),
+            "raw_folder_name": folder_name,
+            "frame_file_id": str(frame_item["id"]),
+            "preview_url": f"/api/preview/{frame_item['id']}",
+            "source": source,
+            "width": int((fallback_dimensions or (0, 0))[0] or 0),
+            "height": int((fallback_dimensions or (0, 0))[1] or 0),
+        }
+    return None
+
+
+def _cleanup_fast_reference_for_channel(
+    client: DriveClient,
+    context: QueueContext,
+    channel_code: str,
+    fallback_dimensions: tuple[int, int] = (0, 0),
+) -> dict[str, Any] | None:
+    true_ten_parent_id = context.folder_ids.get(SCREENRECORD_TRUE_TEN_NODE_KEY)
+    if true_ten_parent_id:
+        reference = _cleanup_reference_from_parent(
+            client,
+            context,
+            true_ten_parent_id,
+            channel_code,
+            SCREENRECORD_TRUE_TEN_FOLDER_NAME,
+            fallback_dimensions,
+        )
+        if reference is not None:
+            return reference
+
+    if context.seed_folder_id:
+        reference = _cleanup_reference_from_parent(
+            client,
+            context,
+            context.seed_folder_id,
+            channel_code,
+            "unassociated",
+            fallback_dimensions,
+        )
+        if reference is not None:
+            return reference
+
+    return None
 
 
 def _cleanup_supabase_crop_cards(client: DriveClient, context: QueueContext) -> list[dict[str, Any]]:
