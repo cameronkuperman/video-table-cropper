@@ -1350,6 +1350,27 @@ def test_crop_cleanup_inventory_uses_lightweight_scan_for_legacy_artifacts(clien
     assert fake_drive.list_files_calls == 0
 
 
+def test_crop_cleanup_inventory_infers_mimosas_channel_folders_as_legacy(client, fake_drive):
+    fake_drive._add_folder(
+        "legacy-mimosas-channel",
+        "mimosas-CH-CH03_table_top_10_t4386",
+        "video-clean",
+    )
+    fake_drive._add_triplet_files("legacy-mimosas-channel", "legacy-mimosas-channel")
+
+    response = client.get("/api/cleanup/crops/inventory?source=reolink&site=restaurant-pi-1&bucket=clean")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["counts"]["fallback_groups"] == 1
+    assert payload["counts"]["fallback_folders"] == 1
+    group = payload["fallback_groups"][0]
+    assert group["channel_hint"] == "CH-CH03"
+    assert group["table_hint"] == "table_top_10"
+    assert group["crop_source_kind"] == "fallback_json"
+    assert group["folder_ids"] == ["legacy-mimosas-channel"]
+
+
 def test_crop_cleanup_group_visual_uses_true_ten_reference_and_crop_polygon(client, fake_drive, monkeypatch):
     fake_drive._add_folder("sr-10-root", "10frametrue", "project-root")
     fake_drive._add_folder("sr-10-matthews", "reolink-matthews-01", "sr-10-root")

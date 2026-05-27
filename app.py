@@ -1184,6 +1184,10 @@ def _folder_matches_review_source(folder_name: str, context: QueueContext, bucke
     return not prefix or folder_name.startswith(f"{prefix}-")
 
 
+def _folder_name_has_reolink_channel(folder_name: str) -> bool:
+    return bool(_extract_reolink_channel_code(folder_name) or re.search(r"IPC[\s_-]*\d+", folder_name, re.IGNORECASE))
+
+
 def _review_folder_matches_context(context: QueueContext, folder_name: str, app_properties: dict[str, Any], bucket: str) -> bool:
     if bucket not in LABEL_DESTINATIONS:
         return True
@@ -1202,7 +1206,7 @@ def _review_folder_matches_context(context: QueueContext, folder_name: str, app_
     if site_key and site_key != (context.site_key or ""):
         return False
 
-    is_reolink_name = "Reolink-" in folder_name
+    is_reolink_name = "Reolink-" in folder_name or _folder_name_has_reolink_channel(folder_name)
     if context.source == REOLINK_SOURCE:
         return is_reolink_name
     if context.source == VIDEO_SOURCE:
@@ -1257,7 +1261,7 @@ def _review_source_type(
         return "screenrecord"
     if bucket in LABEL_DESTINATIONS:
         return "labeled"
-    if context.source == REOLINK_SOURCE and "Reolink-" in folder_name:
+    if context.source == REOLINK_SOURCE and ("Reolink-" in folder_name or _folder_name_has_reolink_channel(folder_name)):
         return "legacy"
     return "generated"
 
@@ -1817,7 +1821,7 @@ def _cleanup_folder_matches_context(context: QueueContext, folder_name: str, app
     prefix = _review_source_prefix(context)
     if prefix and folder_name.startswith(f"{prefix}-"):
         return True
-    is_reolink_name = "Reolink-" in folder_name
+    is_reolink_name = "Reolink-" in folder_name or _folder_name_has_reolink_channel(folder_name)
     if context.source == REOLINK_SOURCE:
         return is_reolink_name
     if context.source == VIDEO_SOURCE:
