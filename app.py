@@ -1748,6 +1748,124 @@ def _cleanup_group_key(context: QueueContext, payload: dict[str, Any]) -> str:
     return "|".join([context.queue_key, crop_kind, channel, table])
 
 
+def _cleanup_merge_key(group: dict[str, Any]) -> tuple[str, str, str]:
+    crop_kind = str(group.get("crop_source_kind") or "fallback_json").strip().lower()
+    channel = str(group.get("channel_hint") or "unknown-channel").strip().lower()
+    table = str(group.get("table_hint") or group.get("group_id") or "unknown-table").strip().lower()
+    return crop_kind, channel, table
+
+
+def _cleanup_polygon_payload(points: list | tuple | None) -> list[list[float]]:
+    polygon: list[list[float]] = []
+    for point in points or []:
+        if isinstance(point, (list, tuple)) and len(point) == 2:
+            polygon.append([float(point[0]), float(point[1])])
+    return polygon
+
+
+def _cleanup_legacy_definition_group(
+    context: QueueContext,
+    *,
+    crop_source_kind: str,
+    crop_label: str,
+    channel_hint: str,
+    table_hint: str,
+    polygon: list | tuple | None,
+    reference_dimensions: tuple[int, int],
+    legacy_source: str,
+) -> dict[str, Any]:
+    payload = {
+        "folder_name": f"{legacy_source}:{channel_hint}:{table_hint}",
+        "channel_hint": channel_hint,
+        "table_hint": table_hint,
+        "crop_source_kind": crop_source_kind,
+        "frame_count": 0,
+    }
+    return {
+        "group_id": _cleanup_group_key(context, payload),
+        "crop_source_kind": crop_source_kind,
+        "crop_label": crop_label,
+        "channel_hint": channel_hint,
+        "table_hint": table_hint,
+        "folder_ids": [],
+        "folder_count": 0,
+        "bucket_counts": {},
+        "representative": None,
+        "folders": [],
+        "polygon": _cleanup_polygon_payload(polygon),
+        "reference_dimensions": reference_dimensions,
+        "legacy_source": legacy_source,
+        "has_legacy_definition": True,
+    }
+
+
+def _cleanup_legacy_json_definition_groups(
+    client: DriveClient,
+    context: QueueContext,
+    filters: dict[str, str],
+) -> list[dict[str, Any]]:
+    if context.source != REOLINK_SOURCE or not context.site_key:
+        return []
+
+    groups: list[dict[str, Any]] = []
+    if _site_uses_manual_crop_configs(context.site_key):
+        crop_config_folder_id = context.folder_ids.get("crop_configs")
+        if not crop_config_folder_id:
+            return []
+        for item in client.list_files(crop_config_folder_id):
+            name = str(item.get("name") or "")
+            if not name.lower().endswith(".json"):
+                continue
+            channel_hint = _normalize_reolink_channel_code(name[:-5]) or name[:-5]
+            config = _load_json_file_from_drive(client, item)
+            if not isinstance(config, dict):
+                continue
+            reference = config.get("reference") or {}
+            dimensions = (int(reference.get("width") or 0), int(reference.get("height") or 0))
+            for table_id, _tight_poly, _tight_bbox, zone_poly in _build_table_polygons_from_crop_config(config):
+                group = _cleanup_legacy_definition_group(
+                    context,
+                    crop_source_kind="drive_crop_config",
+                    crop_label="Drive crop config JSON definition",
+                    channel_hint=channel_hint,
+                    table_hint=table_id,
+                    polygon=zone_poly,
+                    reference_dimensions=dimensions,
+                    legacy_source=f"crop_configs/{name}",
+                )
+                filter_payload = dict(
+                    group,
+                    folder_name=f"{group['legacy_source']}:{group['channel_hint']}:{group['table_hint']}",
+                )
+                if _review_payload_matches_filters(filter_payload, filters):
+                    groups.append(group)
+        return groups
+
+    legacy_source = _table_config_path().name
+    for channel_number, camera in sorted(_camera_configs_by_number().items()):
+        channel_hint = f"CH-CH{channel_number:02d}"
+        width = int(camera.get("image_width") or 0)
+        height = int(camera.get("image_height") or 0)
+        for table_id, _tight_poly, _tight_bbox, zone_poly in _build_table_polygons(camera):
+            group = _cleanup_legacy_definition_group(
+                context,
+                crop_source_kind="fallback_json",
+                crop_label="Fallback JSON definition",
+                channel_hint=channel_hint,
+                table_hint=table_id,
+                polygon=zone_poly,
+                reference_dimensions=(width, height),
+                legacy_source=legacy_source,
+            )
+            filter_payload = dict(
+                group,
+                folder_name=f"{group['legacy_source']}:{group['channel_hint']}:{group['table_hint']}",
+            )
+            if _review_payload_matches_filters(filter_payload, filters):
+                groups.append(group)
+    return groups
+
+
 def _cleanup_manual_crop_visual(
     client: DriveClient,
     context: QueueContext,
@@ -1796,7 +1914,11 @@ def _cleanup_attach_group_visuals(
         channel_hint = str(group.get("channel_hint") or "").strip()
         table_hint = str(group.get("table_hint") or "").strip()
         manual_visual = _cleanup_manual_crop_visual(client, context, channel_hint, table_hint)
-        fallback_dimensions = manual_visual.get("reference_dimensions") or (0, 0)
+        fallback_dimensions = (
+            manual_visual.get("reference_dimensions")
+            or group.get("reference_dimensions")
+            or (0, 0)
+        )
         reference_key = (
             _normalize_reolink_channel_code(channel_hint) or channel_hint,
             fallback_dimensions,
@@ -1933,6 +2055,50 @@ def _cleanup_fallback_groups(
         key=lambda group: (
             str(group.get("channel_hint") or ""),
             str(group.get("table_hint") or ""),
+            -int(group.get("folder_count") or 0),
+        ),
+    )
+    return _cleanup_attach_group_visuals(client, context, sorted_groups)
+
+
+def _cleanup_legacy_crop_groups(
+    client: DriveClient,
+    context: QueueContext,
+    buckets: list[str],
+    filters: dict[str, str],
+) -> list[dict[str, Any]]:
+    definition_groups = _cleanup_legacy_json_definition_groups(client, context, filters)
+    artifact_groups = _cleanup_fallback_groups(client, context, buckets, filters)
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    for group in definition_groups:
+        merged[_cleanup_merge_key(group)] = group
+
+    for artifact_group in artifact_groups:
+        key = _cleanup_merge_key(artifact_group)
+        existing = merged.get(key)
+        if existing is None:
+            artifact_group.setdefault("has_legacy_definition", False)
+            artifact_group.setdefault("legacy_source", None)
+            merged[key] = artifact_group
+            continue
+        existing["folder_ids"] = list(artifact_group.get("folder_ids") or [])
+        existing["folder_count"] = int(artifact_group.get("folder_count") or 0)
+        existing["bucket_counts"] = dict(artifact_group.get("bucket_counts") or {})
+        existing["representative"] = artifact_group.get("representative")
+        existing["folders"] = list(artifact_group.get("folders") or [])
+        existing["artifact_group_id"] = artifact_group.get("group_id")
+        if artifact_group.get("reference") and not existing.get("reference"):
+            existing["reference"] = artifact_group["reference"]
+        if artifact_group.get("polygon") and not existing.get("polygon"):
+            existing["polygon"] = artifact_group["polygon"]
+
+    sorted_groups = sorted(
+        merged.values(),
+        key=lambda group: (
+            str(group.get("channel_hint") or ""),
+            str(group.get("table_hint") or ""),
+            0 if group.get("has_legacy_definition") else 1,
             -int(group.get("folder_count") or 0),
         ),
     )
@@ -7319,7 +7485,7 @@ def api_cleanup_crops_inventory():
             "false",
             "no",
         }
-        fallback_groups = _cleanup_fallback_groups(client, context, buckets, filters) if include_fallback else []
+        fallback_groups = _cleanup_legacy_crop_groups(client, context, buckets, filters) if include_fallback else []
         return jsonify(
             {
                 "source_context": context.to_payload(),
@@ -7329,6 +7495,7 @@ def api_cleanup_crops_inventory():
                 "counts": {
                     "supabase_crops": len(supabase_cards),
                     "fallback_groups": len(fallback_groups),
+                    "legacy_definitions": sum(1 for group in fallback_groups if group.get("has_legacy_definition")),
                     "fallback_folders": sum(int(group.get("folder_count") or 0) for group in fallback_groups),
                 },
             }

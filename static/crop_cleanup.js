@@ -159,6 +159,7 @@ function renderFallbackGroup(group) {
 	const representative = group.representative || {};
 	const referenceVisual = renderReferenceVisual(group.reference || {}, group.polygon || []);
 	const groupLabel = group.table_hint || group.group_id || 'unknown crop';
+	const folderIds = group.folder_ids || [];
 	const frames = frameEntries(representative);
 	const frameHtml = frames.map(([key, fileId]) => `
 	  <a class="frame" href="/api/preview/${encodeURIComponent(fileId)}" target="_blank" title="${escapeHtml(key)}">
@@ -171,25 +172,37 @@ function renderFallbackGroup(group) {
     const folders = (group.folders || []).map(folder => `
       <li>${escapeHtml(folder.bucket)} · ${escapeHtml(folder.folder_name)} · ${escapeHtml(folder.folder_id)}</li>
     `).join('');
+    const trashButton = folderIds.length
+        ? `<button class="danger" data-action="trash" data-group-label="${escapeHtml(groupLabel)}" data-folder-ids="${escapeHtml(folderIds.join(','))}">Trash legacy Drive folders</button>`
+        : '<button class="secondary" disabled>No Drive folders</button>';
+    const detailsHtml = folderIds.length
+        ? `<details>
+             <summary>Associated Drive folders</summary>
+             <ul class="folder-list">${folders}</ul>
+           </details>`
+        : `<details>
+             <summary>Legacy definition source</summary>
+             <ul class="folder-list"><li>${escapeHtml(group.legacy_source || 'legacy crop JSON')}</li></ul>
+           </details>`;
 	return `
 	  <article class="card" data-group-id="${escapeHtml(group.group_id)}">
 	    ${referenceVisual || `<div class="frames">${frameHtml}</div>`}
 	    <div class="card-head">
 	      <div class="card-title" title="${escapeHtml(group.table_hint || group.group_id)}">${escapeHtml(group.table_hint || 'unknown table')}</div>
 	      <div class="chips">${chipHtml([
+	          group.has_legacy_definition ? 'Legacy JSON' : 'Legacy artifact',
+	          group.crop_label,
 	          group.channel_hint,
-	          `${group.folder_count || 0} folders`,
+	          `${group.folder_count || 0} Drive folders`,
 	          bucketSummary,
+	          group.legacy_source,
           ])}</div>
 	    </div>
 	    <div class="card-actions">
-	      <button class="danger" data-action="trash" data-group-label="${escapeHtml(groupLabel)}" data-folder-ids="${escapeHtml((group.folder_ids || []).join(','))}">Trash all Drive folders for this crop</button>
+	      ${trashButton}
 	      <button class="secondary" data-action="hide">Keep / Hide</button>
         </div>
-        <details>
-          <summary>Associated Drive folders</summary>
-          <ul class="folder-list">${folders}</ul>
-        </details>
+        ${detailsHtml}
       </article>
     `;
 }
@@ -203,10 +216,10 @@ function render(data) {
 	if (el.fallbackGrid) {
 		el.fallbackGrid.innerHTML = fallbackGroups.length
 		    ? fallbackGroups.map(renderFallbackGroup).join('')
-		    : '<div class="muted">No generated Drive artifact folders currently match legacy/fallback crop provenance for this restaurant.</div>';
+		    : '<div class="muted">No legacy JSON crop definitions or legacy Drive artifact folders match this restaurant/filter.</div>';
 	}
 	const counts = data.counts || {};
-	el.status.textContent = `${counts.supabase_crops || 0} active crops · ${counts.fallback_groups || 0} fallback groups · ${counts.fallback_folders || 0} Drive folders`;
+	el.status.textContent = `${counts.supabase_crops || 0} active crops · ${counts.legacy_definitions || 0} legacy definitions · ${counts.fallback_folders || 0} legacy Drive folders`;
 }
 
 async function loadInventory() {
@@ -215,7 +228,7 @@ async function loadInventory() {
     try {
         const activeData = await fetch(requestUrl(false)).then(readJson);
         render(activeData);
-        el.status.textContent = `${activeData.counts?.supabase_crops || 0} active crops · scanning legacy Drive crop artifacts...`;
+        el.status.textContent = `${activeData.counts?.supabase_crops || 0} active crops · loading legacy JSON definitions and Drive artifacts...`;
         const cleanupData = await fetch(requestUrl(true)).then(readJson);
         render(cleanupData);
     } catch (error) {

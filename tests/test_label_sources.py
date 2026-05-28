@@ -1287,20 +1287,20 @@ def test_crop_cleanup_inventory_shows_supabase_and_fallback_groups(client, fake_
                     {
                         "id": "table-uuid",
                         "restaurant_id": "restaurant-uuid",
-                        "host_facing_label": "Table 9",
-                        "table_number": "9",
-                        "internal_name": "table_top_9",
+                        "host_facing_label": "Table 6",
+                        "table_number": "6",
+                        "internal_name": "table_top_6",
                     }
                 ]
             return []
 
     label_app._supabase_crop_cache.clear()
     monkeypatch.setattr(label_app, "_get_supabase_crop_client", lambda: FakeSupabase())
-    fake_drive._add_folder("json-clean-a", "mimosas-Reolink-CH-CH04_table_top_9_t0001", "video-clean")
+    fake_drive._add_folder("json-clean-a", "mimosas-Reolink-CH-CH04_table_top_6_t0001", "video-clean")
     fake_drive._add_triplet_files("json-clean-a", "json-clean-a")
-    fake_drive._add_folder("json-dirty-a", "mimosas-Reolink-CH-CH04_table_top_9_t0002", "video-dirty")
+    fake_drive._add_folder("json-dirty-a", "mimosas-Reolink-CH-CH04_table_top_6_t0002", "video-dirty")
     fake_drive._add_triplet_files("json-dirty-a", "json-dirty-a")
-    fake_drive._add_folder("supabase-clean", "mimosas-Reolink-CH-CH04_table_top_9_t0003", "video-clean")
+    fake_drive._add_folder("supabase-clean", "mimosas-Reolink-CH-CH04_table_top_6_t0003", "video-clean")
     fake_drive._add_triplet_files("supabase-clean", "supabase-clean")
     fake_drive._add_file(
         "supabase-clean-metadata",
@@ -1323,11 +1323,37 @@ def test_crop_cleanup_inventory_shows_supabase_and_fallback_groups(client, fake_
     assert payload["counts"]["supabase_crops"] == 1
     assert payload["supabase_crops"][0]["table_camera_crops_id"] == "crop-uuid"
     assert payload["supabase_crops"][0]["reference"]["preview_url"].startswith("/api/preview/")
-    assert payload["counts"]["fallback_groups"] == 1
-    fallback_group = payload["fallback_groups"][0]
+    assert payload["counts"]["legacy_definitions"] >= 1
+    fallback_group = next(
+        group
+        for group in payload["fallback_groups"]
+        if group["channel_hint"] == "CH-CH04" and group["table_hint"] == "table_top_6"
+    )
+    assert fallback_group["has_legacy_definition"] is True
+    assert fallback_group["legacy_source"] in {"approved_table_rectangles.json", "approved_tables.json"}
     assert set(fallback_group["folder_ids"]) == {"json-clean-a", "json-dirty-a"}
     assert fallback_group["folder_count"] == 2
     assert "supabase-clean" not in fallback_group["folder_ids"]
+
+
+def test_crop_cleanup_inventory_shows_legacy_json_definitions_without_artifacts(client, fake_drive):
+    response = client.get(
+        "/api/cleanup/crops/inventory?source=reolink&site=restaurant-pi-1&bucket=clean&channel=CH-CH03&table=table_top_1"
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["counts"]["legacy_definitions"] >= 1
+    assert payload["counts"]["fallback_folders"] == 0
+    group = next(
+        group
+        for group in payload["fallback_groups"]
+        if group["channel_hint"] == "CH-CH03" and group["table_hint"] == "table_top_1"
+    )
+    assert group["crop_source_kind"] == "fallback_json"
+    assert group["has_legacy_definition"] is True
+    assert group["folder_ids"] == []
+    assert group["polygon"]
 
 
 def test_crop_cleanup_inventory_uses_lightweight_scan_for_legacy_artifacts(client, fake_drive):
@@ -1345,8 +1371,8 @@ def test_crop_cleanup_inventory_uses_lightweight_scan_for_legacy_artifacts(clien
     payload = response.get_json()
 
     assert response.status_code == 200
-    assert payload["counts"]["fallback_groups"] == 20
     assert payload["counts"]["fallback_folders"] == 20
+    assert sum(int(group["folder_count"]) for group in payload["fallback_groups"]) == 20
     assert fake_drive.list_files_calls == 0
 
 
@@ -1362,9 +1388,8 @@ def test_crop_cleanup_inventory_infers_mimosas_channel_folders_as_legacy(client,
     payload = response.get_json()
 
     assert response.status_code == 200
-    assert payload["counts"]["fallback_groups"] == 1
     assert payload["counts"]["fallback_folders"] == 1
-    group = payload["fallback_groups"][0]
+    group = next(group for group in payload["fallback_groups"] if group["folder_ids"] == ["legacy-mimosas-channel"])
     assert group["channel_hint"] == "CH-CH03"
     assert group["table_hint"] == "table_top_10"
     assert group["crop_source_kind"] == "fallback_json"
@@ -1395,7 +1420,6 @@ def test_crop_cleanup_group_visual_uses_true_ten_reference_and_crop_polygon(clie
     payload = response.get_json()
 
     assert response.status_code == 200
-    assert payload["counts"]["fallback_groups"] == 2
     groups = {group["table_hint"]: group for group in payload["fallback_groups"]}
     group = groups["table_top_1"]
     assert group["reference"]["source"] == "10frametrue"
