@@ -25,6 +25,7 @@ def isolate_supabase_crop_env(monkeypatch):
     monkeypatch.delenv("DB_SERVICE_ROLE_KEY", raising=False)
     monkeypatch.delenv("SUPABASE_DB_SCHEMA", raising=False)
     label_app._supabase_crop_cache.clear()
+    label_app._cleanup_reference_cache.clear()
     label_app._set_supabase_crop_status(
         enabled=False,
         last_error=None,
@@ -79,6 +80,8 @@ class FakeDriveClient:
         self.created_subfolders: list[tuple[str, str, str]] = []
         self.moves: list[tuple[str, str, str | None]] = []
         self.trashed: list[str] = []
+        self.permanent_deleted: list[str] = []
+        self.list_files_calls = 0
         self._seed()
 
     def _seed(self) -> None:
@@ -238,7 +241,18 @@ class FakeDriveClient:
             and not self.items[child_id].get("trashed")
         ]
 
+    def list_folders_by_name_contains(self, parent_id: str, text: str, fields: str = "") -> list[dict]:
+        needle = text.lower()
+        return [
+            self._copy(child_id)
+            for child_id in self.children.get(parent_id, [])
+            if self.items[child_id].get("mimeType") == label_app.FOLDER_MIME
+            and needle in self.items[child_id]["name"].lower()
+            and not self.items[child_id].get("trashed")
+        ]
+
     def list_files(self, folder_id: str, fields: str = "") -> list[dict]:
+        self.list_files_calls += 1
         return [
             self._copy(child_id)
             for child_id in self.children.get(folder_id, [])
@@ -282,6 +296,10 @@ class FakeDriveClient:
         self.items[file_id]["trashed"] = True
         self.trashed.append(file_id)
         return self._copy(file_id)
+
+    def delete_file(self, file_id: str) -> None:
+        self.permanent_deleted.append(file_id)
+        self.items.pop(file_id, None)
 
     def _trash_duplicate_named_files(self, parent_id: str, file_name: str, keep_file_id: str) -> None:
         for item in self.find_files_by_name(parent_id, file_name):
@@ -652,6 +670,131 @@ def test_screenrecord_true_ten_generation_creates_three_crops_and_perception(mon
     assert perception["n_frames"] == 10
 
 
+def test_screenrecord_true_ten_generation_batches_yolo_across_folders(monkeypatch, tmp_path):
+    import person_detector
+
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    fake._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake._add_folder("sr-10-node", "restaurant-pi-1", "sr-10-root")
+    fake._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+    for raw_id, triplet_index in (("sr-raw-a", 15), ("sr-raw-b", 16)):
+        fake._add_folder(raw_id, f"IPC4_t{triplet_index:04d}", "sr-10-node")
+        for idx in range(10):
+            fake._add_file(
+                f"{raw_id}-frame-{idx}",
+                f"frame_{idx}.jpg",
+                raw_id,
+                content=_jpeg_bytes(color=(idx * 10, triplet_index, 40)),
+            )
+        fake._add_file(
+            f"{raw_id}-metadata",
+            "metadata.json",
+            raw_id,
+            mime_type="application/json",
+            content=json.dumps(
+                {"camera_id": "IPC4", "triplet_stem": "IPC4", "triplet_index": triplet_index}
+            ).encode("utf-8"),
+        )
+
+    batch_sizes: list[int] = []
+    monkeypatch.setattr(label_app, "_get_yolo_model", lambda: (lambda *_args, **_kwargs: None))
+    monkeypatch.setattr(
+        person_detector,
+        "detect_people_batch",
+        lambda frame_paths, *_args, **_kwargs: batch_sizes.append(len(frame_paths)) or [[] for _ in frame_paths],
+    )
+    monkeypatch.setattr(
+        label_app,
+        "_mapped_camera_tables_for_screenrecord_folder",
+        lambda *_args, **_kwargs: (
+            4,
+            {"camera_number": 4, "image_width": 80, "image_height": 60},
+            [("table_top_1", [(0, 0), (40, 0), (40, 40), (0, 40)], (0, 0, 40, 40), [(0, 0), (50, 0), (50, 50), (0, 50)])],
+        ),
+    )
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1,
+    )
+
+    assert generated == 2
+    assert batch_sizes == [20]
+    assert fake.find_file_by_name("r-3frame-unlabeled", "mimosas-IPC4_table_top_1_t0015", mime_type=label_app.FOLDER_MIME)
+    assert fake.find_file_by_name("r-3frame-unlabeled", "mimosas-IPC4_table_top_1_t0016", mime_type=label_app.FOLDER_MIME)
+
+
+def test_screenrecord_true_ten_partial_generation_does_not_mark_processed(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    fake._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake._add_folder("sr-10-node", "restaurant-pi-1", "sr-10-root")
+    fake._add_folder("sr-raw-partial", "IPC4_t0017", "sr-10-node")
+    for idx in range(10):
+        fake._add_file(
+            f"sr-partial-frame-{idx}",
+            f"frame_{idx}.jpg",
+            "sr-raw-partial",
+            content=_jpeg_bytes(color=(idx * 10, 70, 40)),
+        )
+    fake._add_file(
+        "sr-partial-metadata",
+        "metadata.json",
+        "sr-raw-partial",
+        mime_type="application/json",
+        content=json.dumps({"camera_id": "IPC4", "triplet_stem": "IPC4", "triplet_index": 17}).encode("utf-8"),
+    )
+    fake._add_folder("r-3frame", "3frame", "site-restaurant")
+    fake._add_folder("r-3frame-unlabeled", "unlabeled", "r-3frame")
+    table_polygons = [
+        ("table_top_1", [(0, 0), (40, 0), (40, 40), (0, 40)], (0, 0, 40, 40), [(0, 0), (50, 0), (50, 50), (0, 50)]),
+        ("table_top_2", [(40, 0), (79, 0), (79, 40), (40, 40)], (40, 0, 79, 40), [(30, 0), (79, 0), (79, 50), (30, 50)]),
+    ]
+    monkeypatch.setattr(
+        label_app,
+        "_mapped_camera_tables_for_screenrecord_folder",
+        lambda *_args, **_kwargs: (
+            4,
+            {"camera_number": 4, "image_width": 80, "image_height": 60},
+            table_polygons,
+        ),
+    )
+    monkeypatch.setattr(
+        label_app,
+        "_materialize_screenrecord_true_ten_batch",
+        lambda *_args, **_kwargs: {"sr-raw-partial": ["mimosas-IPC4_table_top_1_t0017"]},
+    )
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1,
+    )
+    state = label_app._load_preprocess_state()
+
+    assert generated == 1
+    assert not label_app._reolink_raw_folder_processed(
+        state,
+        context,
+        label_app._screenrecord_state_raw_folder(fake.get_file("sr-raw-partial")),
+    )
+
+
 def test_screenrecord_generation_dedupes_existing_metadata_identity(monkeypatch, tmp_path):
     fake = FakeDriveClient()
     monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
@@ -951,6 +1094,391 @@ def test_queue_prefers_cached_folders_when_available(client):
     assert payload["folders"][0]["preview_urls"]["frame_0"].startswith("/api/preview/")
 
 
+def test_review_folders_lists_labeled_and_legacy_buckets(client, fake_drive):
+    fake_drive._add_folder("review-clean", "mimosas-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-clean", "review-clean")
+    fake_drive._add_file(
+        "review-clean-metadata",
+        "metadata.json",
+        "review-clean",
+        mime_type="application/json",
+        content=json.dumps(
+            {
+                "table_camera_crops_id": "crop-uuid",
+                "supabase_table_id": "table-uuid",
+                "camera_source_id": "camera-source-uuid",
+                "crop_version": 7,
+                "crop_source": "supabase_table_camera_crops",
+            }
+        ).encode("utf-8"),
+    )
+    fake_drive._add_folder("review-dirty", "mimosas-Reolink-CH-CH04_table_top_2_t0004", "video-dirty")
+    fake_drive._add_triplet_files("review-dirty", "review-dirty")
+    fake_drive._add_folder("review-matthews-clean", "matthews-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-matthews-clean", "review-matthews-clean")
+
+    response = client.get(
+        "/api/review/folders?source=reolink&site=restaurant-pi-1"
+        "&mode=labeled&bucket=clean,dirty,occupied&limit=20"
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    names = {folder["folder_name"] for folder in payload["folders"]}
+    assert "mimosas-Reolink-CH-CH03_table_top_1_t0002" in names
+    assert "mimosas-Reolink-CH-CH04_table_top_2_t0004" in names
+    assert "matthews-Reolink-CH-CH03_table_top_1_t0002" not in names
+    clean_folder = next(folder for folder in payload["folders"] if folder["folder_id"] == "review-clean")
+    assert clean_folder["bucket"] == "clean"
+    assert clean_folder["current_label"] == "clean"
+    assert clean_folder["channel_hint"] == "CH-CH03"
+    assert clean_folder["table_hint"] == "table-uuid"
+    assert clean_folder["frame_count"] == 3
+    assert clean_folder["crop_source_kind"] == "supabase"
+    assert clean_folder["has_supabase_crop"] is True
+    assert clean_folder["crop_provenance"]["table_camera_crops_id"] == "crop-uuid"
+
+    fallback_response = client.get(
+        "/api/review/folders?source=reolink&site=restaurant-pi-1"
+        "&mode=labeled&bucket=clean,dirty,occupied&crop_source_kind=fallback_json&limit=20"
+    )
+    fallback_payload = fallback_response.get_json()
+
+    assert fallback_response.status_code == 200
+    assert {folder["folder_id"] for folder in fallback_payload["folders"]} == {"review-dirty"}
+
+
+def test_review_folders_filters_by_channel_table_and_frame_count(client, fake_drive):
+    fake_drive._add_folder("review-filter-match", "mimosas-Reolink-CH-CH03_table_top_2_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-filter-match", "review-filter-match")
+    fake_drive._add_folder("review-filter-miss", "mimosas-Reolink-CH-CH04_table_top_1_t0004", "video-clean")
+    fake_drive._add_triplet_files("review-filter-miss", "review-filter-miss")
+
+    response = client.get(
+        "/api/review/folders?source=reolink&site=restaurant-pi-1&mode=labeled"
+        "&bucket=clean&channel=CH-CH03&table=table_top_2&frame_count=3"
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert [folder["folder_id"] for folder in payload["folders"]] == ["review-filter-match"]
+
+
+def test_review_folders_only_hydrates_current_page(client, fake_drive):
+    for index in range(12):
+        folder_id = f"review-page-{index}"
+        fake_drive._add_folder(
+            folder_id,
+            f"mimosas-Reolink-CH-CH03_table_top_{index}_t0002",
+            "video-clean",
+        )
+        fake_drive._add_triplet_files(folder_id, folder_id)
+
+    fake_drive.list_files_calls = 0
+    response = client.get(
+        "/api/review/folders?source=reolink&site=restaurant-pi-1"
+        "&mode=labeled&bucket=clean&limit=5"
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert len(payload["folders"]) == 5
+    assert payload["next_cursor"] == 5
+    assert fake_drive.list_files_calls <= 10
+
+
+def test_review_relabel_moves_between_labeled_buckets(client, fake_drive):
+    fake_drive._add_folder("review-relabel", "mimosas-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-relabel", "review-relabel")
+
+    response = client.post(
+        "/api/review/relabel",
+        json={
+            "source": "reolink",
+            "site_key": "restaurant-pi-1",
+            "folder_ids": ["review-relabel"],
+            "target_label": "dirty",
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_drive.items["review-relabel"]["parents"] == ["video-dirty"]
+    assert fake_drive.items["review-relabel"]["appProperties"]["autolabel_final_label"] == "dirty"
+    assert ("review-relabel", "video-dirty", "video-clean") in fake_drive.moves
+
+
+def test_review_relabel_rejects_folder_from_other_site(client, fake_drive):
+    fake_drive._add_folder("review-wrong-site", "matthews-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-wrong-site", "review-wrong-site")
+
+    response = client.post(
+        "/api/review/relabel",
+        json={
+            "source": "reolink",
+            "site_key": "restaurant-pi-1",
+            "folder_ids": ["review-wrong-site"],
+            "target_label": "dirty",
+        },
+    )
+
+    assert response.status_code == 400
+    assert fake_drive.items["review-wrong-site"]["parents"] == ["video-clean"]
+    assert fake_drive.moves == []
+
+
+def test_review_trash_soft_trashes_selected_folders(client, fake_drive):
+    fake_drive._add_folder("review-trash", "mimosas-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("review-trash", "review-trash")
+
+    response = client.post(
+        "/api/review/trash",
+        json={
+            "source": "reolink",
+            "site_key": "restaurant-pi-1",
+            "folder_ids": ["review-trash"],
+            "confirm": "TRASH",
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_drive.items["review-trash"]["trashed"] is True
+    assert fake_drive.trashed == ["review-trash"]
+    assert fake_drive.permanent_deleted == []
+
+
+def test_review_pages_render(client):
+    assert client.get("/cleanup/legacy").status_code == 200
+    assert client.get("/cleanup/crops").status_code == 200
+    assert client.get("/review/labeled").status_code == 200
+
+
+def test_crop_cleanup_inventory_shows_supabase_and_fallback_groups(client, fake_drive, monkeypatch):
+    class FakeSupabase:
+        enabled = True
+
+        def select(self, table, params):
+            if table == "camera_sources":
+                return [
+                    {
+                        "id": "camera-source-uuid",
+                        "name": "CH-CH04",
+                        "restaurant_id": "restaurant-uuid",
+                        "is_active": True,
+                        "config": {"edge_node_id": "restaurant-pi-1", "edge_camera_id": "CH-CH04"},
+                    }
+                ]
+            if table == "table_camera_crops":
+                return [
+                    {
+                        "id": "crop-uuid",
+                        "restaurant_id": "restaurant-uuid",
+                        "camera_source_id": "camera-source-uuid",
+                        "table_id": "table-uuid",
+                        "polygon": [[0, 0], [40, 0], [40, 40], [0, 40]],
+                        "frame_width": 80,
+                        "frame_height": 60,
+                        "version": 4,
+                        "source": "supabase_table_camera_crops",
+                        "is_active": True,
+                    }
+                ]
+            if table == "tables":
+                return [
+                    {
+                        "id": "table-uuid",
+                        "restaurant_id": "restaurant-uuid",
+                        "host_facing_label": "Table 6",
+                        "table_number": "6",
+                        "internal_name": "table_top_6",
+                    }
+                ]
+            return []
+
+    label_app._supabase_crop_cache.clear()
+    monkeypatch.setattr(label_app, "_get_supabase_crop_client", lambda: FakeSupabase())
+    fake_drive._add_folder("json-clean-a", "mimosas-Reolink-CH-CH04_table_top_6_t0001", "video-clean")
+    fake_drive._add_triplet_files("json-clean-a", "json-clean-a")
+    fake_drive._add_folder("json-dirty-a", "mimosas-Reolink-CH-CH04_table_top_6_t0002", "video-dirty")
+    fake_drive._add_triplet_files("json-dirty-a", "json-dirty-a")
+    fake_drive._add_folder("supabase-clean", "mimosas-Reolink-CH-CH04_table_top_6_t0003", "video-clean")
+    fake_drive._add_triplet_files("supabase-clean", "supabase-clean")
+    fake_drive._add_file(
+        "supabase-clean-metadata",
+        "metadata.json",
+        "supabase-clean",
+        mime_type="application/json",
+        content=json.dumps(
+            {
+                "table_camera_crops_id": "crop-uuid",
+                "supabase_table_id": "table-uuid",
+                "crop_source": "supabase_table_camera_crops",
+            }
+        ).encode("utf-8"),
+    )
+
+    response = client.get("/api/cleanup/crops/inventory?source=reolink&site=restaurant-pi-1")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["counts"]["supabase_crops"] == 1
+    assert payload["supabase_crops"][0]["table_camera_crops_id"] == "crop-uuid"
+    assert payload["supabase_crops"][0]["reference"]["preview_url"].startswith("/api/preview/")
+    assert payload["counts"]["legacy_definitions"] >= 1
+    fallback_group = next(
+        group
+        for group in payload["fallback_groups"]
+        if group["channel_hint"] == "CH-CH04" and group["table_hint"] == "table_top_6"
+    )
+    assert fallback_group["has_legacy_definition"] is True
+    assert fallback_group["legacy_source"] in {"approved_table_rectangles.json", "approved_tables.json"}
+    assert set(fallback_group["folder_ids"]) == {"json-clean-a", "json-dirty-a"}
+    assert fallback_group["folder_count"] == 2
+    assert "supabase-clean" not in fallback_group["folder_ids"]
+
+
+def test_crop_cleanup_inventory_shows_legacy_json_definitions_without_artifacts(client, fake_drive):
+    response = client.get(
+        "/api/cleanup/crops/inventory?source=reolink&site=restaurant-pi-1&bucket=clean&channel=CH-CH03&table=table_top_1"
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["counts"]["legacy_definitions"] >= 1
+    assert payload["counts"]["fallback_folders"] == 0
+    group = next(
+        group
+        for group in payload["fallback_groups"]
+        if group["channel_hint"] == "CH-CH03" and group["table_hint"] == "table_top_1"
+    )
+    assert group["crop_source_kind"] == "fallback_json"
+    assert group["has_legacy_definition"] is True
+    assert group["folder_ids"] == []
+    assert group["polygon"]
+
+
+def test_crop_cleanup_inventory_uses_lightweight_scan_for_legacy_artifacts(client, fake_drive):
+    for index in range(20):
+        folder_id = f"legacy-clean-{index}"
+        fake_drive._add_folder(
+            folder_id,
+            f"mimosas-Reolink-CH-CH03_table_top_{index}_t0002",
+            "video-clean",
+        )
+        fake_drive._add_triplet_files(folder_id, folder_id)
+
+    fake_drive.list_files_calls = 0
+    response = client.get("/api/cleanup/crops/inventory?source=reolink&site=restaurant-pi-1&bucket=clean")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["counts"]["fallback_folders"] == 20
+    assert sum(int(group["folder_count"]) for group in payload["fallback_groups"]) == 20
+    assert fake_drive.list_files_calls == 0
+
+
+def test_crop_cleanup_inventory_infers_mimosas_channel_folders_as_legacy(client, fake_drive):
+    fake_drive._add_folder(
+        "legacy-mimosas-channel",
+        "mimosas-CH-CH03_table_top_10_t4386",
+        "video-clean",
+    )
+    fake_drive._add_triplet_files("legacy-mimosas-channel", "legacy-mimosas-channel")
+
+    response = client.get("/api/cleanup/crops/inventory?source=reolink&site=restaurant-pi-1&bucket=clean")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["counts"]["fallback_folders"] == 1
+    group = next(group for group in payload["fallback_groups"] if group["folder_ids"] == ["legacy-mimosas-channel"])
+    assert group["channel_hint"] == "CH-CH03"
+    assert group["table_hint"] == "table_top_10"
+    assert group["crop_source_kind"] == "fallback_json"
+    assert group["folder_ids"] == ["legacy-mimosas-channel"]
+
+
+def test_crop_cleanup_group_visual_uses_true_ten_reference_and_crop_polygon(client, fake_drive, monkeypatch):
+    fake_drive._add_folder("sr-10-root", "10frametrue", "project-root")
+    fake_drive._add_folder("sr-10-matthews", "reolink-matthews-01", "sr-10-root")
+    fake_drive._add_folder("sr-10-ch03", "IPC3_t9999", "sr-10-matthews")
+    fake_drive._add_file("sr-10-ch03-f0", "frame_0.jpg", "sr-10-ch03", content=_jpeg_bytes(1920, 1080))
+    fake_drive._add_folder("drive-crop-a", "matthews-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("drive-crop-a", "drive-crop-a")
+    fake_drive._add_folder("drive-crop-b", "matthews-Reolink-CH-CH03_table_top_2_t0002", "video-clean")
+    fake_drive._add_triplet_files("drive-crop-b", "drive-crop-b")
+    downloaded_reference_ids = []
+    original_download = fake_drive.download_file_to_path
+
+    def counted_download(file_id, output_path):
+        if file_id == "sr-10-ch03-f0":
+            downloaded_reference_ids.append(file_id)
+        return original_download(file_id, output_path)
+
+    monkeypatch.setattr(fake_drive, "download_file_to_path", counted_download)
+
+    label_app._source_folder_ids_cache.clear()
+    response = client.get("/api/cleanup/crops/inventory?source=reolink&site=reolink-matthews-01")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    groups = {group["table_hint"]: group for group in payload["fallback_groups"]}
+    group = groups["table_top_1"]
+    assert group["reference"]["source"] == "10frametrue"
+    assert group["reference"]["preview_url"] == "/api/preview/sr-10-ch03-f0"
+    assert group["polygon"] == [[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0]]
+    assert groups["table_top_2"]["reference"]["preview_url"] == "/api/preview/sr-10-ch03-f0"
+    assert downloaded_reference_ids == []
+
+
+def test_crop_cleanup_trash_soft_trashes_only_validated_fallback_folders(client, fake_drive):
+    fake_drive._add_folder("json-clean-trash", "mimosas-Reolink-CH-CH04_table_top_8_t0001", "video-clean")
+    fake_drive._add_triplet_files("json-clean-trash", "json-clean-trash")
+    fake_drive._add_folder("json-dirty-trash", "mimosas-Reolink-CH-CH04_table_top_8_t0002", "video-dirty")
+    fake_drive._add_triplet_files("json-dirty-trash", "json-dirty-trash")
+    fake_drive._add_folder("supabase-do-not-trash", "mimosas-Reolink-CH-CH04_table_top_8_t0003", "video-clean")
+    fake_drive._add_triplet_files("supabase-do-not-trash", "supabase-do-not-trash")
+    fake_drive._add_file(
+        "supabase-do-not-trash-metadata",
+        "metadata.json",
+        "supabase-do-not-trash",
+        mime_type="application/json",
+        content=json.dumps(
+            {
+                "table_camera_crops_id": "crop-uuid",
+                "supabase_table_id": "table-uuid",
+                "crop_source": "supabase_table_camera_crops",
+            }
+        ).encode("utf-8"),
+    )
+
+    rejected = client.post(
+        "/api/cleanup/crops/trash",
+        json={
+            "source": "reolink",
+            "site_key": "restaurant-pi-1",
+            "folder_ids": ["json-clean-trash", "supabase-do-not-trash"],
+            "confirm": "TRASH",
+        },
+    )
+
+    assert rejected.status_code == 400
+    assert fake_drive.trashed == []
+
+    accepted = client.post(
+        "/api/cleanup/crops/trash",
+        json={
+            "source": "reolink",
+            "site_key": "restaurant-pi-1",
+            "folder_ids": ["json-clean-trash", "json-dirty-trash"],
+            "confirm": "TRASH",
+        },
+    )
+
+    assert accepted.status_code == 200
+    assert set(fake_drive.trashed) == {"json-clean-trash", "json-dirty-trash"}
+    assert fake_drive.items["supabase-do-not-trash"]["trashed"] is False
+    assert fake_drive.permanent_deleted == []
+
+
 def test_queue_ignores_stale_frame_metadata_from_another_folder(client, fake_drive):
     fake_drive._add_folder("video-triplet-stale-meta", "ipc3_table-4_t0002", "video-unlabeled")
     fake_drive._add_triplet_files("video-triplet-stale-meta", "fresh-video")
@@ -1231,7 +1759,7 @@ def test_force_refresh_uses_stale_listing_cache_and_refreshes_in_background(monk
         label_app._invalidate_listing_cache(context.queue_key)
 
 
-def test_force_refresh_without_listing_cache_warms_in_background(monkeypatch):
+def test_force_refresh_without_listing_cache_fetches_synchronously(monkeypatch):
     context = label_app.QueueContext(
         source=label_app.REOLINK_SOURCE,
         site_key="restaurant-pi-1",
@@ -1244,18 +1772,18 @@ def test_force_refresh_without_listing_cache_warms_in_background(monkeypatch):
         folder_ids={},
         persist_frame_metadata=False,
     )
-    scheduled: list[str] = []
+    fresh_listing = [{"id": "fresh-folder", "name": "fresh"}]
     label_app._invalidate_listing_cache(context.queue_key)
-    monkeypatch.setattr(label_app, "_schedule_listing_refresh", lambda ctx: scheduled.append(ctx.queue_key) or True)
+    monkeypatch.setattr(
+        label_app,
+        "_schedule_listing_refresh",
+        lambda _ctx: (_ for _ in ()).throw(AssertionError("cold force refresh should not return empty")),
+    )
 
-    def fail_fetch(_client, _context):
-        raise AssertionError("cold force refresh should warm in background")
-
-    monkeypatch.setattr(label_app, "_fetch_source_listing", fail_fetch)
+    monkeypatch.setattr(label_app, "_fetch_source_listing", lambda _client, _context: fresh_listing)
 
     with label_app.app.test_request_context("/api/queue?source=reolink&site=restaurant-pi-1&refresh=1"):
-        assert label_app._list_source_subfolders(object(), context, force_refresh=True) == []
-        assert scheduled == [context.queue_key]
+        assert label_app._list_source_subfolders(object(), context, force_refresh=True) == fresh_listing
 
 
 def test_interactive_preview_prewarm_is_bounded(tmp_path, monkeypatch):
@@ -2168,6 +2696,8 @@ def test_matthews_queue_blocks_when_channel_is_missing_crop_config(client, fake_
 
 
 def test_channel_name_maps_generally_to_matching_ipc_number():
+    assert label_app._extract_reolink_channel_code("Swann CH03") == "CH-CH03"
+    assert label_app._cleanup_channel_hint_from_camera({"name": "Swann CH03"}) == "CH-CH03"
     assert label_app._extract_reolink_channel_number("CH-CH03_t4377") == 3
     assert label_app._extract_reolink_channel_number("Reolink-CH-CH11_t0002") == 11
     assert label_app._derived_reolink_folder_name("CH-CH03_t4377", "table_top_1") == "CH-CH03_table_top_1_t4377"
@@ -2397,6 +2927,31 @@ def test_reolink_preprocess_records_existing_drive_folders_in_local_state(monkey
     state = json.loads((tmp_path / label_app.PREPROCESS_STATE_FILE_NAME).read_text())
     assert state["reolink_processed"]["restaurant-pi-1:r-ready"]["status"] == "complete"
     assert fake.items["r-ready"]["parents"] == ["site-restaurant:processed_raw"]
+
+
+def test_reolink_preprocess_skips_unassociated_zips_by_default(monkeypatch, tmp_path):
+    fake = FakeDriveClient()
+    monkeypatch.setenv("DRIVE_PROJECT_ROOT_FOLDER_ID", "project-root")
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    label_app._source_folder_ids_cache.clear()
+    monkeypatch.setattr(label_app, "REOLINK_PROCESS_UNASSOCIATED_ZIPS", False)
+    monkeypatch.setattr(label_app, "_list_screenrecord_true_ten_folders", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(label_app, "_list_reolink_raw_folders", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(label_app, "_existing_generated_artifact_identities", lambda *_args, **_kwargs: set())
+
+    def fail_iterate(*_args, **_kwargs):
+        raise AssertionError("legacy unassociated zips should not be processed by default")
+
+    monkeypatch.setattr(label_app, "_iterate_unassociated_zip_batches", fail_iterate)
+
+    context = label_app._resolve_queue_context(fake, label_app.REOLINK_SOURCE, "restaurant-pi-1")
+    generated = label_app._prepare_reolink_unlabeled_queue(
+        fake,
+        context,
+        target_unlabeled_count=1_000_000,
+    )
+
+    assert generated == 0
 
 
 def test_reolink_preprocess_failed_materialization_does_not_mark_state(monkeypatch, tmp_path):

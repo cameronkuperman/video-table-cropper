@@ -1,12 +1,12 @@
 """
 Person detection, within-group tracking, and per-table perception building.
 
-Uses YOLOv8-seg (ultralytics) for person segmentation masks.
+Uses YOLO26-seg (ultralytics) for person segmentation masks.
 Falls back gracefully if ultralytics is not installed — perception.json
 is simply not written for that run.
 
 Flow per group of N frames:
-  1. detect_people_in_frame()   — run YOLOv8 on each of the N full frames
+  1. detect_people_in_frame()   — run YOLO on each of the N full frames
   2. assign_track_ids()         — match the same person across frames by
                                   K-frame-lookback centroid + bbox-IoU matching
   3. build_perception_for_table() — for one table, filter to overlapping
@@ -19,6 +19,7 @@ groups can be any N in [MIN, MAX]_FRAMES_PER_GROUP.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -60,19 +61,21 @@ MAX_GAP_TO_FILL = 1
 
 # ── Model loading ──────────────────────────────────────────────────────────
 
-def load_yolo_model(model_name: str = "yolov8m-seg.pt"):
+DEFAULT_YOLO_MODEL_NAME = "yolo26l-seg.pt"
+
+
+def load_yolo_model(model_name: str | None = None):
     """
-    Load YOLOv8 segmentation model. Returns None if ultralytics is not installed.
-    On first run, downloads the model weights (~52 MB for medium).
-    Model options by accuracy/speed tradeoff:
-      yolov8n-seg.pt  ~6 MB   fastest, least accurate
-      yolov8s-seg.pt  ~22 MB  good balance (default)
-      yolov8m-seg.pt  ~52 MB  better for overhead/CCTV angles
+    Load the configured YOLO segmentation model. Returns None if ultralytics is not installed.
+    On first run, downloads the configured model weights.
+
+    Override with YOLO_MODEL_NAME. Default: yolo26l-seg.pt.
     """
     if not _YOLO_AVAILABLE:
         print("  [perception] ultralytics not installed — skipping person detection.")
         print("  [perception] To enable: pip install ultralytics")
         return None
+    model_name = model_name or os.getenv("YOLO_MODEL_NAME", DEFAULT_YOLO_MODEL_NAME)
     print(f"  [perception] Loading {model_name} (auto-downloads on first run)...")
     return YOLO(model_name)
 
@@ -136,7 +139,7 @@ def _people_from_result(result) -> list[dict[str, Any]]:
 
 def detect_people_in_frame(frame_path: Path, model) -> list[dict[str, Any]]:
     """
-    Run YOLOv8-seg on one frame. Returns one dict per detected person.
+    Run YOLO segmentation on one frame. Returns one dict per detected person.
 
     Each dict:
       mask         bool ndarray H×W — pixel-level segmentation (not saved to JSON)
@@ -151,7 +154,7 @@ def detect_people_in_frame(frame_path: Path, model) -> list[dict[str, Any]]:
 
 def detect_people_batch(frame_paths: list[Path], model) -> list[list[dict[str, Any]]]:
     """
-    Run YOLOv8-seg on multiple frames in a single batched forward pass.
+    Run YOLO segmentation on multiple frames in a single batched forward pass.
     Returns one list-of-people per input frame, in the same order.
     Ultralytics batches natively when passed a list of paths — 2–3× faster on GPU.
     """

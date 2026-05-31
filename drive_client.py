@@ -209,6 +209,20 @@ class DriveClient:
         query = f"'{escaped}' in parents and mimeType='{FOLDER_MIME}' and trashed=false"
         return self._list_files(query, fields=fields)
 
+    def list_folders_by_name_contains(
+        self,
+        parent_id: str,
+        text: str,
+        fields: str = "id,name,mimeType,parents",
+    ) -> list[dict[str, Any]]:
+        escaped_parent = self._escape_query_value(parent_id)
+        escaped_text = self._escape_query_value(text)
+        query = (
+            f"'{escaped_parent}' in parents and mimeType='{FOLDER_MIME}' "
+            f"and name contains '{escaped_text}' and trashed=false"
+        )
+        return self._list_files(query, fields=fields)
+
     def list_folders_recursive(self, parent_id: str, include_root: bool = True) -> list[dict[str, Any]]:
         """Recursively list all folders under a parent folder."""
         discovered: dict[str, dict[str, Any]] = {}

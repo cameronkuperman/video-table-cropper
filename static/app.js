@@ -26,6 +26,8 @@ let activePendingLabel = 'unlabeled';
 let activeDisplayName = 'Video';
 let recentLabelUndos = [];
 let recentLabelUndoTimer = null;
+let recentLabelUndoSequence = 0;
+let canceledLabelOperationKeys = new Set();
 let preprocessStatus = null;
 let preprocessStatusRequest = null;
 let lastPreprocessStatusAt = 0;
@@ -943,6 +945,7 @@ function warmBuffer(loadToken = sourceLoadToken) {
 
 function renderFolderCard(folder) {
     currentImagesReady = false;
+    let brokenFrameSkipped = false;
     const frameKeys = displayFrameKeys(folder);
     const sourceLabel = folder.source_label || folder.source || 'unknown';
     const imgHtml = frameKeys.map((key, idx) => {
@@ -999,6 +1002,28 @@ function renderFolderCard(folder) {
         }
     }
 
+    function skipBrokenFolder(reason) {
+        if (brokenFrameSkipped) return;
+        brokenFrameSkipped = true;
+        currentImagesReady = false;
+        rememberSuppressedFolder(folder);
+        folders.splice(currentIndex, 1);
+        saveQueueSnapshot();
+        if (statusEl) {
+            statusEl.textContent = 'Skipping broken triplet...';
+        }
+        logTiming('skipBrokenFolder', {
+            folderId: folder.folder_id,
+            folderName: folder.folder_name,
+            reason,
+            queueKey: folder.queue_key,
+        });
+        window.setTimeout(() => {
+            renderCard(sourceLoadToken);
+            warmBuffer(sourceLoadToken);
+        }, 250);
+    }
+
     images.forEach(img => {
         const slot = img.closest('.image-slot');
         const markLoaded = () => {
@@ -1016,12 +1041,16 @@ function renderFolderCard(folder) {
                 placeholder.textContent = 'failed';
             }
             updateReadyState();
+            skipBrokenFolder(img.getAttribute('data-full-src') || img.getAttribute('src') || 'image_error');
         }, { once: true });
         if (img.complete && img.naturalWidth > 0) {
             markLoaded();
         }
     });
     updateReadyState();
+    if (images.length !== requiredCount) {
+        skipBrokenFolder('missing_frame_url');
+    }
 }
 
 async function refreshStats(loadToken = sourceLoadToken) {
@@ -1206,7 +1235,22 @@ function pruneRecentLabelUndos() {
 
 function latestRecentLabelUndo() {
     pruneRecentLabelUndos();
-    return recentLabelUndos[recentLabelUndos.length - 1] || null;
+    let latest = null;
+    for (const item of recentLabelUndos) {
+        if (!latest) {
+            latest = item;
+            continue;
+        }
+        const itemSequence = Number(item.operation?.undo_sequence || 0);
+        const latestSequence = Number(latest.operation?.undo_sequence || 0);
+        if (
+            itemSequence > latestSequence
+            || (itemSequence === latestSequence && Number(item.createdAt || 0) >= Number(latest.createdAt || 0))
+        ) {
+            latest = item;
+        }
+    }
+    return latest;
 }
 
 function removeRecentLabelUndo(operation) {
@@ -1250,12 +1294,19 @@ function renderRecentLabelUndo() {
 }
 
 function showRecentLabelUndo(folder, operation, response = {}) {
+    const now = Date.now();
     const undoExpires = response.undo_expires_at ? Date.parse(response.undo_expires_at) : NaN;
+    const key = pendingLabelKey(operation);
+    const existing = recentLabelUndos.find(item => pendingLabelKey(item.operation) === key);
     removeRecentLabelUndo(operation);
     recentLabelUndos.push({
         folder,
         operation: { ...operation },
-        expiresAt: Number.isFinite(undoExpires) ? undoExpires : Date.now() + (LABEL_UNDO_SECONDS * 1000),
+        createdAt: existing?.createdAt || now,
+        serverAcked: Boolean(response.queued || response.job_id || response.undo_expires_at),
+        expiresAt: Number.isFinite(undoExpires)
+            ? undoExpires
+            : existing?.expiresAt || now + (LABEL_UNDO_SECONDS * 1000),
     });
     renderRecentLabelUndo();
     ensureRecentLabelUndoTimer();
@@ -1264,6 +1315,8 @@ function showRecentLabelUndo(folder, operation, response = {}) {
 async function undoRecentLabel() {
     const undoState = latestRecentLabelUndo();
     if (!undoState) return;
+    const operationKey = pendingLabelKey(undoState.operation);
+    canceledLabelOperationKeys.add(operationKey);
     removeRecentLabelUndo(undoState.operation);
     renderRecentLabelUndo();
 
@@ -1277,10 +1330,16 @@ async function undoRecentLabel() {
     saveQueueSnapshot();
     await renderCard();
 
+    if (!undoState.serverAcked) {
+        return;
+    }
+
     try {
         await cancelLabelOperation(undoState.operation);
+        canceledLabelOperationKeys.delete(operationKey);
         saveQueueSnapshot();
     } catch (e) {
+        canceledLabelOperationKeys.delete(operationKey);
         showError(`Undo restore shown, but Drive rollback failed: ${e.message}`);
     }
 }
@@ -1395,12 +1454,14 @@ async function labelCurrent(label) {
         frames: folder.frames || {},
         frame_signature: frameSignature(folder),
         content_signature: contentSignature(folder),
+        undo_sequence: ++recentLabelUndoSequence,
     };
     enqueuePendingLabel(operation);
     folders.splice(currentIndex, 1);
     saveQueueSnapshot();
 
     applyOptimisticLabel(label);
+    showRecentLabelUndo(folder, operation);
     const loadToken = sourceLoadToken;
     renderCard(loadToken);
     labeling = false;
@@ -1408,6 +1469,17 @@ async function labelCurrent(label) {
 
     sendLabelOperation(operation, { keepalive: true })
         .then(data => {
+            const operationKey = pendingLabelKey(operation);
+            if (canceledLabelOperationKeys.has(operationKey)) {
+                cancelLabelOperation(operation)
+                    .catch(e => {
+                        showError(`Undo restore shown, but Drive rollback failed: ${e.message}`);
+                    })
+                    .finally(() => {
+                        canceledLabelOperationKeys.delete(operationKey);
+                    });
+                return;
+            }
             showRecentLabelUndo(folder, operation, data);
             logTiming('labelCurrent', {
                 ms: (performance.now() - startedAt).toFixed(1),
@@ -1418,6 +1490,11 @@ async function labelCurrent(label) {
             });
         })
         .catch(e => {
+            const operationKey = pendingLabelKey(operation);
+            if (canceledLabelOperationKeys.has(operationKey)) {
+                canceledLabelOperationKeys.delete(operationKey);
+                return;
+            }
             showError(`Move queued for retry: ${folder.folder_name}: ${e.message}`);
         });
 }

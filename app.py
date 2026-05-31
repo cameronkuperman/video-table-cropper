@@ -222,6 +222,22 @@ REOLINK_FRAME_DOWNLOAD_WORKERS = max(
 REOLINK_TABLE_MATERIALIZE_WORKERS = max(
     1, min(10, int(os.environ.get("REOLINK_TABLE_MATERIALIZE_WORKERS", "8") or "8"))
 )
+REOLINK_TRUE_TEN_BATCH_SIZE = max(
+    1,
+    int(os.environ.get("REOLINK_TRUE_TEN_BATCH_SIZE", "4") or "4"),
+)
+REOLINK_YOLO_BATCH_FRAMES = max(
+    1,
+    int(os.environ.get("REOLINK_YOLO_BATCH_FRAMES", "40") or "40"),
+)
+REOLINK_PROCESS_UNASSOCIATED_ZIPS = os.environ.get(
+    "REOLINK_PROCESS_UNASSOCIATED_ZIPS",
+    "0",
+).strip().lower() in {"1", "true", "yes", "on"}
+REOLINK_PREPROCESS_MAX_SECONDS = max(
+    0.0,
+    float(os.environ.get("REOLINK_PREPROCESS_MAX_SECONDS", "0") or "0"),
+)
 LABEL_READY_TARGET_CONFIGURED = _label_ready_target_configured()
 LABEL_READY_TARGET = (
     max(1, _read_int_env("LABEL_READY_TARGET", 1000))
@@ -631,6 +647,8 @@ _camera_config_lock = Lock()
 _crop_config_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
 _crop_config_lock = Lock()
 _CROP_CONFIG_CACHE_MISS = object()
+_cleanup_reference_cache: dict[tuple[str, str, str, int, int], dict[str, Any] | None] = {}
+_cleanup_reference_cache_lock = Lock()
 _supabase_crop_cache: dict[str, dict[str, Any]] = {}
 _supabase_crop_cache_lock = Lock()
 _supabase_crop_status: dict[str, Any] = {
@@ -790,6 +808,8 @@ def _crop_editor_url(site_key: str, channel_code: str | None = None) -> str:
 
 def _extract_reolink_channel_code(text: str) -> str | None:
     match = re.search(r"CH-CH(\d+)", text, re.IGNORECASE)
+    if not match:
+        match = re.search(r"\bCH[\s_-]*(\d+)\b", text, re.IGNORECASE)
     if not match:
         return None
     return f"CH-CH{int(match.group(1)):02d}"
@@ -1113,6 +1133,1033 @@ def _request_json_payload() -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("JSON object body required")
     return data
+
+
+REVIEW_UNLABELED_BUCKET = "unlabeled"
+REVIEW_SCREENRECORD_BUCKET = "screenrecord_3frame_unlabeled"
+REVIEW_BUCKETS = (REVIEW_UNLABELED_BUCKET, REVIEW_SCREENRECORD_BUCKET, *LABEL_DESTINATIONS)
+REVIEW_LABELED_DEFAULT_BUCKETS = ("clean", "dirty", "occupied")
+REVIEW_LEGACY_DEFAULT_BUCKETS = (
+    REVIEW_UNLABELED_BUCKET,
+    REVIEW_SCREENRECORD_BUCKET,
+    "clean",
+    "dirty",
+    "occupied",
+)
+CROP_CLEANUP_DEFAULT_BUCKETS = REVIEW_BUCKETS
+CROP_CLEANUP_FALLBACK_KINDS = {"fallback_json", "drive_crop_config"}
+
+
+def _parse_csv_arg(name: str, default: tuple[str, ...] = ()) -> list[str]:
+    values: list[str] = []
+    for raw in request.args.getlist(name):
+        for part in str(raw).split(","):
+            value = part.strip()
+            if value:
+                values.append(value)
+    return values or list(default)
+
+
+def _review_bucket_parent_ids(context: QueueContext, buckets: list[str]) -> dict[str, str]:
+    parent_ids: dict[str, str] = {}
+    for bucket in buckets:
+        if bucket == REVIEW_UNLABELED_BUCKET:
+            parent_ids[bucket] = context.input_folder_id
+        elif bucket == REVIEW_SCREENRECORD_BUCKET:
+            screenrecord_id = context.folder_ids.get(SCREENRECORD_THREE_FRAME_UNLABELED_KEY)
+            if screenrecord_id:
+                parent_ids[bucket] = screenrecord_id
+        elif bucket in LABEL_DESTINATIONS:
+            parent_ids[bucket] = context.folder_ids[bucket]
+        else:
+            raise ValueError(f"Unknown review bucket: {bucket}")
+    return parent_ids
+
+
+def _review_source_prefix(context: QueueContext) -> str:
+    try:
+        return _resolve_label_source(context.source, context.site_key).folder_prefix
+    except ValueError:
+        return ""
+
+
+def _folder_matches_review_source(folder_name: str, context: QueueContext, bucket: str) -> bool:
+    if bucket not in LABEL_DESTINATIONS:
+        return True
+    prefix = _review_source_prefix(context)
+    return not prefix or folder_name.startswith(f"{prefix}-")
+
+
+def _folder_name_has_reolink_channel(folder_name: str) -> bool:
+    return bool(_extract_reolink_channel_code(folder_name) or re.search(r"IPC[\s_-]*\d+", folder_name, re.IGNORECASE))
+
+
+def _review_folder_matches_context(context: QueueContext, folder_name: str, app_properties: dict[str, Any], bucket: str) -> bool:
+    if bucket not in LABEL_DESTINATIONS:
+        return True
+    if not _folder_matches_review_source(folder_name, context, bucket):
+        return False
+
+    queue_key = str(app_properties.get("autolabel_queue_key") or "").strip()
+    if queue_key:
+        return queue_key == context.queue_key
+
+    source = str(app_properties.get("autolabel_source") or "").strip()
+    if source and source != context.source:
+        return False
+
+    site_key = str(app_properties.get("autolabel_site_key") or "").strip()
+    if site_key and site_key != (context.site_key or ""):
+        return False
+
+    is_reolink_name = "Reolink-" in folder_name or _folder_name_has_reolink_channel(folder_name)
+    if context.source == REOLINK_SOURCE:
+        return is_reolink_name
+    if context.source == VIDEO_SOURCE:
+        return not is_reolink_name
+    return True
+
+
+def _review_channel_hint(folder_name: str, metadata: dict[str, Any] | None = None) -> str:
+    for value in _camera_id_candidates(folder_name, metadata):
+        channel = _extract_reolink_channel_code(value)
+        if channel:
+            return channel
+        ipc = re.search(r"IPC[\s_-]*(\d+)", value, re.IGNORECASE)
+        if ipc:
+            return f"IPC{int(ipc.group(1))}"
+    return ""
+
+
+def _review_table_hint(folder_name: str, metadata: dict[str, Any] | None = None) -> str:
+    if isinstance(metadata, dict):
+        table = metadata.get("table")
+        if isinstance(table, dict):
+            for key in ("label", "id", "table_id"):
+                value = str(table.get(key) or "").strip()
+                if value:
+                    return value
+        for key in ("table_label", "supabase_table_id", "table_camera_crops_id"):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value
+    base, _suffix = _split_triplet_suffix(folder_name)
+    match = re.search(r"_(table[^_]*(?:_[^_]+)*)$", base, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _review_source_type(
+    context: QueueContext,
+    bucket: str,
+    parent_id: str,
+    folder_name: str,
+    payload: dict[str, Any],
+) -> str:
+    screenrecord_id = context.folder_ids.get(SCREENRECORD_THREE_FRAME_UNLABELED_KEY)
+    if (
+        bucket == REVIEW_SCREENRECORD_BUCKET
+        or (screenrecord_id and parent_id == screenrecord_id)
+        or payload.get("source_label") == SCREENRECORD_TRUE_TEN_FOLDER_NAME
+        or payload.get("perception_file_name") == PERCEPTION_V2_FILE_NAME
+    ):
+        return "screenrecord"
+    if bucket in LABEL_DESTINATIONS:
+        return "labeled"
+    if context.source == REOLINK_SOURCE and ("Reolink-" in folder_name or _folder_name_has_reolink_channel(folder_name)):
+        return "legacy"
+    return "generated"
+
+
+def _review_crop_provenance(
+    context: QueueContext,
+    metadata: dict[str, Any] | None,
+    source_type: str,
+) -> dict[str, Any]:
+    metadata = metadata or {}
+    crop_source = str(metadata.get("crop_source") or "").strip()
+    table_camera_crops_id = str(metadata.get("table_camera_crops_id") or "").strip()
+    supabase_table_id = str(metadata.get("supabase_table_id") or "").strip()
+    camera_source_id = str(metadata.get("camera_source_id") or "").strip()
+    crop_version = metadata.get("crop_version")
+
+    if table_camera_crops_id or supabase_table_id or crop_source == "supabase_table_camera_crops":
+        kind = "supabase"
+        label = "Supabase crop"
+    elif crop_source == "manual_crop_config" or (
+        context.source == REOLINK_SOURCE and context.site_key and _site_uses_manual_crop_configs(context.site_key)
+    ):
+        kind = "drive_crop_config"
+        label = "Drive crop config JSON"
+    elif crop_source:
+        kind = crop_source
+        label = crop_source.replace("_", " ")
+    elif source_type in {"legacy", "generated", "labeled", "screenrecord"}:
+        kind = "fallback_json"
+        label = "Fallback JSON"
+    else:
+        kind = "unknown"
+        label = "Unknown crop source"
+
+    return {
+        "kind": kind,
+        "label": label,
+        "is_supabase": kind == "supabase",
+        "is_fallback": kind in {"fallback_json", "drive_crop_config"},
+        "crop_source": crop_source or None,
+        "table_camera_crops_id": table_camera_crops_id or None,
+        "supabase_table_id": supabase_table_id or None,
+        "camera_source_id": camera_source_id or None,
+        "crop_version": crop_version,
+    }
+
+
+def _review_payload_for_folder(
+    client: DriveClient,
+    context: QueueContext,
+    folder: dict[str, Any],
+    bucket: str,
+    parent_id: str,
+) -> dict[str, Any] | None:
+    payload = _hydrate_folder(client, context, folder)
+    if payload is None:
+        return None
+    files = client.list_files(str(folder["id"]))
+    files_by_name = _file_by_name(files)
+    metadata = _load_json_file_from_drive(client, files_by_name.get("metadata.json"))
+    folder_name = str(payload.get("folder_name") or folder.get("name") or "")
+    frame_count = len(_ordered_frame_keys(payload.get("frames") or {}))
+    source_type = _review_source_type(context, bucket, parent_id, folder_name, payload)
+    crop_provenance = _review_crop_provenance(context, metadata, source_type)
+    payload.update(
+        {
+            "bucket": bucket,
+            "current_label": bucket if bucket in LABEL_DESTINATIONS else None,
+            "review_source_type": source_type,
+            "crop_provenance": crop_provenance,
+            "crop_source_kind": crop_provenance["kind"],
+            "has_supabase_crop": crop_provenance["is_supabase"],
+            "is_fallback_crop": crop_provenance["is_fallback"],
+            "table_camera_crops_id": crop_provenance["table_camera_crops_id"],
+            "supabase_table_id": crop_provenance["supabase_table_id"],
+            "camera_source_id": crop_provenance["camera_source_id"],
+            "crop_version": crop_provenance["crop_version"],
+            "channel_hint": _review_channel_hint(folder_name, metadata),
+            "table_hint": _review_table_hint(folder_name, metadata),
+            "frame_count": frame_count,
+            "modified_time": folder.get("modifiedTime"),
+            "metadata_file_id": payload.get("metadata_file_id") or (files_by_name.get("metadata.json") or {}).get("id"),
+        }
+    )
+    return payload
+
+
+def _review_payload_matches_filters(payload: dict[str, Any], filters: dict[str, str]) -> bool:
+    folder_name = str(payload.get("folder_name") or "").lower()
+    q = filters.get("q", "").lower()
+    if q and q not in folder_name:
+        return False
+    channel = filters.get("channel", "").lower()
+    if channel and channel not in str(payload.get("channel_hint") or "").lower() and channel not in folder_name:
+        return False
+    table = filters.get("table", "").lower()
+    if table and table not in str(payload.get("table_hint") or "").lower() and table not in folder_name:
+        return False
+    source_type = filters.get("folder_source_type", "").lower()
+    if source_type and source_type not in {"all", str(payload.get("review_source_type") or "").lower()}:
+        return False
+    crop_source_kind = filters.get("crop_source_kind", "").lower()
+    if crop_source_kind and crop_source_kind not in {"all", str(payload.get("crop_source_kind") or "").lower()}:
+        return False
+    frame_count = filters.get("frame_count", "")
+    if frame_count:
+        try:
+            if int(frame_count) != int(payload.get("frame_count") or 0):
+                return False
+        except ValueError:
+            raise ValueError("frame_count must be an integer")
+    return True
+
+
+def _review_list_folders(
+    client: DriveClient,
+    context: QueueContext,
+    buckets: list[str],
+    filters: dict[str, str],
+    *,
+    limit: int,
+    cursor: int = 0,
+) -> tuple[list[dict[str, Any]], int | None, int]:
+    parent_ids = _review_bucket_parent_ids(context, buckets)
+    candidates: list[tuple[str, str, dict[str, Any]]] = []
+    seen_folder_ids: set[str] = set()
+    for bucket, parent_id in parent_ids.items():
+        for folder in client.list_folders(parent_id, fields="id,name,mimeType,parents,appProperties,modifiedTime"):
+            folder_id = str(folder.get("id") or "")
+            folder_name = str(folder.get("name") or "")
+            if not folder_id or folder_id in seen_folder_ids:
+                continue
+            app_properties = dict(folder.get("appProperties") or {})
+            if not _review_folder_matches_context(context, folder_name, app_properties, bucket):
+                continue
+            seen_folder_ids.add(folder_id)
+            candidates.append((bucket, parent_id, folder))
+
+    candidates.sort(key=lambda item: str(item[2].get("modifiedTime") or ""), reverse=True)
+
+    results: list[dict[str, Any]] = []
+    next_cursor: int | None = None
+    index = max(0, cursor)
+    while index < len(candidates):
+        bucket, parent_id, folder = candidates[index]
+        index += 1
+        payload = _review_payload_for_folder(client, context, folder, bucket, parent_id)
+        if payload is None:
+            continue
+        if _review_payload_matches_filters(payload, filters):
+            results.append(payload)
+        if len(results) >= limit:
+            next_cursor = index if index < len(candidates) else None
+            break
+
+    return results, next_cursor, len(candidates)
+
+
+def _cleanup_channel_hint_from_camera(camera: dict[str, Any]) -> str:
+    config = camera.get("config") if isinstance(camera.get("config"), dict) else {}
+    for value in (
+        config.get("edge_camera_id"),
+        config.get("edge_camera_key"),
+        camera.get("name"),
+    ):
+        channel = _review_channel_hint(str(value or ""))
+        if channel:
+            if channel.upper().startswith("IPC"):
+                match = re.search(r"IPC(\d+)", channel, re.IGNORECASE)
+                if match:
+                    return f"CH-CH{int(match.group(1)):02d}"
+            return channel
+    return ""
+
+
+def _drive_image_dimensions(
+    client: DriveClient,
+    file_id: str,
+    fallback: tuple[int, int] = (0, 0),
+) -> tuple[int, int]:
+    try:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory(prefix="drive_image_dimensions_") as tmpdir:
+            reference_path = Path(tmpdir) / "frame.jpg"
+            client.download_file_to_path(file_id, reference_path)
+            with Image.open(reference_path) as image:
+                return image.width, image.height
+    except Exception:
+        return fallback
+
+
+def _reference_payload_for_frame(
+    client: DriveClient,
+    site_key: str,
+    site_label: str,
+    channel_code: str,
+    raw_folder: dict[str, Any],
+    frame_item: dict[str, Any],
+    source: str,
+    fallback_dimensions: tuple[int, int] = (0, 0),
+) -> dict[str, Any]:
+    frame_file_id = str(frame_item["id"])
+    width, height = _drive_image_dimensions(client, frame_file_id, fallback_dimensions)
+    return {
+        "site_key": site_key,
+        "site_label": site_label,
+        "channel_code": channel_code,
+        "raw_folder_id": str(raw_folder["id"]),
+        "raw_folder_name": str(raw_folder.get("name", "")),
+        "frame_file_id": frame_file_id,
+        "preview_url": f"/api/preview/{frame_file_id}",
+        "source": source,
+        "width": width,
+        "height": height,
+    }
+
+
+def _find_reolink_true_ten_reference_frame(
+    client: DriveClient,
+    context: QueueContext,
+    channel_code: str,
+    fallback_dimensions: tuple[int, int] = (0, 0),
+) -> dict[str, Any] | None:
+    if context.source != REOLINK_SOURCE or not context.site_key:
+        return None
+    normalized_channel = _normalize_reolink_channel_code(channel_code or "")
+    if not normalized_channel:
+        return None
+    site = _resolve_site_config(context.site_key)
+    for raw_folder in sorted(
+        _list_screenrecord_true_ten_folders(client, context),
+        key=lambda item: str(item.get("name", "")).lower(),
+        reverse=True,
+    ):
+        source_files = {
+            item["name"]: item
+            for item in client.list_files(
+                raw_folder["id"],
+                fields="id,name,mimeType,parents,appProperties",
+            )
+        }
+        metadata = _load_json_file_from_drive(client, source_files.get("metadata.json")) or {}
+        raw_channel = _screenrecord_channel_code_from_metadata(str(raw_folder.get("name", "")), metadata)
+        if raw_channel != normalized_channel:
+            continue
+        frame_item = source_files.get("frame_0.jpg")
+        if not frame_item or not frame_item.get("id"):
+            continue
+        return _reference_payload_for_frame(
+            client,
+            context.site_key,
+            site.display_name,
+            normalized_channel,
+            raw_folder,
+            frame_item,
+            SCREENRECORD_TRUE_TEN_FOLDER_NAME,
+            fallback_dimensions,
+        )
+    return None
+
+
+def _cleanup_reference_for_channel(
+    client: DriveClient,
+    context: QueueContext,
+    channel_hint: str,
+    fallback_dimensions: tuple[int, int] = (0, 0),
+) -> dict[str, Any] | None:
+    if context.source != REOLINK_SOURCE or not context.site_key or not channel_hint:
+        return None
+    try:
+        channel_code = _normalize_reolink_channel_code(channel_hint) or channel_hint
+        dimensions = (
+            int((fallback_dimensions or (0, 0))[0] or 0),
+            int((fallback_dimensions or (0, 0))[1] or 0),
+        )
+        cache_key = (context.queue_key, context.site_key, channel_code, dimensions[0], dimensions[1])
+        with _cleanup_reference_cache_lock:
+            if cache_key in _cleanup_reference_cache:
+                return _cleanup_reference_cache[cache_key]
+
+        reference = _cleanup_fast_reference_for_channel(client, context, channel_code, dimensions)
+        with _cleanup_reference_cache_lock:
+            _cleanup_reference_cache[cache_key] = reference
+        return reference
+    except Exception:
+        return None
+
+
+def _cleanup_channel_search_terms(channel_code: str) -> list[str]:
+    normalized = _normalize_reolink_channel_code(channel_code) or channel_code
+    terms = [normalized]
+    channel_number = _extract_reolink_channel_number(normalized)
+    if channel_number is not None:
+        terms.extend(
+            [
+                f"CH{channel_number:02d}",
+                f"CH{channel_number}",
+                f"IPC{channel_number}",
+                f"IPC{channel_number:02d}",
+            ]
+        )
+    seen: set[str] = set()
+    unique_terms: list[str] = []
+    for term in terms:
+        value = str(term or "").strip()
+        if not value or value.lower() in seen:
+            continue
+        seen.add(value.lower())
+        unique_terms.append(value)
+    return unique_terms
+
+
+def _cleanup_reference_candidate_folders(
+    client: DriveClient,
+    parent_id: str,
+    channel_code: str,
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    folders: list[dict[str, Any]] = []
+    fields = "id,name,mimeType,parents,appProperties,modifiedTime"
+    for term in _cleanup_channel_search_terms(channel_code):
+        if hasattr(client, "list_folders_by_name_contains"):
+            candidates = client.list_folders_by_name_contains(parent_id, term, fields=fields)
+        else:
+            candidates = [
+                folder
+                for folder in client.list_folders(parent_id, fields=fields)
+                if term.lower() in str(folder.get("name") or "").lower()
+            ]
+        for folder in candidates:
+            folder_id = str(folder.get("id") or "")
+            if not folder_id or folder_id in seen:
+                continue
+            seen.add(folder_id)
+            folders.append(folder)
+    return sorted(
+        folders,
+        key=lambda item: (
+            str(item.get("modifiedTime") or ""),
+            str(item.get("name") or "").lower(),
+        ),
+        reverse=True,
+    )
+
+
+def _cleanup_reference_from_parent(
+    client: DriveClient,
+    context: QueueContext,
+    parent_id: str,
+    channel_code: str,
+    source: str,
+    fallback_dimensions: tuple[int, int],
+) -> dict[str, Any] | None:
+    normalized_channel = _normalize_reolink_channel_code(channel_code) or channel_code
+    for raw_folder in _cleanup_reference_candidate_folders(client, parent_id, normalized_channel):
+        folder_name = str(raw_folder.get("name") or "")
+        folder_channel = _extract_reolink_channel_code(folder_name)
+        if folder_channel and folder_channel != normalized_channel:
+            continue
+        frame_item = client.find_file_by_name(str(raw_folder["id"]), "frame_0.jpg")
+        if not frame_item or not frame_item.get("id"):
+            continue
+        return {
+            "site_key": context.site_key or "",
+            "site_label": context.display_name,
+            "channel_code": normalized_channel,
+            "raw_folder_id": str(raw_folder["id"]),
+            "raw_folder_name": folder_name,
+            "frame_file_id": str(frame_item["id"]),
+            "preview_url": f"/api/preview/{frame_item['id']}",
+            "source": source,
+            "width": int((fallback_dimensions or (0, 0))[0] or 0),
+            "height": int((fallback_dimensions or (0, 0))[1] or 0),
+        }
+    return None
+
+
+def _cleanup_fast_reference_for_channel(
+    client: DriveClient,
+    context: QueueContext,
+    channel_code: str,
+    fallback_dimensions: tuple[int, int] = (0, 0),
+) -> dict[str, Any] | None:
+    true_ten_parent_id = context.folder_ids.get(SCREENRECORD_TRUE_TEN_NODE_KEY)
+    if true_ten_parent_id:
+        reference = _cleanup_reference_from_parent(
+            client,
+            context,
+            true_ten_parent_id,
+            channel_code,
+            SCREENRECORD_TRUE_TEN_FOLDER_NAME,
+            fallback_dimensions,
+        )
+        if reference is not None:
+            return reference
+
+    if context.seed_folder_id:
+        reference = _cleanup_reference_from_parent(
+            client,
+            context,
+            context.seed_folder_id,
+            channel_code,
+            "unassociated",
+            fallback_dimensions,
+        )
+        if reference is not None:
+            return reference
+
+    return None
+
+
+def _cleanup_supabase_crop_cards(client: DriveClient, context: QueueContext) -> list[dict[str, Any]]:
+    supabase_client = _get_supabase_crop_client()
+    if not supabase_client.enabled:
+        return []
+    try:
+        cameras = supabase_client.select(
+            "camera_sources",
+            {
+                "select": "id,name,restaurant_id,is_active,config",
+                "limit": "1000",
+            },
+        )
+    except Exception:
+        return []
+
+    cards: list[dict[str, Any]] = []
+    for camera in cameras:
+        if camera.get("is_active") is False or not _camera_source_matches_site_key(camera, context.site_key):
+            continue
+        camera_source_id = str(camera.get("id") or "").strip()
+        if not camera_source_id:
+            continue
+        crops = _supabase_active_crops_for_camera(supabase_client, camera_source_id)
+        if not crops:
+            continue
+        table_rows = _supabase_table_rows_by_id(
+            supabase_client,
+            [str(crop.get("table_id") or "") for crop in crops],
+        )
+        channel_hint = _cleanup_channel_hint_from_camera(camera)
+        reference = _cleanup_reference_for_channel(client, context, channel_hint)
+        for idx, crop in enumerate(crops):
+            raw_polygon = crop.get("polygon")
+            polygon: list[list[float]] = []
+            if isinstance(raw_polygon, list):
+                for point in raw_polygon:
+                    if isinstance(point, (list, tuple)) and len(point) == 2:
+                        polygon.append([float(point[0]), float(point[1])])
+            table_row = table_rows.get(str(crop.get("table_id") or ""))
+            label = _supabase_table_label(table_row, crop, idx)
+            cards.append(
+                {
+                    "kind": "supabase",
+                    "id": str(crop.get("id") or f"{camera_source_id}:{idx}"),
+                    "label": label,
+                    "table_hint": _safe_table_slug(label, f"table_{idx + 1}"),
+                    "channel_hint": channel_hint,
+                    "camera_source_id": camera_source_id,
+                    "camera_name": camera.get("name"),
+                    "restaurant_id": crop.get("restaurant_id") or camera.get("restaurant_id"),
+                    "table_id": crop.get("table_id"),
+                    "table_camera_crops_id": crop.get("id"),
+                    "crop_version": crop.get("version"),
+                    "crop_source": crop.get("source") or "supabase_table_camera_crops",
+                    "polygon": polygon,
+                    "frame_width": crop.get("frame_width") or (reference or {}).get("width"),
+                    "frame_height": crop.get("frame_height") or (reference or {}).get("height"),
+                    "reference": reference,
+                }
+            )
+    return cards
+
+
+def _cleanup_group_key(context: QueueContext, payload: dict[str, Any]) -> str:
+    channel = str(payload.get("channel_hint") or "unknown-channel").strip().lower()
+    table = str(payload.get("table_hint") or payload.get("folder_name") or "unknown-table").strip().lower()
+    crop_kind = str(payload.get("crop_source_kind") or "fallback_json").strip().lower()
+    return "|".join([context.queue_key, crop_kind, channel, table])
+
+
+def _cleanup_merge_key(group: dict[str, Any]) -> tuple[str, str, str]:
+    crop_kind = str(group.get("crop_source_kind") or "fallback_json").strip().lower()
+    channel = str(group.get("channel_hint") or "unknown-channel").strip().lower()
+    table = str(group.get("table_hint") or group.get("group_id") or "unknown-table").strip().lower()
+    return crop_kind, channel, table
+
+
+def _cleanup_polygon_payload(points: list | tuple | None) -> list[list[float]]:
+    polygon: list[list[float]] = []
+    for point in points or []:
+        if isinstance(point, (list, tuple)) and len(point) == 2:
+            polygon.append([float(point[0]), float(point[1])])
+    return polygon
+
+
+def _cleanup_legacy_definition_group(
+    context: QueueContext,
+    *,
+    crop_source_kind: str,
+    crop_label: str,
+    channel_hint: str,
+    table_hint: str,
+    polygon: list | tuple | None,
+    reference_dimensions: tuple[int, int],
+    legacy_source: str,
+) -> dict[str, Any]:
+    payload = {
+        "folder_name": f"{legacy_source}:{channel_hint}:{table_hint}",
+        "channel_hint": channel_hint,
+        "table_hint": table_hint,
+        "crop_source_kind": crop_source_kind,
+        "frame_count": 0,
+    }
+    return {
+        "group_id": _cleanup_group_key(context, payload),
+        "crop_source_kind": crop_source_kind,
+        "crop_label": crop_label,
+        "channel_hint": channel_hint,
+        "table_hint": table_hint,
+        "folder_ids": [],
+        "folder_count": 0,
+        "bucket_counts": {},
+        "representative": None,
+        "folders": [],
+        "polygon": _cleanup_polygon_payload(polygon),
+        "reference_dimensions": reference_dimensions,
+        "legacy_source": legacy_source,
+        "has_legacy_definition": True,
+    }
+
+
+def _cleanup_legacy_json_definition_groups(
+    client: DriveClient,
+    context: QueueContext,
+    filters: dict[str, str],
+) -> list[dict[str, Any]]:
+    if context.source != REOLINK_SOURCE or not context.site_key:
+        return []
+
+    groups: list[dict[str, Any]] = []
+    if _site_uses_manual_crop_configs(context.site_key):
+        crop_config_folder_id = context.folder_ids.get("crop_configs")
+        if not crop_config_folder_id:
+            return []
+        for item in client.list_files(crop_config_folder_id):
+            name = str(item.get("name") or "")
+            if not name.lower().endswith(".json"):
+                continue
+            channel_hint = _normalize_reolink_channel_code(name[:-5]) or name[:-5]
+            config = _load_json_file_from_drive(client, item)
+            if not isinstance(config, dict):
+                continue
+            reference = config.get("reference") or {}
+            dimensions = (int(reference.get("width") or 0), int(reference.get("height") or 0))
+            for table_id, _tight_poly, _tight_bbox, zone_poly in _build_table_polygons_from_crop_config(config):
+                group = _cleanup_legacy_definition_group(
+                    context,
+                    crop_source_kind="drive_crop_config",
+                    crop_label="Drive crop config JSON definition",
+                    channel_hint=channel_hint,
+                    table_hint=table_id,
+                    polygon=zone_poly,
+                    reference_dimensions=dimensions,
+                    legacy_source=f"crop_configs/{name}",
+                )
+                filter_payload = dict(
+                    group,
+                    folder_name=f"{group['legacy_source']}:{group['channel_hint']}:{group['table_hint']}",
+                )
+                if _review_payload_matches_filters(filter_payload, filters):
+                    groups.append(group)
+        return groups
+
+    legacy_source = _table_config_path().name
+    for channel_number, camera in sorted(_camera_configs_by_number().items()):
+        channel_hint = f"CH-CH{channel_number:02d}"
+        width = int(camera.get("image_width") or 0)
+        height = int(camera.get("image_height") or 0)
+        for table_id, _tight_poly, _tight_bbox, zone_poly in _build_table_polygons(camera):
+            group = _cleanup_legacy_definition_group(
+                context,
+                crop_source_kind="fallback_json",
+                crop_label="Fallback JSON definition",
+                channel_hint=channel_hint,
+                table_hint=table_id,
+                polygon=zone_poly,
+                reference_dimensions=(width, height),
+                legacy_source=legacy_source,
+            )
+            filter_payload = dict(
+                group,
+                folder_name=f"{group['legacy_source']}:{group['channel_hint']}:{group['table_hint']}",
+            )
+            if _review_payload_matches_filters(filter_payload, filters):
+                groups.append(group)
+    return groups
+
+
+def _cleanup_manual_crop_visual(
+    client: DriveClient,
+    context: QueueContext,
+    channel_hint: str,
+    table_hint: str,
+) -> dict[str, Any]:
+    if context.source != REOLINK_SOURCE or not context.site_key or not channel_hint:
+        return {}
+    channel_code = _normalize_reolink_channel_code(channel_hint)
+    if not channel_code:
+        return {}
+    crop_config = _load_saved_crop_config(client, context.site_key, channel_code)
+    if not crop_config:
+        return {}
+
+    reference = crop_config.get("reference") or {}
+    dimensions = (int(reference.get("width") or 0), int(reference.get("height") or 0))
+    wanted = _safe_table_slug(table_hint, "").lower()
+    polygon: list[list[float]] = []
+    if wanted:
+        for idx, crop in enumerate(crop_config.get("crops", [])):
+            crop_name = str(crop.get("name") or f"table_{idx + 1}").strip() or f"table_{idx + 1}"
+            crop_slug = _safe_table_slug(crop_name, f"table_{idx + 1}").lower()
+            if wanted not in {crop_name.lower(), crop_slug}:
+                continue
+            raw_polygon = crop.get("polygon")
+            if isinstance(raw_polygon, list):
+                for point in raw_polygon:
+                    if isinstance(point, (list, tuple)) and len(point) == 2:
+                        polygon.append([float(point[0]), float(point[1])])
+            break
+
+    return {
+        "polygon": polygon,
+        "reference_dimensions": dimensions,
+    }
+
+
+def _cleanup_attach_group_visuals(
+    client: DriveClient,
+    context: QueueContext,
+    groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    reference_cache: dict[tuple[str, tuple[int, int]], dict[str, Any] | None] = {}
+    for group in groups:
+        channel_hint = str(group.get("channel_hint") or "").strip()
+        table_hint = str(group.get("table_hint") or "").strip()
+        manual_visual = _cleanup_manual_crop_visual(client, context, channel_hint, table_hint)
+        fallback_dimensions = (
+            manual_visual.get("reference_dimensions")
+            or group.get("reference_dimensions")
+            or (0, 0)
+        )
+        reference_key = (
+            _normalize_reolink_channel_code(channel_hint) or channel_hint,
+            fallback_dimensions,
+        )
+        if reference_key not in reference_cache:
+            reference_cache[reference_key] = _cleanup_reference_for_channel(
+                client,
+                context,
+                channel_hint,
+                fallback_dimensions,
+            )
+        reference = reference_cache[reference_key]
+        if reference is not None:
+            group["reference"] = reference
+        if manual_visual.get("polygon"):
+            group["polygon"] = manual_visual["polygon"]
+    return groups
+
+
+def _cleanup_folder_matches_context(context: QueueContext, folder_name: str, app_properties: dict[str, Any], bucket: str) -> bool:
+    if not _review_folder_matches_context(context, folder_name, app_properties, bucket):
+        return False
+    queue_key = str(app_properties.get("autolabel_queue_key") or "").strip()
+    if queue_key:
+        return queue_key == context.queue_key
+    prefix = _review_source_prefix(context)
+    if prefix and folder_name.startswith(f"{prefix}-"):
+        return True
+    is_reolink_name = "Reolink-" in folder_name or _folder_name_has_reolink_channel(folder_name)
+    if context.source == REOLINK_SOURCE:
+        return is_reolink_name
+    if context.source == VIDEO_SOURCE:
+        return not is_reolink_name
+    return True
+
+
+def _cleanup_lightweight_payload_for_folder(
+    client: DriveClient,
+    context: QueueContext,
+    folder: dict[str, Any],
+    bucket: str,
+    parent_id: str,
+) -> dict[str, Any] | None:
+    folder_id = str(folder.get("id") or "")
+    folder_name = str(folder.get("name") or "")
+    if not folder_id or not folder_name:
+        return None
+
+    metadata_item = client.find_file_by_name(folder_id, "metadata.json")
+    metadata = _load_json_file_from_drive(client, metadata_item)
+    source_type = _review_source_type(
+        context,
+        bucket,
+        parent_id,
+        folder_name,
+        {"source_label": None, "perception_file_name": None},
+    )
+    crop_provenance = _review_crop_provenance(context, metadata, source_type)
+    if crop_provenance["kind"] not in CROP_CLEANUP_FALLBACK_KINDS:
+        return None
+
+    return {
+        "folder_id": folder_id,
+        "folder_name": folder_name,
+        "parent_id": parent_id,
+        "bucket": bucket,
+        "current_label": bucket if bucket in LABEL_DESTINATIONS else None,
+        "review_source_type": source_type,
+        "crop_provenance": crop_provenance,
+        "crop_source_kind": crop_provenance["kind"],
+        "has_supabase_crop": False,
+        "is_fallback_crop": True,
+        "table_camera_crops_id": crop_provenance["table_camera_crops_id"],
+        "supabase_table_id": crop_provenance["supabase_table_id"],
+        "camera_source_id": crop_provenance["camera_source_id"],
+        "crop_version": crop_provenance["crop_version"],
+        "channel_hint": _review_channel_hint(folder_name, metadata),
+        "table_hint": _review_table_hint(folder_name, metadata),
+        "frame_count": 0,
+        "modified_time": folder.get("modifiedTime"),
+        "metadata_file_id": (metadata_item or {}).get("id"),
+        "frames": {},
+    }
+
+
+def _cleanup_fallback_groups(
+    client: DriveClient,
+    context: QueueContext,
+    buckets: list[str],
+    filters: dict[str, str],
+) -> list[dict[str, Any]]:
+    parent_ids = _review_bucket_parent_ids(context, buckets)
+    groups: dict[str, dict[str, Any]] = {}
+    seen_folder_ids: set[str] = set()
+    for bucket, parent_id in parent_ids.items():
+        for folder in client.list_folders(parent_id, fields="id,name,mimeType,parents,appProperties,modifiedTime"):
+            folder_id = str(folder.get("id") or "")
+            folder_name = str(folder.get("name") or "")
+            if not folder_id or folder_id in seen_folder_ids:
+                continue
+            app_properties = dict(folder.get("appProperties") or {})
+            if not _cleanup_folder_matches_context(context, folder_name, app_properties, bucket):
+                continue
+            seen_folder_ids.add(folder_id)
+            payload = _cleanup_lightweight_payload_for_folder(client, context, folder, bucket, parent_id)
+            if payload is None:
+                continue
+            if not _review_payload_matches_filters(payload, filters):
+                continue
+            group_key = _cleanup_group_key(context, payload)
+            group = groups.setdefault(
+                group_key,
+                {
+                    "group_id": group_key,
+                    "crop_source_kind": payload.get("crop_source_kind"),
+                    "crop_label": (payload.get("crop_provenance") or {}).get("label"),
+                    "channel_hint": payload.get("channel_hint"),
+                    "table_hint": payload.get("table_hint"),
+                    "folder_ids": [],
+                    "folder_count": 0,
+                    "bucket_counts": {},
+                    "representative": payload,
+                    "folders": [],
+                },
+            )
+            group["folder_ids"].append(folder_id)
+            group["folder_count"] += 1
+            group["bucket_counts"][bucket] = int(group["bucket_counts"].get(bucket, 0)) + 1
+            group["folders"].append(payload)
+            if str(folder.get("modifiedTime") or "") > str((group["representative"] or {}).get("modified_time") or ""):
+                group["representative"] = payload
+    sorted_groups = sorted(
+        groups.values(),
+        key=lambda group: (
+            str(group.get("channel_hint") or ""),
+            str(group.get("table_hint") or ""),
+            -int(group.get("folder_count") or 0),
+        ),
+    )
+    return _cleanup_attach_group_visuals(client, context, sorted_groups)
+
+
+def _cleanup_legacy_crop_groups(
+    client: DriveClient,
+    context: QueueContext,
+    buckets: list[str],
+    filters: dict[str, str],
+) -> list[dict[str, Any]]:
+    definition_groups = _cleanup_legacy_json_definition_groups(client, context, filters)
+    artifact_groups = _cleanup_fallback_groups(client, context, buckets, filters)
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    for group in definition_groups:
+        merged[_cleanup_merge_key(group)] = group
+
+    for artifact_group in artifact_groups:
+        key = _cleanup_merge_key(artifact_group)
+        existing = merged.get(key)
+        if existing is None:
+            artifact_group.setdefault("has_legacy_definition", False)
+            artifact_group.setdefault("legacy_source", None)
+            merged[key] = artifact_group
+            continue
+        existing["folder_ids"] = list(artifact_group.get("folder_ids") or [])
+        existing["folder_count"] = int(artifact_group.get("folder_count") or 0)
+        existing["bucket_counts"] = dict(artifact_group.get("bucket_counts") or {})
+        existing["representative"] = artifact_group.get("representative")
+        existing["folders"] = list(artifact_group.get("folders") or [])
+        existing["artifact_group_id"] = artifact_group.get("group_id")
+        if artifact_group.get("reference") and not existing.get("reference"):
+            existing["reference"] = artifact_group["reference"]
+        if artifact_group.get("polygon") and not existing.get("polygon"):
+            existing["polygon"] = artifact_group["polygon"]
+
+    sorted_groups = sorted(
+        merged.values(),
+        key=lambda group: (
+            str(group.get("channel_hint") or ""),
+            str(group.get("table_hint") or ""),
+            0 if group.get("has_legacy_definition") else 1,
+            -int(group.get("folder_count") or 0),
+        ),
+    )
+    return _cleanup_attach_group_visuals(client, context, sorted_groups)
+
+
+def _cleanup_card_matches_filters(card: dict[str, Any], filters: dict[str, str]) -> bool:
+    q = filters.get("q", "").lower()
+    haystack = " ".join(
+        str(card.get(key) or "")
+        for key in ("label", "table_hint", "channel_hint", "camera_name", "table_camera_crops_id")
+    ).lower()
+    if q and q not in haystack:
+        return False
+    channel = filters.get("channel", "").lower()
+    if channel and channel not in str(card.get("channel_hint") or "").lower():
+        return False
+    table = filters.get("table", "").lower()
+    if table and table not in str(card.get("table_hint") or "").lower() and table not in str(card.get("label") or "").lower():
+        return False
+    return True
+
+
+def _review_allowed_parent_ids(context: QueueContext) -> set[str]:
+    return set(_review_bucket_parent_ids(context, list(REVIEW_BUCKETS)).values())
+
+
+def _review_current_parent(current: dict[str, Any]) -> str | None:
+    parents = [str(parent) for parent in current.get("parents", []) if parent]
+    return parents[0] if parents else None
+
+
+def _review_bucket_for_parent(context: QueueContext, parent_id: str) -> str | None:
+    for bucket, bucket_parent_id in _review_bucket_parent_ids(context, list(REVIEW_BUCKETS)).items():
+        if bucket_parent_id == parent_id:
+            return bucket
+    return None
+
+
+def _review_validate_folder_parent(context: QueueContext, current: dict[str, Any]) -> str:
+    parent_id = _review_current_parent(current)
+    if not parent_id or parent_id not in _review_allowed_parent_ids(context):
+        raise ValueError("folder is not in a reviewable Drive bucket")
+    bucket = _review_bucket_for_parent(context, parent_id)
+    folder_name = str(current.get("name") or "")
+    app_properties = dict(current.get("appProperties") or {})
+    if not bucket or not _review_folder_matches_context(context, folder_name, app_properties, bucket):
+        raise ValueError("folder does not belong to the selected review source")
+    return parent_id
+
+
+def _review_signature_for_current_folder(client: DriveClient, folder_id: str) -> tuple[str, dict[str, str | None], str]:
+    current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+    frames = _frame_payload_from_folder(current)
+    if not has_complete_frame_ids(frames):
+        frames = _frame_payload_from_files(client.list_files(folder_id))
+    frame_signature = _frame_signature_from_frames(frames) if has_complete_frame_ids(frames) else ""
+    folder_name = str(current.get("name") or "")
+    return folder_name, frames, frame_signature
 
 
 def _log_label_route_error(
@@ -3524,11 +4571,55 @@ def _detect_people_for_frames(frame_paths: list[Path], yolo_model: Any) -> list[
     from person_detector import assign_track_ids, detect_people_batch, detect_people_in_frame
 
     if callable(yolo_model):
-        frame_detections = detect_people_batch(frame_paths, yolo_model)
+        frame_detections: list[list[dict[str, Any]]] = []
+        for batch_start in range(0, len(frame_paths), REOLINK_YOLO_BATCH_FRAMES):
+            batch = frame_paths[batch_start:batch_start + REOLINK_YOLO_BATCH_FRAMES]
+            frame_detections.extend(detect_people_batch(batch, yolo_model))
     else:
         frame_detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
     assign_track_ids(frame_detections)
     return frame_detections
+
+
+def _detect_people_for_frame_groups(
+    frame_groups: list[list[Path]],
+    yolo_model: Any,
+) -> list[list[list[dict[str, Any]]]]:
+    from person_detector import assign_track_ids, detect_people_batch, detect_people_in_frame
+
+    if not frame_groups:
+        return []
+    if callable(yolo_model):
+        flat_paths = [frame_path for frame_paths in frame_groups for frame_path in frame_paths]
+        flat_detections: list[list[dict[str, Any]]] = []
+        for batch_start in range(0, len(flat_paths), REOLINK_YOLO_BATCH_FRAMES):
+            batch = flat_paths[batch_start:batch_start + REOLINK_YOLO_BATCH_FRAMES]
+            flat_detections.extend(detect_people_batch(batch, yolo_model))
+        grouped: list[list[list[dict[str, Any]]]] = []
+        offset = 0
+        for frame_paths in frame_groups:
+            detections = flat_detections[offset:offset + len(frame_paths)]
+            assign_track_ids(detections)
+            grouped.append(detections)
+            offset += len(frame_paths)
+        return grouped
+
+    grouped = []
+    for frame_paths in frame_groups:
+        detections = [detect_people_in_frame(frame_path, yolo_model) for frame_path in frame_paths]
+        assign_track_ids(detections)
+        grouped.append(detections)
+    return grouped
+
+
+@dataclass
+class _ScreenRecordTrueTenCandidate:
+    raw_folder: dict[str, Any]
+    state_folder: dict[str, Any]
+    source_files: dict[str, dict[str, Any]]
+    metadata: dict[str, Any]
+    camera: dict[str, Any]
+    missing_table_polygons: list[tuple[str, list, tuple[int, int, int, int], list]]
 
 
 def _materialize_screenrecord_true_ten_artifacts(
@@ -3538,15 +4629,6 @@ def _materialize_screenrecord_true_ten_artifacts(
     missing_table_polygons: list[tuple[str, list, tuple[int, int, int, int], list]],
     metadata: dict[str, Any],
 ) -> list[str]:
-    """Build final labeler artifacts from a ScreenRecord 10frametrue folder.
-
-    The source is ten full frames. The output is a compact 3-frame table crop
-    folder plus perception_v2.json built from all ten full frames.
-    """
-    from PIL import Image
-    from person_detector import build_perception_for_table
-    from processor import perspective_crop_polygon, save_jpeg, _scale_table_polygons
-
     source_files = {
         item["name"]: item
         for item in client.list_files(
@@ -3554,10 +4636,6 @@ def _materialize_screenrecord_true_ten_artifacts(
             fields="id,name,mimeType,parents,appProperties",
         )
     }
-    frame_items = [source_files.get(f"frame_{idx}.jpg") for idx in range(10)]
-    if any(item is None for item in frame_items):
-        return []
-
     mapped = _mapped_camera_tables_for_screenrecord_folder(
         str(raw_folder.get("name") or ""),
         metadata,
@@ -3580,42 +4658,117 @@ def _materialize_screenrecord_true_ten_artifacts(
     if not selected_polygons:
         return []
 
+    candidate = _ScreenRecordTrueTenCandidate(
+        raw_folder=raw_folder,
+        state_folder=_screenrecord_state_raw_folder(raw_folder),
+        source_files=source_files,
+        metadata=metadata,
+        camera=camera,
+        missing_table_polygons=selected_polygons,
+    )
+    results = _materialize_screenrecord_true_ten_batch(client, context, [candidate])
+    return results.get(str(raw_folder.get("id") or ""), [])
+
+
+def _materialize_screenrecord_true_ten_batch(
+    client: DriveClient,
+    context: QueueContext,
+    candidates: list[_ScreenRecordTrueTenCandidate],
+) -> dict[str, list[str]]:
+    """Build final labeler artifacts from ScreenRecord 10frametrue folders.
+
+    Each source folder has ten full frames. The output remains the existing
+    compact 3-frame table crop folder plus perception_v2.json built from all ten
+    full frames. This batches downloads and YOLO across folders while preserving
+    per-folder artifact semantics.
+    """
+    from PIL import Image
+    from person_detector import build_perception_for_table
+    from processor import perspective_crop_polygon, save_jpeg, _scale_table_polygons
+
+    if not candidates:
+        return {}
+
     label_source = _resolve_label_source(context.source, context.site_key)
     output_parent_id = _screenrecord_output_unlabeled_folder_id(client, context)
     selected_source_indices = [0, 5, 9]
+    timings: dict[str, float] = {}
+    total_started = time.perf_counter()
 
-    with tempfile.TemporaryDirectory(prefix="screenrecord_10frame_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="screenrecord_10frame_batch_") as tmpdir:
         tmp = Path(tmpdir)
-        frame_paths = [tmp / f"frame_{idx}.jpg" for idx in range(len(frame_items))]
-        _download_drive_files_parallel(client, frame_items, frame_paths)
+        work: list[dict[str, Any]] = []
+        all_frame_items: list[dict[str, Any]] = []
+        all_frame_paths: list[Path] = []
+        for candidate_index, candidate in enumerate(candidates):
+            frame_items = [candidate.source_files.get(f"frame_{idx}.jpg") for idx in range(10)]
+            if any(item is None for item in frame_items):
+                continue
+            frame_paths = [
+                tmp / f"candidate_{candidate_index}" / f"frame_{idx}.jpg"
+                for idx in range(len(frame_items))
+            ]
+            all_frame_items.extend([item for item in frame_items if item is not None])
+            all_frame_paths.extend(frame_paths)
+            work.append({"candidate": candidate, "frame_paths": frame_paths})
 
-        with Image.open(frame_paths[0]) as image:
-            frame_h, frame_w = image.height, image.width
-        img_shape = (frame_h, frame_w)
+        if not work:
+            return {}
 
-        ref_w = int(camera.get("image_width") or camera.get("frame_width") or camera.get("width") or frame_w)
-        ref_h = int(camera.get("image_height") or camera.get("frame_height") or camera.get("height") or frame_h)
-        scaled_polygons = selected_polygons
-        if ref_w != frame_w or ref_h != frame_h:
-            scaled_polygons = _scale_table_polygons(selected_polygons, ref_w, ref_h, frame_w, frame_h)
+        download_started = time.perf_counter()
+        _download_drive_files_parallel(client, all_frame_items, all_frame_paths)
+        timings["download_ms"] = (time.perf_counter() - download_started) * 1000
 
+        for item in work:
+            frame_paths = item["frame_paths"]
+            candidate = item["candidate"]
+            with Image.open(frame_paths[0]) as image:
+                frame_h, frame_w = image.height, image.width
+            img_shape = (frame_h, frame_w)
+            ref_w = int(
+                candidate.camera.get("image_width")
+                or candidate.camera.get("frame_width")
+                or candidate.camera.get("width")
+                or frame_w
+            )
+            ref_h = int(
+                candidate.camera.get("image_height")
+                or candidate.camera.get("frame_height")
+                or candidate.camera.get("height")
+                or frame_h
+            )
+            scaled_polygons = candidate.missing_table_polygons
+            if ref_w != frame_w or ref_h != frame_h:
+                scaled_polygons = _scale_table_polygons(
+                    candidate.missing_table_polygons,
+                    ref_w,
+                    ref_h,
+                    frame_w,
+                    frame_h,
+                )
+            item["img_shape"] = img_shape
+            item["scaled_polygons"] = scaled_polygons
+
+        yolo_started = time.perf_counter()
         yolo_model = _get_yolo_model()
-        frame_detections = _detect_people_for_frames(frame_paths, yolo_model)
+        grouped_detections = _detect_people_for_frame_groups(
+            [item["frame_paths"] for item in work],
+            yolo_model,
+        )
+        timings["yolo_ms"] = (time.perf_counter() - yolo_started) * 1000
+        for item, detections in zip(work, grouped_detections):
+            item["frame_detections"] = detections
 
-        generated_names: list[str] = []
-        source_captured_at = list(metadata.get("captured_at_utc") or metadata.get("source_captured_at_utc") or [])
-        selected_captured_at = [
-            source_captured_at[idx]
-            for idx in selected_source_indices
-            if idx < len(source_captured_at)
-        ]
-        raw_name = str(raw_folder.get("name") or metadata.get("triplet_stem") or "triplet")
-
-        def _materialize_one_table(
-            table_entry: tuple[str, list, tuple[int, int, int, int], list],
-        ) -> str:
+        def _materialize_one_table(item: dict[str, Any], table_entry: tuple[str, list, tuple[int, int, int, int], list]) -> tuple[str, str]:
+            candidate: _ScreenRecordTrueTenCandidate = item["candidate"]
+            frame_paths: list[Path] = item["frame_paths"]
+            frame_detections = item["frame_detections"]
+            img_shape = item["img_shape"]
             table_id, tight_poly, _tight_bbox, zone_poly = table_entry
-            table_metadata = _camera_table_metadata(camera, table_id)
+            table_metadata = _camera_table_metadata(candidate.camera, table_id)
+            metadata = candidate.metadata
+            raw_folder = candidate.raw_folder
+            raw_name = str(raw_folder.get("name") or metadata.get("triplet_stem") or "triplet")
             derived_name = _apply_source_prefix(
                 _derived_reolink_folder_name(raw_name, table_id),
                 label_source,
@@ -3635,6 +4788,12 @@ def _materialize_screenrecord_true_ten_artifacts(
                 )
                 uploaded_frame_ids[f"frame_{output_idx}"] = str(uploaded["id"])
 
+            source_captured_at = list(metadata.get("captured_at_utc") or metadata.get("source_captured_at_utc") or [])
+            selected_captured_at = [
+                source_captured_at[idx]
+                for idx in selected_source_indices
+                if idx < len(source_captured_at)
+            ]
             artifact_metadata = {
                 **metadata,
                 "frame_count": 3,
@@ -3653,7 +4812,7 @@ def _materialize_screenrecord_true_ten_artifacts(
                 "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
                 "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
                 "crop_version": table_metadata.get("crop_version"),
-                "crop_source": table_metadata.get("crop_source"),
+                "crop_source": table_metadata.get("crop_source") or candidate.camera.get("source") or "fallback_json",
                 "artifact_identity": _artifact_identity(raw_name, table_metadata, metadata),
                 "perception_file": PERCEPTION_V2_FILE_NAME,
             }
@@ -3684,16 +4843,61 @@ def _materialize_screenrecord_true_ten_artifacts(
                 dest_folder_id,
                 {"appProperties": build_folder_app_properties(uploaded_frame_ids)},
             )
-            return derived_name
+            return str(raw_folder.get("id") or ""), derived_name
 
-        max_workers = min(REOLINK_TABLE_MATERIALIZE_WORKERS, len(scaled_polygons))
+        materialize_started = time.perf_counter()
+        tasks = [
+            (item, table_entry)
+            for item in work
+            for table_entry in item["scaled_polygons"]
+        ]
+        generated_by_folder: dict[str, list[str]] = {
+            str(item["candidate"].raw_folder.get("id") or ""): []
+            for item in work
+        }
+        max_workers = min(REOLINK_TABLE_MATERIALIZE_WORKERS, len(tasks))
         if max_workers <= 1:
-            generated_names = [_materialize_one_table(entry) for entry in scaled_polygons]
+            for item, table_entry in tasks:
+                try:
+                    folder_id, generated_name = _materialize_one_table(item, table_entry)
+                    generated_by_folder.setdefault(folder_id, []).append(generated_name)
+                except Exception as exc:
+                    raw_folder = item["candidate"].raw_folder
+                    print(f"[screenrecord-true-ten] failed to materialize {raw_folder.get('name')}: {exc}")
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                generated_names = list(executor.map(_materialize_one_table, scaled_polygons))
+                futures = {
+                    executor.submit(_materialize_one_table, item, table_entry): item
+                    for item, table_entry in tasks
+                }
+                for future in as_completed(futures):
+                    try:
+                        folder_id, generated_name = future.result()
+                    except Exception as exc:
+                        raw_folder = futures[future]["candidate"].raw_folder
+                        print(f"[screenrecord-true-ten] failed to materialize {raw_folder.get('name')}: {exc}")
+                        continue
+                    generated_by_folder.setdefault(folder_id, []).append(generated_name)
+        timings["materialize_ms"] = (time.perf_counter() - materialize_started) * 1000
 
-        return generated_names
+        total_ms = (time.perf_counter() - total_started) * 1000
+        generated_count = sum(len(names) for names in generated_by_folder.values())
+        folders_per_min = (len(work) / (total_ms / 60000.0)) if total_ms > 0 else 0.0
+        _log_timing(
+            "screenrecord_true_ten_batch",
+            total_ms=f"{total_ms:.1f}",
+            download_ms=f"{timings.get('download_ms', 0.0):.1f}",
+            yolo_ms=f"{timings.get('yolo_ms', 0.0):.1f}",
+            materialize_ms=f"{timings.get('materialize_ms', 0.0):.1f}",
+            folders=len(work),
+            frames=len(all_frame_paths),
+            tables=len(tasks),
+            generated=generated_count,
+            yolo_batch_frames=REOLINK_YOLO_BATCH_FRAMES,
+            folders_per_min=f"{folders_per_min:.2f}",
+            queue=context.queue_key,
+        )
+        return generated_by_folder
 
 
 def _materialize_reolink_table_crops(
@@ -3857,7 +5061,7 @@ def _materialize_reolink_table_crops(
                     "table_camera_crops_id": table_metadata.get("table_camera_crops_id"),
                     "camera_source_id": table_metadata.get("camera_source_id") or metadata.get("camera_source_id"),
                     "crop_version": table_metadata.get("crop_version"),
-                    "crop_source": table_metadata.get("crop_source"),
+                    "crop_source": table_metadata.get("crop_source") or camera.get("source") or "fallback_json",
                     "artifact_identity": _artifact_identity(str(raw_folder["name"]), table_metadata, metadata),
                     "perception_file": perception_file_name,
                 }
@@ -4070,6 +5274,7 @@ def _prepare_reolink_unlabeled_queue(
     context: QueueContext,
     target_unlabeled_count: int,
     current_visible_count: int | None = None,
+    deadline_monotonic: float | None = None,
 ) -> int:
     if context.source != REOLINK_SOURCE:
         return 0
@@ -4104,128 +5309,49 @@ def _prepare_reolink_unlabeled_queue(
 
         # ScreenRecord-native path: use ready 3-frame artifacts first, then
         # materialize missing artifacts from root-level 10frametrue folders.
-        for true_ten_folder in _list_screenrecord_true_ten_folders(client, context):
-            if visible_count >= target_unlabeled_count:
+        true_ten_scan_started = time.perf_counter()
+        true_ten_folders = _list_screenrecord_true_ten_folders(client, context)
+        true_ten_scanned = 0
+        true_ten_candidates = 0
+        true_ten_index = 0
+        while true_ten_index < len(true_ten_folders) and visible_count < target_unlabeled_count:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                 break
 
-            state_folder = _screenrecord_state_raw_folder(true_ten_folder)
-            if _reolink_raw_folder_processed(preprocess_state, context, state_folder):
-                continue
-
-            source_files = {
-                item["name"]: item
-                for item in client.list_files(
-                    true_ten_folder["id"],
-                    fields="id,name,mimeType,parents,appProperties",
-                )
-            }
-            metadata = _load_json_file_from_drive(client, source_files.get("metadata.json"))
-            if not metadata:
-                continue
-
-            mapped = _mapped_camera_tables_for_screenrecord_folder(
-                str(true_ten_folder.get("name", "")),
-                metadata,
-                site_key=context.site_key,
-                client=client,
-            )
-            if mapped is None:
-                continue
-
-            _channel_number, _camera, table_polygons = mapped
-            missing_table_polygons = [
-                entry
-                for entry in table_polygons
-                if (
-                    _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0])
-                    not in existing_names
-                    and _apply_source_prefix(
-                        _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0]),
-                        label_source,
-                    )
-                    not in existing_names
-                    and _artifact_identity(
-                        str(true_ten_folder.get("name", "")),
-                        _camera_table_metadata(_camera, entry[0]),
-                        metadata,
-                    )
-                    not in existing_identities
-                )
-            ]
-            if not missing_table_polygons:
-                _mark_reolink_raw_folder_processed(
-                    preprocess_state,
-                    context,
-                    state_folder,
-                    status="complete",
-                    generated=0,
-                )
-                continue
-
-            generated_names = _materialize_screenrecord_true_ten_artifacts(
-                client,
-                context,
-                true_ten_folder,
-                missing_table_polygons,
-                metadata,
-            )
-            raw_generated_count = 0
-            recorded_generated = _record_generated_reolink_artifacts(
-                generated_names=generated_names,
-                existing_names=existing_names,
-                existing_identities=existing_identities,
-                raw_name=str(true_ten_folder.get("name", "")),
-                table_polygons=missing_table_polygons,
-                camera=_camera,
-                metadata=metadata,
-                label_source=label_source,
-            )
-            for _name in generated_names:
-                unlabeled_count += 1
-                visible_count += 1
-                generated_any = True
-                generated_count += 1
-                raw_generated_count += 1
-            raw_generated_count = max(raw_generated_count, recorded_generated)
-
-            if raw_generated_count > 0:
-                _mark_reolink_raw_folder_processed(
-                    preprocess_state,
-                    context,
-                    state_folder,
-                    status="complete",
-                    generated=raw_generated_count,
-                )
-
-        if visible_count >= target_unlabeled_count:
-            if generated_any:
-                _invalidate_listing_cache(context.queue_key)
-            return generated_count
-
-        # Phase 3: drain zipped unprocessed batches first (older queue from
-        # before the per-triplet upload pattern; lives at <site>/unassociated_zips/).
-        # Each zip is a batch of raw triplets compacted by
-        # scripts/compact_unassociated_to_zips.py. We download, extract,
-        # process each triplet from local files, then delete the zip when
-        # every triplet inside it has reached a terminal state.
-        for zip_batch in _iterate_unassociated_zip_batches(client, context):
-            if visible_count >= target_unlabeled_count:
-                break
-            for triplet in zip_batch.triplets:
-                if visible_count >= target_unlabeled_count:
+            batch_candidates: list[_ScreenRecordTrueTenCandidate] = []
+            while (
+                true_ten_index < len(true_ten_folders)
+                and len(batch_candidates) < REOLINK_TRUE_TEN_BATCH_SIZE
+                and visible_count < target_unlabeled_count
+            ):
+                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                     break
-                triplet_id = triplet["id"]
-                if _reolink_raw_folder_processed(preprocess_state, context, triplet):
-                    zip_batch.mark_success(triplet_id)
+                true_ten_folder = true_ten_folders[true_ten_index]
+                true_ten_index += 1
+                true_ten_scanned += 1
+
+                state_folder = _screenrecord_state_raw_folder(true_ten_folder)
+                if _reolink_raw_folder_processed(preprocess_state, context, state_folder):
                     continue
 
-                mapped = _mapped_camera_tables_for_reolink_folder(
-                    str(triplet.get("name", "")),
+                source_files = {
+                    item["name"]: item
+                    for item in client.list_files(
+                        true_ten_folder["id"],
+                        fields="id,name,mimeType,parents,appProperties",
+                    )
+                }
+                metadata = _load_json_file_from_drive(client, source_files.get("metadata.json"))
+                if not metadata:
+                    continue
+
+                mapped = _mapped_camera_tables_for_screenrecord_folder(
+                    str(true_ten_folder.get("name", "")),
+                    metadata,
                     site_key=context.site_key,
                     client=client,
                 )
                 if mapped is None:
-                    zip_batch.mark_failure(triplet_id)
                     continue
 
                 _channel_number, _camera, table_polygons = mapped
@@ -4233,17 +5359,17 @@ def _prepare_reolink_unlabeled_queue(
                     entry
                     for entry in table_polygons
                     if (
-                        _derived_reolink_folder_name(str(triplet["name"]), entry[0])
+                        _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0])
                         not in existing_names
                         and _apply_source_prefix(
-                            _derived_reolink_folder_name(str(triplet["name"]), entry[0]),
+                            _derived_reolink_folder_name(str(true_ten_folder["name"]), entry[0]),
                             label_source,
                         )
                         not in existing_names
                         and _artifact_identity(
-                            str(triplet.get("name", "")),
+                            str(true_ten_folder.get("name", "")),
                             _camera_table_metadata(_camera, entry[0]),
-                            {},
+                            metadata,
                         )
                         not in existing_identities
                     )
@@ -4252,38 +5378,44 @@ def _prepare_reolink_unlabeled_queue(
                     _mark_reolink_raw_folder_processed(
                         preprocess_state,
                         context,
-                        triplet,
+                        state_folder,
                         status="complete",
                         generated=0,
                     )
-                    zip_batch.mark_success(triplet_id)
                     continue
 
-                try:
-                    generated_names = _materialize_reolink_table_crops(
-                        client,
-                        context,
-                        triplet,
-                        missing_table_polygons,
-                        local_frame_paths=triplet["_local_frame_paths"],
-                        local_metadata_path=triplet.get("_local_metadata_path"),
+                batch_candidates.append(
+                    _ScreenRecordTrueTenCandidate(
+                        raw_folder=true_ten_folder,
+                        state_folder=state_folder,
+                        source_files=source_files,
+                        metadata=metadata,
+                        camera=_camera,
+                        missing_table_polygons=missing_table_polygons,
                     )
-                except Exception as exc:
-                    print(
-                        f"[zip-batch] crop failed for {triplet.get('name')} ({triplet_id}): {exc}"
-                    )
-                    zip_batch.mark_failure(triplet_id)
-                    continue
+                )
+                true_ten_candidates += 1
 
+            if not batch_candidates:
+                continue
+
+            generated_by_folder = _materialize_screenrecord_true_ten_batch(
+                client,
+                context,
+                batch_candidates,
+            )
+            for candidate in batch_candidates:
+                true_ten_folder = candidate.raw_folder
+                generated_names = generated_by_folder.get(str(true_ten_folder.get("id") or ""), [])
                 raw_generated_count = 0
                 recorded_generated = _record_generated_reolink_artifacts(
                     generated_names=generated_names,
                     existing_names=existing_names,
                     existing_identities=existing_identities,
-                    raw_name=str(triplet.get("name", "")),
-                    table_polygons=missing_table_polygons,
-                    camera=_camera,
-                    metadata={},
+                    raw_name=str(true_ten_folder.get("name", "")),
+                    table_polygons=candidate.missing_table_polygons,
+                    camera=candidate.camera,
+                    metadata=candidate.metadata,
                     label_source=label_source,
                 )
                 for _name in generated_names:
@@ -4294,17 +5426,140 @@ def _prepare_reolink_unlabeled_queue(
                     raw_generated_count += 1
                 raw_generated_count = max(raw_generated_count, recorded_generated)
 
-                if raw_generated_count > 0:
+                if raw_generated_count >= len(candidate.missing_table_polygons):
                     _mark_reolink_raw_folder_processed(
                         preprocess_state,
                         context,
-                        triplet,
+                        candidate.state_folder,
                         status="complete",
                         generated=raw_generated_count,
                     )
-                    zip_batch.mark_success(triplet_id)
-                else:
-                    zip_batch.mark_failure(triplet_id)
+
+        true_ten_scan_ms = (time.perf_counter() - true_ten_scan_started) * 1000
+        if true_ten_scanned or true_ten_candidates:
+            _log_timing(
+                "screenrecord_true_ten_scan",
+                total_ms=f"{true_ten_scan_ms:.1f}",
+                scanned=true_ten_scanned,
+                candidates=true_ten_candidates,
+                generated=generated_count,
+                batch_size=REOLINK_TRUE_TEN_BATCH_SIZE,
+                target=target_unlabeled_count,
+                visible=visible_count,
+                deadline_hit=int(deadline_monotonic is not None and time.monotonic() >= deadline_monotonic),
+                queue=context.queue_key,
+            )
+
+        if visible_count >= target_unlabeled_count:
+            if generated_any:
+                _invalidate_listing_cache(context.queue_key)
+            return generated_count
+
+        # Legacy zip batches are old migration input, not normal queue material.
+        # Keep them available for explicit cleanup/audit, but do not silently
+        # turn them into new label folders unless an operator opts in.
+        if REOLINK_PROCESS_UNASSOCIATED_ZIPS:
+            for zip_batch in _iterate_unassociated_zip_batches(client, context):
+                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                    break
+                if visible_count >= target_unlabeled_count:
+                    break
+                for triplet in zip_batch.triplets:
+                    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                        break
+                    if visible_count >= target_unlabeled_count:
+                        break
+                    triplet_id = triplet["id"]
+                    if _reolink_raw_folder_processed(preprocess_state, context, triplet):
+                        zip_batch.mark_success(triplet_id)
+                        continue
+
+                    mapped = _mapped_camera_tables_for_reolink_folder(
+                        str(triplet.get("name", "")),
+                        site_key=context.site_key,
+                        client=client,
+                    )
+                    if mapped is None:
+                        zip_batch.mark_failure(triplet_id)
+                        continue
+
+                    _channel_number, _camera, table_polygons = mapped
+                    missing_table_polygons = [
+                        entry
+                        for entry in table_polygons
+                        if (
+                            _derived_reolink_folder_name(str(triplet["name"]), entry[0])
+                            not in existing_names
+                            and _apply_source_prefix(
+                                _derived_reolink_folder_name(str(triplet["name"]), entry[0]),
+                                label_source,
+                            )
+                            not in existing_names
+                            and _artifact_identity(
+                                str(triplet.get("name", "")),
+                                _camera_table_metadata(_camera, entry[0]),
+                                {},
+                            )
+                            not in existing_identities
+                        )
+                    ]
+                    if not missing_table_polygons:
+                        _mark_reolink_raw_folder_processed(
+                            preprocess_state,
+                            context,
+                            triplet,
+                            status="complete",
+                            generated=0,
+                        )
+                        zip_batch.mark_success(triplet_id)
+                        continue
+
+                    try:
+                        generated_names = _materialize_reolink_table_crops(
+                            client,
+                            context,
+                            triplet,
+                            missing_table_polygons,
+                            local_frame_paths=triplet["_local_frame_paths"],
+                            local_metadata_path=triplet.get("_local_metadata_path"),
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[zip-batch] crop failed for {triplet.get('name')} ({triplet_id}): {exc}"
+                        )
+                        zip_batch.mark_failure(triplet_id)
+                        continue
+
+                    raw_generated_count = 0
+                    recorded_generated = _record_generated_reolink_artifacts(
+                        generated_names=generated_names,
+                        existing_names=existing_names,
+                        existing_identities=existing_identities,
+                        raw_name=str(triplet.get("name", "")),
+                        table_polygons=missing_table_polygons,
+                        camera=_camera,
+                        metadata={},
+                        label_source=label_source,
+                    )
+                    for _name in generated_names:
+                        unlabeled_count += 1
+                        visible_count += 1
+                        generated_any = True
+                        generated_count += 1
+                        raw_generated_count += 1
+                    raw_generated_count = max(raw_generated_count, recorded_generated)
+
+                    if raw_generated_count > 0:
+                        _mark_reolink_raw_folder_processed(
+                            preprocess_state,
+                            context,
+                            triplet,
+                            status="complete",
+                            generated=raw_generated_count,
+                        )
+                        zip_batch.mark_success(triplet_id)
+                    else:
+                        zip_batch.mark_failure(triplet_id)
 
         if visible_count >= target_unlabeled_count:
             if generated_any:
@@ -4314,6 +5569,8 @@ def _prepare_reolink_unlabeled_queue(
         raw_folders = _list_reolink_raw_folders(client, context)
 
         for raw_folder in raw_folders:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                break
             if visible_count >= target_unlabeled_count:
                 break
 
@@ -4436,18 +5693,28 @@ def drain_reolink_preprocessing(
     """Materialize all missing Reolink per-table folders and then stop."""
     drive = client or _new_storage_client()
     requested_site_keys = site_keys or [site.site_key for site in REOLINK_SITES]
+    deadline_monotonic = (
+        time.monotonic() + REOLINK_PREPROCESS_MAX_SECONDS
+        if REOLINK_PREPROCESS_MAX_SECONDS > 0
+        else None
+    )
     summary: dict[str, Any] = {
         "sites": {},
         "generated": 0,
         "errors": {},
+        "max_seconds": REOLINK_PREPROCESS_MAX_SECONDS,
     }
     for site_key in requested_site_keys:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            summary["stopped_reason"] = "max_seconds"
+            break
         try:
             context = _resolve_queue_context(drive, REOLINK_SOURCE, site_key)
             generated = _prepare_reolink_unlabeled_queue(
                 drive,
                 context,
                 target_unlabeled_count=1_000_000_000,
+                deadline_monotonic=deadline_monotonic,
             )
             summary["sites"][site_key] = {"generated": generated}
             summary["generated"] += generated
@@ -4594,10 +5861,6 @@ def _list_source_subfolders(
     if cached_listing is not None and not force_refresh:
         _schedule_listing_refresh(context)
         return cached_listing
-
-    if force_refresh and context.source == REOLINK_SOURCE and has_request_context():
-        _schedule_listing_refresh(context)
-        return []
 
     listing = _fetch_source_listing(client, context)
     _set_listing_cache(context.queue_key, listing)
@@ -5860,6 +7123,29 @@ def index():
     return render_template("label.html")
 
 
+@app.route("/cleanup/legacy")
+def legacy_cleanup():
+    return render_template(
+        "review.html",
+        review_mode="legacy",
+        page_title="Legacy Cleanup",
+    )
+
+
+@app.route("/cleanup/crops")
+def crop_cleanup():
+    return render_template("crop_cleanup.html")
+
+
+@app.route("/review/labeled")
+def labeled_review():
+    return render_template(
+        "review.html",
+        review_mode="labeled",
+        page_title="Labeled Review",
+    )
+
+
 @app.route("/crop-editor")
 def crop_editor():
     site_key = request.args.get("site", MATTHEWS_SITE_KEY)
@@ -6130,6 +7416,314 @@ def api_folder_frames(folder_id: str):
             frames = _frame_payload_from_files(client.list_files(folder_id))
         return jsonify(frames)
     except DriveClientError as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/review/folders")
+def api_review_folders():
+    try:
+        client = get_client()
+        source, site_key = _request_source_args()
+        context = _resolve_queue_context(client, source, site_key)
+        mode = str(request.args.get("mode") or "labeled").strip().lower()
+        default_buckets = REVIEW_LEGACY_DEFAULT_BUCKETS if mode == "legacy" else REVIEW_LABELED_DEFAULT_BUCKETS
+        buckets = _parse_csv_arg("bucket", default_buckets)
+        limit = max(1, min(120, int(request.args.get("limit", "30") or "30")))
+        cursor = max(0, int(request.args.get("cursor", "0") or "0"))
+        filters = {
+            "q": str(request.args.get("q") or "").strip(),
+            "channel": str(request.args.get("channel") or "").strip(),
+            "table": str(request.args.get("table") or "").strip(),
+            "frame_count": str(request.args.get("frame_count") or "").strip(),
+            "folder_source_type": str(request.args.get("folder_source_type") or "").strip(),
+            "crop_source_kind": str(request.args.get("crop_source_kind") or "").strip(),
+        }
+        page, next_cursor, candidate_total = _review_list_folders(
+            client,
+            context,
+            buckets,
+            filters,
+            limit=limit,
+            cursor=cursor,
+        )
+        return jsonify(
+            {
+                "folders": page,
+                "next_cursor": next_cursor,
+                "total": candidate_total,
+                "total_is_candidate_count": True,
+                "source_context": context.to_payload(),
+                "buckets": buckets,
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cleanup/crops/inventory")
+def api_cleanup_crops_inventory():
+    try:
+        client = get_client()
+        source, site_key = _request_source_args()
+        context = _resolve_queue_context(client, source, site_key)
+        buckets = _parse_csv_arg("bucket", CROP_CLEANUP_DEFAULT_BUCKETS)
+        filters = {
+            "q": str(request.args.get("q") or "").strip(),
+            "channel": str(request.args.get("channel") or "").strip(),
+            "table": str(request.args.get("table") or "").strip(),
+            "frame_count": str(request.args.get("frame_count") or "").strip(),
+            "folder_source_type": str(request.args.get("folder_source_type") or "").strip(),
+            "crop_source_kind": str(request.args.get("crop_source_kind") or "").strip(),
+        }
+        supabase_cards = [
+            card
+            for card in _cleanup_supabase_crop_cards(client, context)
+            if _cleanup_card_matches_filters(card, filters)
+        ]
+        include_fallback = str(request.args.get("include_fallback") or "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        fallback_groups = _cleanup_legacy_crop_groups(client, context, buckets, filters) if include_fallback else []
+        return jsonify(
+            {
+                "source_context": context.to_payload(),
+                "supabase_crops": supabase_cards,
+                "fallback_groups": fallback_groups,
+                "buckets": buckets,
+                "counts": {
+                    "supabase_crops": len(supabase_cards),
+                    "fallback_groups": len(fallback_groups),
+                    "legacy_definitions": sum(1 for group in fallback_groups if group.get("has_legacy_definition")),
+                    "fallback_folders": sum(int(group.get("folder_count") or 0) for group in fallback_groups),
+                },
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cleanup/crops/trash", methods=["POST"])
+def api_cleanup_crops_trash():
+    try:
+        data = _request_json_payload()
+        source, site_key = _payload_source_args(data)
+        folder_ids = [str(item).strip() for item in (data.get("folder_ids") or []) if str(item).strip()]
+        confirm = str(data.get("confirm") or "").strip()
+        if confirm != "TRASH":
+            return jsonify({"error": "confirm must be TRASH"}), 400
+        if not folder_ids:
+            return jsonify({"error": "folder_ids required"}), 400
+        if len(folder_ids) > 500:
+            return jsonify({"error": "at most 500 folders can be trashed at once"}), 400
+
+        client = get_client()
+        context = _resolve_queue_context(client, source, site_key)
+        validated: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for folder_id in folder_ids:
+            current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+            try:
+                parent_id = _review_validate_folder_parent(context, current)
+                bucket = _review_bucket_for_parent(context, parent_id) or "current"
+                if not _cleanup_folder_matches_context(
+                    context,
+                    str(current.get("name") or ""),
+                    dict(current.get("appProperties") or {}),
+                    bucket,
+                ):
+                    raise ValueError("folder does not belong to the selected cleanup source")
+                payload = _review_payload_for_folder(client, context, current, bucket, parent_id)
+                if payload is None or str(payload.get("crop_source_kind") or "") not in CROP_CLEANUP_FALLBACK_KINDS:
+                    raise ValueError("folder is not a fallback/manual JSON crop artifact")
+                validated.append({"folder_id": folder_id, "parent_id": parent_id, "payload": payload})
+            except Exception as exc:
+                rejected.append({"folder_id": folder_id, "error": str(exc)})
+
+        if rejected:
+            return jsonify({"error": "one or more folders are not safe to trash", "rejected": rejected}), 400
+
+        results: list[dict[str, Any]] = []
+        for item in validated:
+            folder_id = item["folder_id"]
+            payload = item["payload"]
+            folder_name, frames, frame_signature = _review_signature_for_current_folder(client, folder_id)
+            content_signature = _content_signature_from_frames(frames) if has_complete_frame_ids(frames) else ""
+            client.trash_file(folder_id)
+            _remove_label_history(context, folder_id, folder_name, frame_signature, content_signature)
+            _clear_label_queue_caches(context, folder_id)
+            results.append(
+                {
+                    "folder_id": folder_id,
+                    "folder_name": payload.get("folder_name") or folder_name,
+                    "trashed": True,
+                    "crop_source_kind": payload.get("crop_source_kind"),
+                }
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "trashed": len(results),
+                "results": results,
+                "source_context": context.to_payload(),
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError, OSError, TypeError) as e:
+        return jsonify({"error": str(e), "code": "cleanup_crop_trash_failed"}), 500
+
+
+@app.route("/api/review/relabel", methods=["POST"])
+def api_review_relabel():
+    try:
+        data = _request_json_payload()
+        source, site_key = _payload_source_args(data)
+        target_label = str(data.get("target_label") or data.get("label") or "").strip().lower()
+        folder_ids = [str(item).strip() for item in (data.get("folder_ids") or []) if str(item).strip()]
+        if target_label not in LABEL_DESTINATIONS:
+            return jsonify({"error": f"target_label must be one of {', '.join(LABEL_DESTINATIONS)}"}), 400
+        if not folder_ids:
+            return jsonify({"error": "folder_ids required"}), 400
+        if len(folder_ids) > 200:
+            return jsonify({"error": "at most 200 folders can be relabeled at once"}), 400
+
+        client = get_client()
+        context = _resolve_queue_context(client, source, site_key)
+        destination_id = context.folder_ids[target_label]
+        results: list[dict[str, Any]] = []
+        for folder_id in folder_ids:
+            current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+            current_parent = _review_validate_folder_parent(context, current)
+            if current_parent != destination_id:
+                client.move_file(folder_id, new_parent_id=destination_id, remove_parent_id=current_parent)
+            label_metadata = dict(current.get("appProperties") or {})
+            label_metadata.update(_label_app_properties(target_label, context))
+            client.update_file_metadata(
+                folder_id,
+                {"appProperties": label_metadata},
+                fields="id,name,mimeType,parents,appProperties",
+            )
+            folder_name, frames, frame_signature = _review_signature_for_current_folder(client, folder_id)
+            content_signature = _content_signature_from_frames(frames) if has_complete_frame_ids(frames) else ""
+            _record_label_history(
+                context,
+                folder_id,
+                folder_name,
+                frame_signature,
+                target_label,
+                content_signature,
+            )
+            _clear_label_queue_caches(context, folder_id)
+            results.append({"folder_id": folder_id, "label": target_label, "moved": current_parent != destination_id})
+        return jsonify({"ok": True, "updated": len(results), "results": results, "source_context": context.to_payload()})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError, OSError, TypeError) as e:
+        return jsonify({"error": str(e), "code": "review_relabel_failed"}), 500
+
+
+@app.route("/api/review/trash", methods=["POST"])
+def api_review_trash():
+    try:
+        data = _request_json_payload()
+        source, site_key = _payload_source_args(data)
+        folder_ids = [str(item).strip() for item in (data.get("folder_ids") or []) if str(item).strip()]
+        confirm = str(data.get("confirm") or "").strip()
+        if confirm != "TRASH":
+            return jsonify({"error": "confirm must be TRASH"}), 400
+        if not folder_ids:
+            return jsonify({"error": "folder_ids required"}), 400
+        if len(folder_ids) > 200:
+            return jsonify({"error": "at most 200 folders can be trashed at once"}), 400
+
+        client = get_client()
+        context = _resolve_queue_context(client, source, site_key)
+        results: list[dict[str, Any]] = []
+        for folder_id in folder_ids:
+            current = client.get_file(folder_id, fields="id,name,parents,appProperties")
+            _review_validate_folder_parent(context, current)
+            folder_name, frames, frame_signature = _review_signature_for_current_folder(client, folder_id)
+            content_signature = _content_signature_from_frames(frames) if has_complete_frame_ids(frames) else ""
+            client.trash_file(folder_id)
+            _remove_label_history(context, folder_id, folder_name, frame_signature, content_signature)
+            _clear_label_queue_caches(context, folder_id)
+            results.append({"folder_id": folder_id, "trashed": True})
+        return jsonify({"ok": True, "trashed": len(results), "results": results, "source_context": context.to_payload()})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError, OSError, TypeError) as e:
+        return jsonify({"error": str(e), "code": "review_trash_failed"}), 500
+
+
+@app.route("/api/review/compare")
+def api_review_compare():
+    try:
+        client = get_client()
+        source, site_key = _request_source_args()
+        context = _resolve_queue_context(client, source, site_key)
+        folder_id = str(request.args.get("folder_id") or "").strip()
+        if not folder_id:
+            return jsonify({"error": "folder_id required"}), 400
+
+        current = client.get_file(folder_id, fields="id,name,parents,appProperties,modifiedTime")
+        _review_validate_folder_parent(context, current)
+        current_parent = _review_current_parent(current) or ""
+        current_payload = _review_payload_for_folder(client, context, current, "current", current_parent)
+        if current_payload is None:
+            return jsonify({"matches": [], "folder": None})
+        channel = str(current_payload.get("channel_hint") or "").lower()
+        table = str(current_payload.get("table_hint") or "").lower()
+        name_bits = [
+            bit.lower()
+            for bit in re.split(r"[^A-Za-z0-9]+", str(current_payload.get("folder_name") or ""))
+            if len(bit) >= 3
+        ]
+
+        candidates, _next_cursor, _candidate_total = _review_list_folders(
+            client,
+            context,
+            list(REVIEW_LEGACY_DEFAULT_BUCKETS),
+            {
+                "q": "",
+                "channel": "",
+                "table": "",
+                "frame_count": "",
+                "folder_source_type": "",
+                "crop_source_kind": "",
+            },
+            limit=120,
+            cursor=0,
+        )
+        scored: list[tuple[int, dict[str, Any]]] = []
+        current_kind = str(current_payload.get("crop_source_kind") or "")
+        for candidate in candidates:
+            if candidate.get("folder_id") == folder_id:
+                continue
+            score = 0
+            candidate_kind = str(candidate.get("crop_source_kind") or "")
+            if current_kind == "supabase" and candidate_kind in {"fallback_json", "drive_crop_config"}:
+                score += 12
+            elif current_kind in {"fallback_json", "drive_crop_config"} and candidate_kind == "supabase":
+                score += 12
+            candidate_name = str(candidate.get("folder_name") or "").lower()
+            if channel and channel == str(candidate.get("channel_hint") or "").lower():
+                score += 5
+            if table and table == str(candidate.get("table_hint") or "").lower():
+                score += 4
+            score += min(3, sum(1 for bit in name_bits if bit in candidate_name))
+            if score > 0:
+                scored.append((score, candidate))
+        scored.sort(key=lambda item: (item[0], str(item[1].get("modified_time") or "")), reverse=True)
+        return jsonify({"folder": current_payload, "matches": [item for _score, item in scored[:12]]})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError) as e:
         return jsonify({"error": str(e)}), 500
 
 
@@ -6632,6 +8226,9 @@ def api_preprocess_status():
                 "sites": [site.site_key for site in REOLINK_SITES],
                 "inflight": bool(reolink_inflight),
                 "inflight_queues": reolink_inflight,
+                "true_ten_batch_size": REOLINK_TRUE_TEN_BATCH_SIZE,
+                "yolo_batch_frames": REOLINK_YOLO_BATCH_FRAMES,
+                "preprocess_max_seconds": REOLINK_PREPROCESS_MAX_SECONDS,
                 "supabase_crops": _supabase_crop_status_snapshot(),
             },
             "ready_target": REOLINK_PREWARM_TARGET,

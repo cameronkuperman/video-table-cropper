@@ -192,8 +192,12 @@ gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 4 --timeout 180 app:
 Create a second Railway service or job from the same repo for finite preprocessing:
 
 ```bash
-python main.py --preprocess-until-empty --sources all
+python main.py --preprocess-until-empty --sources reolink
 ```
+
+If a deployed cron command still passes `--sources all`, set
+`PREPROCESS_SOURCES=reolink` on that service to force the finite drain to stay
+on the Reolink/ScreenRecord true-10 path.
 
 For Reolink preprocessing persistence, mount a Railway volume at `/data` and set:
 
