@@ -1576,7 +1576,9 @@ def test_queue_filters_history_hidden_folders_with_one_history_read(client, fake
     assert response.status_code == 200
     assert payload["folders"] == []
     assert payload["total_unlabeled"] == 0
-    assert load_count == 1
+    # History is now served from an in-memory index (seeded once), so a queue
+    # request triggers no per-folder disk reads — 0 or 1 seed load, never O(n).
+    assert load_count <= 1
 
 
 def test_queue_dedupes_duplicate_frame_signatures(client, fake_drive):
@@ -2071,7 +2073,7 @@ def test_label_route_records_durable_job_before_drive_move(client, fake_drive):
     assert response.get_json()["queued"] is True
     assert response.get_json()["drive_move_status"] == "queued"
     assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-unlabeled"]
-    history = json.loads(label_app._label_history_path().read_text(encoding="utf-8"))
+    history = label_app._read_persisted_label_history()
     assert "frames:video-frame0|video-frame1|video-frame2" in history["queues"]["video"]["labeled"]
     jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
     job = jobs["jobs"]["video:video-triplet"]
@@ -2184,7 +2186,7 @@ def test_cancel_pending_label_job_removes_history_and_restores_queue(client, fak
     assert cancel_response.status_code == 200
     jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
     assert jobs["jobs"]["video:video-triplet"]["status"] == "canceled"
-    history = json.loads(label_app._label_history_path().read_text(encoding="utf-8"))
+    history = label_app._read_persisted_label_history()
     assert history["queues"]["video"]["labeled"] == {}
     repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
     assert repeat_response.get_json()["folders"][0]["folder_id"] == folder["folder_id"]
@@ -2208,7 +2210,7 @@ def test_cancel_after_drive_move_restores_folder_to_unlabeled(client, fake_drive
     jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
     assert jobs["jobs"]["video:video-triplet"]["status"] == "canceled"
     assert "restored folder" in jobs["jobs"]["video:video-triplet"]["last_error"]
-    history = json.loads(label_app._label_history_path().read_text(encoding="utf-8"))
+    history = label_app._read_persisted_label_history()
     assert history["queues"]["video"]["labeled"] == {}
     repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
     assert repeat_response.get_json()["folders"][0]["folder_id"] == folder["folder_id"]

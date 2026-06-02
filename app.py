@@ -3580,10 +3580,157 @@ def _label_history_queue(history: dict[str, Any], queue_key: str) -> dict[str, A
     return queue
 
 
+# Label history is kept in memory and persisted as an append-only JSONL log.
+# Rewriting the whole label_history.json on every label was O(total labels)
+# under a global lock — it grew to ~20s and saturated the request thread pool.
+# Now each change appends one line (O(1)); other gunicorn workers stay consistent
+# by tailing new lines on read (under the same cross-process fcntl lock).
+_label_history_mem: dict[str, Any] | None = None
+_label_history_jsonl_offset = 0
+_label_history_loaded_path: str | None = None
+# Fold the JSONL back into label_history.json once it grows past this, to keep
+# process-startup replay bounded. Compaction happens under the held locks.
+LABEL_HISTORY_JSONL_COMPACT_BYTES = max(
+    1_000_000, int(os.environ.get("LABEL_HISTORY_JSONL_COMPACT_BYTES", "16777216") or "16777216")
+)
+
+
+def _label_history_jsonl_path() -> Path:
+    return _label_history_path().with_name("label_history.jsonl")
+
+
+def _apply_label_history_entry(history: dict[str, Any], entry: dict[str, Any]) -> None:
+    queue_key = entry.get("queue_key")
+    keys = entry.get("keys") or []
+    if not queue_key or not keys:
+        return
+    queue = _label_history_queue(history, queue_key)
+    labeled = queue["labeled"]
+    if entry.get("op") == "remove":
+        for key in keys:
+            labeled.pop(key, None)
+    else:
+        record = entry.get("record") or {}
+        for key in keys:
+            labeled[key] = record
+
+
+def _ingest_label_history_jsonl_locked() -> None:
+    """Apply log lines appended since our last read (incl. by other workers).
+
+    Must be called with _label_history_lock and the label_history fcntl lock held.
+    """
+    global _label_history_mem, _label_history_jsonl_offset
+    path = _label_history_jsonl_path()
+    try:
+        size = path.stat().st_size if path.exists() else 0
+    except OSError:
+        return
+    if size < _label_history_jsonl_offset:
+        # Log was compacted/truncated out from under us — reseed from JSON.
+        _label_history_mem = _load_label_history_unlocked()
+        _label_history_jsonl_offset = 0
+        try:
+            size = path.stat().st_size if path.exists() else 0
+        except OSError:
+            size = 0
+    if size <= _label_history_jsonl_offset:
+        return
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(_label_history_jsonl_offset)
+            chunk = fh.read()
+            _label_history_jsonl_offset = fh.tell()
+    except OSError:
+        return
+    for line in chunk.decode("utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            _apply_label_history_entry(_label_history_mem, entry)
+
+
+def _ensure_label_history_loaded_locked() -> dict[str, Any]:
+    """Return the in-memory history, seeding from JSON on first use and tailing
+    the JSONL for any newer entries. Caller holds both history locks."""
+    global _label_history_mem, _label_history_jsonl_offset, _label_history_loaded_path
+    current_path = str(_label_history_jsonl_path())
+    # Reseed if first use or the state dir changed (env reconfig / tests). In
+    # production the path is constant, so this is a no-op after the first call.
+    if _label_history_mem is None or _label_history_loaded_path != current_path:
+        _label_history_mem = _load_label_history_unlocked()
+        _label_history_jsonl_offset = 0
+        _label_history_loaded_path = current_path
+    _ingest_label_history_jsonl_locked()
+    return _label_history_mem
+
+
+def _read_persisted_label_history() -> dict[str, Any]:
+    """Read the durable history straight from disk (JSON seed + JSONL replay),
+    bypassing the in-memory cache. Used to verify persistence."""
+    history = _load_label_history_unlocked()
+    path = _label_history_jsonl_path()
+    if path.exists():
+        try:
+            chunk = path.read_bytes()
+        except OSError:
+            chunk = b""
+        for line in chunk.decode("utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                _apply_label_history_entry(history, entry)
+    return history
+
+
+def _append_label_history_entries_locked(entries: list[dict[str, Any]]) -> None:
+    """Append change entries to the JSONL log. Caller holds both history locks
+    and has already applied the entries to the in-memory index."""
+    global _label_history_jsonl_offset
+    if not entries:
+        return
+    path = _label_history_jsonl_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in entries).encode("utf-8")
+    try:
+        with open(path, "ab") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+            _label_history_jsonl_offset = fh.tell()
+    except OSError:
+        return
+    if _label_history_jsonl_offset >= LABEL_HISTORY_JSONL_COMPACT_BYTES:
+        _compact_label_history_locked()
+
+
+def _compact_label_history_locked() -> None:
+    """Fold the in-memory index back into label_history.json and reset the log."""
+    global _label_history_jsonl_offset
+    if _label_history_mem is None:
+        return
+    try:
+        _save_label_history_unlocked(_label_history_mem)
+        _label_history_jsonl_path().write_bytes(b"")
+        _label_history_jsonl_offset = 0
+    except OSError:
+        pass
+
+
 def _label_history_records_for_queue(queue_key: str) -> dict[str, Any]:
     with _label_history_lock:
         with _state_file_lock("label_history"):
-            history = _load_label_history_unlocked()
+            history = _ensure_label_history_loaded_locked()
             queue = (history.get("queues") or {}).get(queue_key) or {}
             labeled = queue.get("labeled") or {}
             return dict(labeled) if isinstance(labeled, dict) else {}
@@ -3642,14 +3789,15 @@ def _record_label_history(
         "labeled_at": datetime.now(timezone.utc).isoformat(),
         "labeled_by": _labeler_name(),
     }
+    keys = _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature)
+    if not keys:
+        return
+    entry = {"op": "set", "queue_key": context.queue_key, "keys": keys, "record": record}
     with _label_history_lock:
         with _state_file_lock("label_history"):
-            history = _load_label_history_unlocked()
-            queue = _label_history_queue(history, context.queue_key)
-            labeled = queue.setdefault("labeled", {})
-            for key in _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature):
-                labeled[key] = record
-            _save_label_history_unlocked(history)
+            history = _ensure_label_history_loaded_locked()
+            _apply_label_history_entry(history, entry)
+            _append_label_history_entries_locked([entry])
 
 
 def _remove_label_history(
@@ -3659,16 +3807,15 @@ def _remove_label_history(
     frame_signature: str,
     content_signature: str = "",
 ) -> None:
+    keys = _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature)
+    if not keys:
+        return
+    entry = {"op": "remove", "queue_key": context.queue_key, "keys": keys}
     with _label_history_lock:
         with _state_file_lock("label_history"):
-            history = _load_label_history_unlocked()
-            queue = (history.get("queues") or {}).get(context.queue_key) or {}
-            labeled = queue.get("labeled")
-            if not isinstance(labeled, dict):
-                return
-            for key in _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature):
-                labeled.pop(key, None)
-            _save_label_history_unlocked(history)
+            history = _ensure_label_history_loaded_locked()
+            _apply_label_history_entry(history, entry)
+            _append_label_history_entries_locked([entry])
 
 
 def _load_label_jobs_unlocked() -> dict[str, Any]:
