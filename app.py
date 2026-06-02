@@ -367,6 +367,11 @@ LABEL_JOB_ERROR_LIMIT = max(1, int(os.environ.get("LABEL_JOB_ERROR_LIMIT", "25")
 LABEL_JOB_MAX_ATTEMPTS = max(1, int(os.environ.get("LABEL_JOB_MAX_ATTEMPTS", "100") or "100"))
 LABEL_JOB_UNDO_SECONDS = max(0, int(os.environ.get("LABEL_JOB_UNDO_SECONDS", "30") or "30"))
 LABEL_JOB_MIN_INTERVAL_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_MIN_INTERVAL_SECONDS", "0.15") or "0.15"))
+# How many pending Drive folder-moves to push concurrently. The move worker used
+# to do one at a time (~1 per 1.5-3s of Drive latency), so a fast labeler built a
+# growing backlog. A modest pool drains it quickly; 429 backoff still protects us,
+# and it shares Drive quota with image warming so we keep it small.
+LABEL_JOB_DRAIN_CONCURRENCY = max(1, int(os.environ.get("LABEL_JOB_DRAIN_CONCURRENCY", "5") or "5"))
 LABEL_JOB_JITTER_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_JITTER_SECONDS", "0.05") or "0.05"))
 LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS = max(
     1.0,
@@ -606,6 +611,8 @@ _preview_prewarm_lock = Lock()
 _thumb_warm_executor = ThreadPoolExecutor(max_workers=THUMB_WARM_MAX_WORKERS)
 _cache_warm_executor = ThreadPoolExecutor(max_workers=1)
 _label_job_executor = ThreadPoolExecutor(max_workers=1)
+# Pushes claimed Drive moves to Drive in parallel (see LABEL_JOB_DRAIN_CONCURRENCY).
+_label_job_push_executor = ThreadPoolExecutor(max_workers=LABEL_JOB_DRAIN_CONCURRENCY)
 _cache_warm_lock = Lock()
 _cache_warm_state: dict[str, Any] = {
     "inflight": False,
@@ -4460,6 +4467,47 @@ def _drain_label_jobs_once(client: DriveClient | None = None, *, force_due: bool
     return 1
 
 
+def _process_claimed_label_job(job: dict[str, Any]) -> int:
+    job_id = str(job.get("id") or "")
+    try:
+        # Thread-local client: httplib2 services are not thread-safe to share.
+        _mark_label_job_attempt()
+        _push_label_job_to_drive(warm_client(), job)
+    except Exception as exc:
+        if _looks_like_drive_rate_limit_error(exc):
+            _record_label_job_rate_limit(exc)
+        _finish_label_job(job_id, status="pending", error=str(exc))
+        return 0
+    _record_label_job_success()
+    _finish_label_job(job_id, status="succeeded")
+    return 1
+
+
+def _drain_label_jobs_batch(*, force_due: bool = False) -> int:
+    """Claim up to LABEL_JOB_DRAIN_CONCURRENCY due jobs and push them to Drive in
+    parallel. Claims are serialized under the jobs lock (each marks the job
+    'processing' + persists), so concurrent pushes never collide."""
+    if not force_due:
+        _clear_label_job_rate_limit_cooldown()
+        if _label_job_rate_limit_delay_seconds() > 0:
+            return 0
+    jobs: list[dict[str, Any]] = []
+    with _label_jobs_lock:
+        with _state_file_lock("label_jobs"):
+            state = _load_label_jobs_unlocked()
+            for _ in range(LABEL_JOB_DRAIN_CONCURRENCY):
+                job = _claim_next_label_job_unlocked(state, force_due=force_due)
+                if job is None:
+                    break
+                jobs.append(job)
+    if not jobs:
+        return 0
+    if len(jobs) == 1:
+        return _process_claimed_label_job(jobs[0])
+    results = list(_label_job_push_executor.map(_process_claimed_label_job, jobs))
+    return sum(results)
+
+
 def _next_label_job_delay_seconds() -> float | None:
     rate_limit_delay = _label_job_rate_limit_delay_seconds()
     if rate_limit_delay > 0:
@@ -4481,7 +4529,7 @@ def _run_label_job_worker() -> None:
     global _label_job_worker_inflight, _label_job_worker_rerun_requested
     try:
         while True:
-            processed = _drain_label_jobs_once()
+            processed = _drain_label_jobs_batch()
             delay = _next_label_job_delay_seconds()
             if delay is None:
                 return

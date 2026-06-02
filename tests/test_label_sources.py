@@ -2617,8 +2617,49 @@ def test_labeled_frame_signature_never_returns_to_queue_across_sessions(client, 
 
     assert repeat_response.status_code == 200
     assert repeat_payload["folders"] == []
-    history = json.loads((tmp_path / label_app.LABEL_HISTORY_FILE_NAME).read_text())
+    history = label_app._read_persisted_label_history()
     assert "frames:video-frame0|video-frame1|video-frame2" in history["queues"]["video"]["labeled"]
+
+
+def test_record_label_history_appends_without_full_rewrite(fake_drive, tmp_path, monkeypatch):
+    monkeypatch.setenv("PREPROCESS_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(label_app, "_label_history_mem", None)
+    monkeypatch.setattr(label_app, "_label_history_loaded_path", None)
+    monkeypatch.setattr(label_app, "_label_history_jsonl_offset", 0)
+    context = label_app._resolve_queue_context(fake_drive, label_app.VIDEO_SOURCE, None)
+
+    saves = 0
+    original_save = label_app._save_label_history_unlocked
+
+    def counted_save(history):
+        nonlocal saves
+        saves += 1
+        return original_save(history)
+
+    monkeypatch.setattr(label_app, "_save_label_history_unlocked", counted_save)
+
+    for i in range(5):
+        label_app._record_label_history(context, f"folder-{i}", f"name-{i}", f"sig-{i}", "clean")
+
+    # The O(n) hot-path cost was rewriting the whole file on every label; now
+    # each change is a single appended line and the full file is never rewritten.
+    assert saves == 0
+    jsonl = tmp_path / "label_history.jsonl"
+    assert jsonl.exists()
+    assert len([line for line in jsonl.read_text().splitlines() if line.strip()]) == 5
+
+    # Durable disk state (JSON seed + JSONL replay) and the in-memory lookup agree.
+    persisted = label_app._read_persisted_label_history()
+    labeled = persisted["queues"][context.queue_key]["labeled"]
+    for i in range(5):
+        assert f"id:folder-{i}" in labeled
+    assert label_app._label_history_lookup(context, "folder-2", "name-2", "sig-2") is not None
+
+    # Removal appends a tombstone; durable state drops the keys.
+    label_app._remove_label_history(context, "folder-2", "name-2", "sig-2")
+    persisted_after = label_app._read_persisted_label_history()
+    assert "id:folder-2" not in persisted_after["queues"][context.queue_key]["labeled"]
+    assert label_app._label_history_lookup(context, "folder-2", "name-2", "sig-2") is None
 
 
 def test_cache_dir_reuses_existing_repo_cache(monkeypatch, tmp_path):
