@@ -119,6 +119,20 @@ class AzureBlobClient:
     def _exists(self, blob_name: str) -> bool:
         return bool(self._execute_with_retry(lambda: self._blob(blob_name).exists(), f"Azure exists error for {blob_name}"))
 
+    def blob_exists(self, blob_name: str) -> bool:
+        return self._exists(blob_name)
+
+    def blob_size(self, blob_name: str) -> int | None:
+        blob_name = _clean_prefix(blob_name)
+        if not self._exists(blob_name):
+            return None
+        props = self._execute_with_retry(
+            lambda: self._blob(blob_name).get_blob_properties(),
+            f"Azure get properties error for {blob_name}",
+        )
+        size = getattr(props, "size", None)
+        return int(size) if size is not None else None
+
     def _read_json_blob(self, blob_name: str) -> dict[str, Any] | None:
         if not self._exists(blob_name):
             return None
