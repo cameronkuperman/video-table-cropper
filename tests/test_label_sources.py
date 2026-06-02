@@ -1088,8 +1088,22 @@ def test_queue_prefers_cached_folders_when_available(client):
     assert response.status_code == 200
     assert [folder["folder_name"] for folder in payload["folders"]] == ["ipc3_table-4_t0001"]
     assert payload["folders"][0]["cache_ready"] is True
+
+
+def test_queue_excludes_buffered_folder_ids(client, fake_drive):
+    fake_drive._add_folder("video-triplet-2", "ipc4_table-5_t0002", "video-unlabeled")
+    fake_drive._add_triplet_files("video-triplet-2", "video2")
+    label_app._listing_cache.clear()
+    label_app._hydrated_folder_cache.clear()
+
+    response = client.get("/api/queue?source=video&limit=10&exclude_folder_id=video-triplet")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert [folder["folder_id"] for folder in payload["folders"]] == ["video-triplet-2"]
+    assert payload["excluded_hidden"] == 1
     assert payload["ready_buffer_count"] == 1
-    assert payload["folders"][0]["frame_signature"] == "video-frame0|video-frame1|video-frame2"
+    assert payload["folders"][0]["frame_signature"] == "video2-frame0|video2-frame1|video2-frame2"
     assert payload["folders"][0]["thumb_urls"]["frame_0"].startswith("/api/thumb/")
     assert payload["folders"][0]["preview_urls"]["frame_0"].startswith("/api/preview/")
 
@@ -2697,10 +2711,32 @@ def test_matthews_queue_blocks_when_channel_is_missing_crop_config(client, fake_
 
 def test_channel_name_maps_generally_to_matching_ipc_number():
     assert label_app._extract_reolink_channel_code("Swann CH03") == "CH-CH03"
+    assert label_app._extract_reolink_channel_code("mimosas-Swann-CH03_table_top_1_t0001") == "CH-CH03"
+    assert label_app._extract_reolink_channel_code("3_1_Mimosas_Channel 3_t0001") == "CH-CH03"
+    assert label_app._extract_reolink_channel_code("IPC5") == "CH-CH05"
     assert label_app._cleanup_channel_hint_from_camera({"name": "Swann CH03"}) == "CH-CH03"
     assert label_app._extract_reolink_channel_number("CH-CH03_t4377") == 3
     assert label_app._extract_reolink_channel_number("Reolink-CH-CH11_t0002") == 11
     assert label_app._derived_reolink_folder_name("CH-CH03_t4377", "table_top_1") == "CH-CH03_table_top_1_t4377"
+
+
+def test_balanced_channel_chunk_order_keeps_chunks_but_rotates_channels(monkeypatch):
+    monkeypatch.setattr(label_app, "LABEL_BALANCED_RAW_CHANNEL_CHUNK_SIZE", 2)
+    items = [
+        {"name": "mimosas-Swann-CH03_table_top_1_t0001"},
+        {"name": "mimosas-Swann-CH03_table_top_1_t0002"},
+        {"name": "mimosas-Swann-CH03_table_top_1_t0003"},
+        {"name": "mimosas-Swann-CH03_table_top_1_t0004"},
+        {"name": "mimosas-Swann-CH05_table_top_1_t0001"},
+        {"name": "mimosas-Swann-CH05_table_top_1_t0002"},
+    ]
+
+    ordered = label_app._balanced_channel_chunk_order(
+        items,
+        chunk_size=label_app.LABEL_BALANCED_RAW_CHANNEL_CHUNK_SIZE,
+    )
+
+    assert [label_app._extract_reolink_channel_number(item["name"]) for item in ordered] == [3, 3, 5, 5, 3, 3]
 
 
 def test_ordered_quadrilateral_points_normalizes_crossed_click_order():

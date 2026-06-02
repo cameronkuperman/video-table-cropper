@@ -142,7 +142,8 @@ LABEL_JOB_UNDO_SECONDS=30
 LABEL_JOB_PROCESSING_STALE_SECONDS=300
 LABEL_JOB_MIN_INTERVAL_SECONDS=2.0
 LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS=120
-LABEL_READY_TARGET=359
+LABEL_READY_TARGET=3000
+LABEL_READY_MAINTAINER_ON_STARTUP=1
 ```
 
 Mount a Railway volume on the web service at `/data` when using
@@ -169,15 +170,15 @@ to be stopped, call `POST /api/cache/warm/cancel`.
 need. When set, it overrides the older per-path target variables for Reolink
 generation, video low-watermark refills, interactive prewarm, and ready scans.
 For high-throughput labeling, the default sprint target is
-`LABEL_THROUGHPUT_TARGET_IMAGES=4000` with `LABEL_IMAGES_PER_FOLDER_ESTIMATE=3`.
-That derives a roughly 1,334-folder ready/cache target so the browser can stay
-ahead of a 30-minute labeling sprint without reducing image quality. The label
-page starts the ready-maintainer and cache warmer after it renders; plain app
-imports and health/status polling do not start Drive work. Set
-`LABEL_READY_MAINTAINER_ON_STARTUP=1` only when a deployed `app:app` worker
-should begin warming before anyone opens the label page. A shared lock in
-`PREPROCESS_STATE_DIR` prevents multiple web workers from running the
-ready-maintainer pass at the same time.
+`LABEL_THROUGHPUT_TARGET_IMAGES=4000` with `LABEL_IMAGES_PER_FOLDER_ESTIMATE=3`,
+and the Reolink ready target defaults to 3,000 folders unless
+`LABEL_READY_TARGET` overrides it. The browser keeps a larger local buffer,
+refills before it runs low, and restores its queue snapshot on reload/new tab
+while refreshing in the background. The label page starts the ready-maintainer
+and cache warmer after it renders; set `LABEL_READY_MAINTAINER_ON_STARTUP=1`
+when a deployed `app:app` worker should begin warming before anyone opens the
+label page. A shared lock in `PREPROCESS_STATE_DIR` prevents multiple web
+workers from running the ready-maintainer pass at the same time.
 
 Label clicks are recorded to the volume first, held briefly for undo/relabel,
 then pushed to Drive by a background worker. Use `/api/label/jobs/status` to

@@ -41,16 +41,16 @@ let stats = {
     discarded: 0,
 };
 
-const INITIAL_QUEUE_BATCH_SIZE = 72;
-const REFILL_QUEUE_BATCH_SIZE = 900;
-const WARM_BUFFER_SIZE = 540;
-const LOW_WATERMARK = 420;
-const BACKGROUND_WARM_LIMIT = 1400;
+const INITIAL_QUEUE_BATCH_SIZE = 180;
+const REFILL_QUEUE_BATCH_SIZE = 1500;
+const WARM_BUFFER_SIZE = 900;
+const LOW_WATERMARK = 900;
+const BACKGROUND_WARM_LIMIT = 2500;
 const TIMING_LOGS_ENABLED = true;
 const QUEUE_SNAPSHOT_PREFIX = 'autolabeler.queueSnapshot.';
 const QUEUE_SNAPSHOT_SCHEMA_VERSION = 4;
 const QUEUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
-const QUEUE_SNAPSHOT_MAX_FOLDERS = 1500;
+const QUEUE_SNAPSHOT_MAX_FOLDERS = 3000;
 const SUPPRESSED_QUEUE_MAX = 2500;
 const PENDING_LABELS_KEY = 'autolabeler.pendingLabels.v1';
 const PENDING_LABEL_KEEPALIVE_LIMIT = 20;
@@ -533,6 +533,17 @@ function appendSourceParams(params, source = activeSource, siteKey = activeSiteK
     }
 }
 
+function currentQueueExcludeFolderIds() {
+    const ids = new Set(suppressedFolderIds);
+    for (let idx = currentIndex; idx < folders.length; idx++) {
+        const folderId = folders[idx]?.folder_id;
+        if (folderId) {
+            ids.add(String(folderId));
+        }
+    }
+    return Array.from(ids).slice(-SUPPRESSED_QUEUE_MAX);
+}
+
 function jsonPostHeaders() {
     const headers = { 'Content-Type': 'application/json' };
     if (csrfToken) {
@@ -725,6 +736,11 @@ async function fetchQueue({
 
     const params = new URLSearchParams({ limit: String(limit) });
     appendSourceParams(params, requestSource, requestSiteKey);
+    if (!reset) {
+        for (const folderId of currentQueueExcludeFolderIds()) {
+            params.append('exclude_folder_id', folderId);
+        }
+    }
     if (includeStats) {
         params.set('include_stats', '1');
     }
@@ -1601,7 +1617,7 @@ async function bootstrap() {
     try {
         await fetchSources();
         refreshPreprocessStatus({ force: true }).catch(() => {});
-        await init(true);
+        await init(false);
     } catch (e) {
         const errorContent = formatErrorContent('Failed to load sources: ', e);
         showError(errorContent.body, errorContent.isHtml);

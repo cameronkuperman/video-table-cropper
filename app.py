@@ -21,6 +21,7 @@ import secrets
 import tempfile
 import time
 import zipfile
+from collections import defaultdict
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -177,10 +178,19 @@ QUEUE_BATCH_MAX = max(
     int(
         os.environ.get(
             "LABEL_QUEUE_BATCH_MAX",
-            str(max(600, min(2000, LABEL_THROUGHPUT_TARGET_FOLDERS or 600))),
+            str(max(1500, min(3000, (LABEL_THROUGHPUT_TARGET_FOLDERS or 750) * 2))),
         )
-        or "600"
+        or "1500"
     ),
+)
+QUEUE_EXCLUDE_MAX = max(0, int(os.environ.get("LABEL_QUEUE_EXCLUDE_MAX", "2500") or "2500"))
+LABEL_BALANCED_RAW_CHANNEL_CHUNK_SIZE = max(
+    1,
+    int(os.environ.get("LABEL_BALANCED_RAW_CHANNEL_CHUNK_SIZE", "24") or "24"),
+)
+LABEL_BALANCED_QUEUE_CHANNEL_CHUNK_SIZE = max(
+    1,
+    int(os.environ.get("LABEL_BALANCED_QUEUE_CHANNEL_CHUNK_SIZE", "120") or "120"),
 )
 CACHE_CLEANUP_INTERVAL_SECONDS = 300
 INTERACTIVE_PREWARM_FOLDER_CAP = max(
@@ -188,9 +198,9 @@ INTERACTIVE_PREWARM_FOLDER_CAP = max(
     int(
         os.environ.get(
             "LABEL_INTERACTIVE_PREWARM_FOLDER_CAP",
-            str(max(400, min(2000, LABEL_THROUGHPUT_TARGET_FOLDERS or 400))),
+            str(max(900, min(3000, (LABEL_THROUGHPUT_TARGET_FOLDERS or 900) * 2))),
         )
-        or "400"
+        or "900"
     ),
 )
 INTERACTIVE_READY_SCAN_CAP = max(
@@ -198,9 +208,9 @@ INTERACTIVE_READY_SCAN_CAP = max(
     int(
         os.environ.get(
             "LABEL_INTERACTIVE_READY_SCAN_CAP",
-            str(max(1000, min(3000, (LABEL_THROUGHPUT_TARGET_FOLDERS or 500) * 2))),
+            str(max(3000, min(6000, (LABEL_THROUGHPUT_TARGET_FOLDERS or 1000) * 3))),
         )
-        or "1000"
+        or "3000"
     ),
 )
 UNLABELED_LIST_CACHE_SECONDS = max(
@@ -247,13 +257,13 @@ PREWARM_FOLDER_COUNT = min(
     INTERACTIVE_PREWARM_FOLDER_CAP,
     max(
         12,
-        _ready_target_or_legacy_env("LABEL_PREWARM_FOLDER_COUNT", 400),
+        _ready_target_or_legacy_env("LABEL_PREWARM_FOLDER_COUNT", 900),
     ),
 )
 REOLINK_PREWARM_TARGET = max(
     PREWARM_FOLDER_COUNT,
     LABEL_THROUGHPUT_TARGET_FOLDERS,
-    _ready_target_or_legacy_env("LABEL_REOLINK_PREWARM_TARGET", 1000),
+    _ready_target_or_legacy_env("LABEL_REOLINK_PREWARM_TARGET", 3000),
 )
 INTERACTIVE_REOLINK_PREWARM_TARGET = REOLINK_PREWARM_TARGET
 AUTOLABEL_VIDEO_LOW_WATERMARK = max(
@@ -805,12 +815,19 @@ def _crop_editor_url(site_key: str, channel_code: str | None = None) -> str:
 
 
 def _extract_reolink_channel_code(text: str) -> str | None:
-    match = re.search(r"CH-CH(\d+)", text, re.IGNORECASE)
-    if not match:
-        match = re.search(r"\bCH[\s_-]*(\d+)\b", text, re.IGNORECASE)
-    if not match:
-        return None
-    return f"CH-CH{int(match.group(1)):02d}"
+    text = str(text or "")
+    patterns = (
+        r"CH-CH\s*0*(\d+)(?=\D|$)",
+        r"(?:^|[^A-Za-z0-9])CH[\s_-]*0*(\d+)(?=\D|$)",
+        r"(?:^|[^A-Za-z0-9])Channel[\s_-]*0*(\d+)(?=\D|$)",
+        r"(?:^|[^A-Za-z0-9])IPC[\s_-]*0*(\d+)(?=\D|$)",
+        r"^0*(\d+)[\s_-]",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return f"CH-CH{int(match.group(1)):02d}"
+    return None
 
 
 def _normalize_reolink_channel_code(value: str) -> str | None:
@@ -827,6 +844,52 @@ def _normalize_reolink_channel_code(value: str) -> str | None:
 def _reolink_channel_sort_key(channel_code: str) -> tuple[int, str]:
     channel_number = _extract_reolink_channel_number(channel_code)
     return (channel_number if channel_number is not None else 10_000, channel_code)
+
+
+def _folder_channel_number(item: dict[str, Any] | str) -> int | None:
+    name = item if isinstance(item, str) else str(item.get("name") or "")
+    return _extract_reolink_channel_number(str(name))
+
+
+def _folder_table_sort_hint(item: dict[str, Any] | str) -> tuple[str, str]:
+    name = item if isinstance(item, str) else str(item.get("name") or "")
+    match = re.search(r"(table(?:[_\s-]+(?:top|bottom))?[_\s-]*\d+|table[_\s-]+[A-Za-z0-9_.-]+)", name, re.IGNORECASE)
+    return ((match.group(1).lower() if match else ""), name.lower())
+
+
+def _balanced_channel_chunk_order(
+    items: list[dict[str, Any]],
+    *,
+    chunk_size: int,
+) -> list[dict[str, Any]]:
+    if len(items) <= 1:
+        return items
+
+    groups: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for item in sorted(items, key=_folder_table_sort_hint):
+        channel_number = _folder_channel_number(item)
+        key = (
+            channel_number if channel_number is not None else 10_000,
+            f"CH-CH{channel_number:02d}" if channel_number is not None else str(item.get("name") or "").lower(),
+        )
+        groups[key].append(item)
+
+    ordered: list[dict[str, Any]] = []
+    keys = sorted(groups)
+    offsets = {key: 0 for key in keys}
+    while len(ordered) < len(items):
+        progressed = False
+        for key in keys:
+            offset = offsets[key]
+            group = groups[key]
+            if offset >= len(group):
+                continue
+            ordered.extend(group[offset:offset + chunk_size])
+            offsets[key] = offset + chunk_size
+            progressed = True
+        if not progressed:
+            break
+    return ordered
 
 
 def _discover_reolink_root_id(client: DriveClient, site: ReolinkSiteConfig) -> str:
@@ -2788,12 +2851,13 @@ def _list_reolink_raw_folders(
 ) -> list[dict[str, Any]]:
     if not context.seed_folder_id:
         return []
-    return sorted(
-        client.list_folders(
-            context.seed_folder_id,
-            fields="id,name,mimeType,parents,appProperties",
-        ),
-        key=lambda item: str(item.get("name", "")).lower(),
+    raw_folders = client.list_folders(
+        context.seed_folder_id,
+        fields="id,name,mimeType,parents,appProperties",
+    )
+    return _balanced_channel_chunk_order(
+        raw_folders,
+        chunk_size=LABEL_BALANCED_RAW_CHANNEL_CHUNK_SIZE,
     )
 
 
@@ -2804,12 +2868,13 @@ def _list_screenrecord_true_ten_folders(
     node_folder_id = context.folder_ids.get(SCREENRECORD_TRUE_TEN_NODE_KEY)
     if not node_folder_id:
         return []
-    return sorted(
-        client.list_folders(
-            node_folder_id,
-            fields="id,name,mimeType,parents,appProperties,modifiedTime",
-        ),
-        key=lambda item: str(item.get("name", "")).lower(),
+    raw_folders = client.list_folders(
+        node_folder_id,
+        fields="id,name,mimeType,parents,appProperties,modifiedTime",
+    )
+    return _balanced_channel_chunk_order(
+        raw_folders,
+        chunk_size=LABEL_BALANCED_RAW_CHANNEL_CHUNK_SIZE,
     )
 
 
@@ -5792,6 +5857,11 @@ def _fetch_source_listing(client: DriveClient, context: QueueContext) -> list[di
                 fields="id,name,mimeType,parents,appProperties,modifiedTime",
             )
         )
+    if context.source == REOLINK_SOURCE:
+        return _balanced_channel_chunk_order(
+            folders,
+            chunk_size=LABEL_BALANCED_QUEUE_CHANNEL_CHUNK_SIZE,
+        )
     return sorted(folders, key=lambda item: str(item.get("name", "")).lower())
 
 
@@ -5886,6 +5956,32 @@ def _filter_label_history_hidden_subfolders(
             continue
         visible.append(folder)
     return visible, hidden
+
+
+def _request_excluded_folder_ids() -> set[str]:
+    values: list[str] = []
+    for value in (
+        *request.args.getlist("exclude_folder_id"),
+        *request.args.getlist("exclude_folder_ids"),
+    ):
+        values.extend(part.strip() for part in str(value or "").split(","))
+    values = [value for value in values if value]
+    if QUEUE_EXCLUDE_MAX:
+        values = values[-QUEUE_EXCLUDE_MAX:]
+    return set(values)
+
+
+def _filter_excluded_subfolders(
+    subfolders: list[dict[str, str]],
+    excluded_folder_ids: set[str],
+) -> tuple[list[dict[str, str]], int]:
+    if not excluded_folder_ids:
+        return subfolders, 0
+    visible = [
+        folder for folder in subfolders
+        if str(folder.get("id") or "") not in excluded_folder_ids
+    ]
+    return visible, len(subfolders) - len(visible)
 
 
 def _frame_payload_from_files(files: list[dict]) -> dict[str, str | None]:
@@ -6684,6 +6780,9 @@ def _ensure_ready_maintainer_started() -> bool:
     return True
 
 
+_auto_start_ready_maintainer()
+
+
 def _hydrate_folder_with_fresh_client(
     context: QueueContext,
     folder: dict[str, str],
@@ -7312,6 +7411,11 @@ def api_queue():
             context,
             labeled_records,
         )
+        excluded_folder_ids = _request_excluded_folder_ids()
+        subfolders, excluded_hidden = _filter_excluded_subfolders(
+            subfolders,
+            excluded_folder_ids,
+        )
         total_unlabeled = len(subfolders)
 
         ready_folders, ready_stats = _collect_ready_folders(
@@ -7356,6 +7460,7 @@ def api_queue():
             "has_more": total_unlabeled > returned_count,
             "ready_buffer_count": ready_buffer_count,
             "warming_count": warming_count,
+            "excluded_hidden": excluded_hidden,
             "retry_ms": QUEUE_RETRY_MS if total_unlabeled > 0 and returned_count < limit else 0,
         }
         if include_stats:
@@ -7381,6 +7486,7 @@ def api_queue():
             hydrated_valid=ready_stats["hydrated_valid"],
             hidden_labeled=ready_stats["hidden_labeled"],
             history_hidden=history_hidden,
+            excluded_hidden=excluded_hidden,
             duplicate_signatures=ready_stats["duplicate_signatures"],
             visible_unlabeled=visible_unlabeled_estimate,
             cache_hits=ready_stats["hydrate_cache_hits"],
