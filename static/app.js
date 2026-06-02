@@ -52,6 +52,13 @@ const QUEUE_SNAPSHOT_SCHEMA_VERSION = 4;
 const QUEUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
 const QUEUE_SNAPSHOT_MAX_FOLDERS = 3000;
 const SUPPRESSED_QUEUE_MAX = 2500;
+// Cap how many exclude_folder_id values go into the /api/queue GET URL. The
+// server-side exclude is only an optimization (the client also dedups results
+// on merge), so a small cap keeps the request line well under gunicorn's /
+// proxy's limit while still skipping the folders nearest the labeler. Without
+// this the URL grew to 100KB+ and gunicorn rejected it (400 -> "Preparing next
+// triplets" forever once the suppressed set filled up).
+const QUEUE_EXCLUDE_MAX = 100;
 const PENDING_LABELS_KEY = 'autolabeler.pendingLabels.v1';
 const PENDING_LABEL_KEEPALIVE_LIMIT = 20;
 const LABEL_UNDO_SECONDS = 30;
@@ -534,14 +541,27 @@ function appendSourceParams(params, source = activeSource, siteKey = activeSiteK
 }
 
 function currentQueueExcludeFolderIds() {
-    const ids = new Set(suppressedFolderIds);
-    for (let idx = currentIndex; idx < folders.length; idx++) {
+    // Prioritize the folders currently buffered ahead of the labeler (most
+    // valuable to skip on the next page), then recently suppressed ones, and
+    // hard-cap the total so the GET URL stays small. Correctness does not
+    // depend on this list — results are deduped on merge.
+    const ids = [];
+    const seen = new Set();
+    for (let idx = currentIndex; idx < folders.length && ids.length < QUEUE_EXCLUDE_MAX; idx++) {
         const folderId = folders[idx]?.folder_id;
-        if (folderId) {
-            ids.add(String(folderId));
+        if (folderId && !seen.has(folderId)) {
+            seen.add(folderId);
+            ids.push(String(folderId));
         }
     }
-    return Array.from(ids).slice(-SUPPRESSED_QUEUE_MAX);
+    for (const folderId of suppressedFolderIds) {
+        if (ids.length >= QUEUE_EXCLUDE_MAX) break;
+        if (folderId && !seen.has(folderId)) {
+            seen.add(folderId);
+            ids.push(String(folderId));
+        }
+    }
+    return ids;
 }
 
 function jsonPostHeaders() {
