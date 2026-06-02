@@ -172,6 +172,7 @@ class DriveClient:
                         q=query,
                         fields=f"nextPageToken, files({fields})",
                         pageToken=page_token,
+                        pageSize=1000,
                         supportsAllDrives=True,
                         includeItemsFromAllDrives=True,
                     )

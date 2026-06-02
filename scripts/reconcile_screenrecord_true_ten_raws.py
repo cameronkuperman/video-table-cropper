@@ -13,7 +13,9 @@ import os
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import local
 from typing import Any
 
 os.environ.setdefault("LABEL_READY_MAINTAINER_ON_STARTUP", "0")
@@ -28,6 +30,7 @@ from drive_client import DriveClient  # noqa: E402
 CONFIRM_TEXT = "TRASH_TRUE_TEN_RAW"
 GENERATED_BUCKET = "generated"
 LABELED_BUCKETS = {"clean", "dirty", "occupied", "label_later", "discarded"}
+_THREAD_STATE = local()
 
 
 def _jsonl_path() -> Path:
@@ -59,7 +62,12 @@ def _artifact_table_keys(metadata: dict[str, Any]) -> set[str]:
     return {str(value).strip() for value in values if str(value or "").strip()}
 
 
-def _scan_generated_artifacts(client: DriveClient, context: label_app.QueueContext) -> dict[str, Any]:
+def _scan_generated_artifacts(
+    client: DriveClient,
+    context: label_app.QueueContext,
+    *,
+    read_metadata: bool = False,
+) -> dict[str, Any]:
     by_identity: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_raw_table: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -92,6 +100,8 @@ def _scan_generated_artifacts(client: DriveClient, context: label_app.QueueConte
                 "parent_id": parent_id,
             }
             by_name[folder_name].append(record)
+            if not read_metadata:
+                continue
             metadata = _load_metadata(client, folder_id)
             if not metadata:
                 continue
@@ -205,6 +215,8 @@ def _decision(
 def reconcile(args: argparse.Namespace) -> int:
     if args.mode == "trash" and args.confirm != CONFIRM_TEXT:
         raise SystemExit(f"--mode trash requires --confirm {CONFIRM_TEXT}")
+    if args.trash_from_report:
+        return trash_from_report(args)
 
     client = DriveClient()
     context = label_app._resolve_queue_context(client, label_app.REOLINK_SOURCE, args.site)  # noqa: SLF001
@@ -212,9 +224,26 @@ def reconcile(args: argparse.Namespace) -> int:
     output_path = Path(args.output) if args.output else _jsonl_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    artifact_index = _scan_generated_artifacts(client, context)
+    artifact_index = _scan_generated_artifacts(client, context, read_metadata=args.metadata_index)
     raw_folders = label_app._list_screenrecord_true_ten_folders(client, context)  # noqa: SLF001
     label_source = label_app._resolve_label_source(context.source, context.site_key)  # noqa: SLF001
+    channel_mapping_cache: dict[str, tuple[str | None, int, dict[str, Any] | None, list[tuple[str, list, tuple[int, int, int, int], list]]]] = {}
+
+    def expected_for_raw(
+        raw_folder: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> tuple[str | None, int, dict[str, Any] | None, list[tuple[str, list, tuple[int, int, int, int], list]]]:
+        raw_name = str(raw_folder.get("name") or "")
+        channel_code = label_app._screenrecord_channel_code_from_metadata(raw_name, metadata)  # noqa: SLF001
+        if channel_code and not metadata:
+            cached = channel_mapping_cache.get(channel_code)
+            if cached is not None:
+                return cached
+            resolved = _resolve_expected(client, context, raw_folder, {})
+            if resolved[0] is None:
+                channel_mapping_cache[channel_code] = resolved
+            return resolved
+        return _resolve_expected(client, context, raw_folder, metadata)
 
     counts: dict[str, int] = defaultdict(int)
     processed = 0
@@ -225,6 +254,7 @@ def reconcile(args: argparse.Namespace) -> int:
             "mode": args.mode,
             "min_generated_ratio": args.min_generated_ratio,
             "require_labeled": args.require_labeled,
+            "metadata_index": args.metadata_index,
             "generated_artifacts_scanned": artifact_index["scanned"],
             "generated_artifacts_with_metadata": artifact_index["metadata_found"],
         }
@@ -234,11 +264,22 @@ def reconcile(args: argparse.Namespace) -> int:
             if args.limit is not None and processed >= args.limit:
                 break
             raw_name = str(raw_folder.get("name") or "")
-            metadata = _load_metadata(client, str(raw_folder["id"]))
-            if not metadata:
+            raw_channel = label_app._screenrecord_channel_code_from_metadata(raw_name, {})  # noqa: SLF001
+            if channel_filter and raw_channel != channel_filter:
+                continue
+            metadata: dict[str, Any] = {}
+            mapping_error, _channel_number, camera, table_polygons = expected_for_raw(raw_folder, metadata)
+            if mapping_error:
+                loaded_metadata = _load_metadata(client, str(raw_folder["id"]))
+                if loaded_metadata:
+                    metadata = loaded_metadata
+                    raw_channel = label_app._screenrecord_channel_code_from_metadata(raw_name, metadata)  # noqa: SLF001
+                    if channel_filter and raw_channel != channel_filter:
+                        continue
+                    mapping_error, _channel_number, camera, table_polygons = expected_for_raw(raw_folder, metadata)
+
+            if mapping_error == "missing_mapping" and not metadata:
                 raw_channel = label_app._screenrecord_channel_code_from_metadata(raw_name, {})  # noqa: SLF001
-                if channel_filter and raw_channel != channel_filter:
-                    continue
                 decision = "missing_metadata"
                 record = {
                     "type": "raw_folder",
@@ -254,10 +295,6 @@ def reconcile(args: argparse.Namespace) -> int:
                     "trashed": False,
                 }
             else:
-                raw_channel = label_app._screenrecord_channel_code_from_metadata(raw_name, metadata)  # noqa: SLF001
-                if channel_filter and raw_channel != channel_filter:
-                    continue
-                mapping_error, _channel_number, camera, table_polygons = _resolve_expected(client, context, raw_folder, metadata)
                 expected_count = len(table_polygons)
                 generated_found = 0
                 labeled_found = 0
@@ -321,6 +358,92 @@ def reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def trash_from_report(args: argparse.Namespace) -> int:
+    report_path = Path(args.trash_from_report)
+    if not report_path.exists():
+        raise SystemExit(f"Report not found: {report_path}")
+
+    output_path = Path(args.output) if args.output else _jsonl_path()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    eligible_decisions = {"eligible_generated_threshold", "eligible_labeled_threshold"}
+    records_to_trash: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    with report_path.open("r", encoding="utf-8") as report:
+        for line in report:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("type") != "raw_folder":
+                continue
+            raw_folder_id = str(record.get("raw_folder_id") or "").strip()
+            decision = str(record.get("decision") or "")
+            if not raw_folder_id or raw_folder_id in seen_ids or decision not in eligible_decisions:
+                continue
+            seen_ids.add(raw_folder_id)
+            records_to_trash.append(record)
+
+    trashed = 0
+    errors = 0
+    with output_path.open("w", encoding="utf-8") as out:
+        out.write(json.dumps({
+            "type": "trash_header",
+            "source_report": str(report_path),
+            "mode": args.mode,
+            "trash_workers": args.trash_workers,
+            "eligible_records": len(records_to_trash),
+        }, sort_keys=True) + "\n")
+        out.flush()
+        with ThreadPoolExecutor(max_workers=args.trash_workers) as executor:
+            futures = [executor.submit(_trash_report_record, record) for record in records_to_trash]
+            for future in as_completed(futures):
+                result = future.result()
+                if result.get("trashed"):
+                    trashed += 1
+                if result.get("error"):
+                    errors += 1
+                out.write(json.dumps(result, sort_keys=True) + "\n")
+                if (trashed + errors) % 100 == 0:
+                    out.flush()
+        footer = {
+            "type": "trash_footer",
+            "source_report": str(report_path),
+            "trashed": trashed,
+            "eligible_records": len(records_to_trash),
+            "errors": errors,
+        }
+        out.write(json.dumps(footer, sort_keys=True) + "\n")
+    print(json.dumps({"output": str(output_path), **footer}, sort_keys=True))
+    return 0 if errors == 0 else 1
+
+
+def _thread_drive_client() -> DriveClient:
+    client = getattr(_THREAD_STATE, "drive_client", None)
+    if client is None:
+        client = DriveClient()
+        _THREAD_STATE.drive_client = client
+    return client
+
+
+def _trash_report_record(record: dict[str, Any]) -> dict[str, Any]:
+    raw_folder_id = str(record.get("raw_folder_id") or "").strip()
+    result = {
+        "type": "trash_result",
+        "raw_folder_id": raw_folder_id,
+        "raw_folder_name": record.get("raw_folder_name"),
+        "channel_code": record.get("channel_code"),
+        "decision": record.get("decision"),
+        "trashed": False,
+        "error": "",
+    }
+    try:
+        _thread_drive_client().trash_file(raw_folder_id)
+        result["trashed"] = True
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", default="restaurant-pi-1", help="Reolink site key to audit.")
@@ -328,14 +451,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, help="Maximum raw true-10 folders to audit.")
     parser.add_argument("--min-generated-ratio", type=float, default=0.80, help="Eligible threshold. Default: 0.80.")
     parser.add_argument("--require-labeled", action="store_true", help="Require labeled artifacts to meet the threshold.")
+    parser.add_argument("--metadata-index", action="store_true", help="Also read generated artifact metadata for fallback matching. Slower.")
     parser.add_argument("--mode", choices=("dry-run", "trash"), default="dry-run")
     parser.add_argument("--confirm", default="", help=f"Required for --mode trash: {CONFIRM_TEXT}")
     parser.add_argument("--output", help="JSONL report path. Default: /private/tmp/screenrecord_true_ten_reconcile_<timestamp>.jsonl")
+    parser.add_argument("--trash-from-report", help="Trash eligible raw folders from an existing dry-run JSONL report without rescanning.")
+    parser.add_argument("--trash-workers", type=int, default=8, help="Parallel Drive trash workers for --trash-from-report. Default: 8.")
     args = parser.parse_args(argv)
     if not 0 < args.min_generated_ratio <= 1:
         parser.error("--min-generated-ratio must be > 0 and <= 1")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be >= 1")
+    if args.trash_workers < 1:
+        parser.error("--trash-workers must be >= 1")
     return args
 
 
