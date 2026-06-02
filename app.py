@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 from typing import Any, Iterator
 from urllib.parse import unquote, urlencode, urlparse
 
@@ -220,6 +220,23 @@ HYDRATE_MAX_WORKERS = max(2, int(os.environ.get("LABEL_QUEUE_HYDRATE_WORKERS", "
 PREVIEW_PREWARM_MAX_WORKERS = max(
     2, int(os.environ.get("LABEL_PREVIEW_PREWARM_WORKERS", "32") or "32")
 )
+# Hot-path browser-buffer thumbnail/contact-sheet warming runs on its own pool so
+# it is never starved behind background cache-warm folder hydration. With the
+# thread-local Drive client each worker is cheap (one reused token/session), and
+# the work is download-bound, so a higher count overlaps more Drive latency.
+THUMB_WARM_MAX_WORKERS = max(
+    2, int(os.environ.get("LABEL_THUMB_WARM_WORKERS", "48") or "48")
+)
+# Contact sheets: one composite JPEG per triplet so each card blocks on ONE image
+# request instead of three. Disable by setting LABEL_CONTACT_SHEETS=0 (the client
+# falls back to per-frame thumbs whenever contact_sheet_url is absent).
+CONTACT_SHEETS_ENABLED = os.environ.get("LABEL_CONTACT_SHEETS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+CONTACT_SHEET_GAP_PX = max(0, int(os.environ.get("LABEL_CONTACT_SHEET_GAP_PX", "4") or "4"))
 THUMB_WIDTH = max(128, int(os.environ.get("LABEL_THUMB_WIDTH", "512") or "512"))
 THUMB_QUALITY = max(40, min(95, int(os.environ.get("LABEL_THUMB_QUALITY", "82") or "82")))
 FOLDER_PREWARM_MAX_WORKERS = max(
@@ -585,6 +602,8 @@ _listing_refresh_inflight: set[str] = set()
 _preview_prewarm_executor = ThreadPoolExecutor(max_workers=PREVIEW_PREWARM_MAX_WORKERS)
 _preview_prewarm_inflight: set[str] = set()
 _preview_prewarm_lock = Lock()
+# Dedicated pool for labeler-facing buffer warming (see THUMB_WARM_MAX_WORKERS).
+_thumb_warm_executor = ThreadPoolExecutor(max_workers=THUMB_WARM_MAX_WORKERS)
 _cache_warm_executor = ThreadPoolExecutor(max_workers=1)
 _label_job_executor = ThreadPoolExecutor(max_workers=1)
 _cache_warm_lock = Lock()
@@ -748,6 +767,23 @@ def get_client() -> DriveClient:
     if client is None:
         client = DriveClient()
         g._drive_client = client
+    return client
+
+
+# Background warm/prewarm threads run outside a Flask request context, so they
+# cannot use get_client() (which is bound to flask.g). Constructing a fresh
+# DriveClient per task re-parses credentials, rebuilds the API surface, and
+# forces a new OAuth token fetch (RSA-signed JWT + network round-trip) — all of
+# which hold the GIL and collapse pool parallelism. Reuse one client per worker
+# thread instead, mirroring scripts/reconcile_screenrecord_true_ten_raws.py.
+_warm_client_state = local()
+
+
+def warm_client() -> DriveClient:
+    client = getattr(_warm_client_state, "drive_client", None)
+    if client is None:
+        client = DriveClient()
+        _warm_client_state.drive_client = client
     return client
 
 
@@ -5889,7 +5925,7 @@ def _remove_folder_from_listing_cache(queue_key: str, folder_id: str) -> None:
 
 def _refresh_listing_in_background(context: QueueContext) -> None:
     try:
-        listing = _fetch_source_listing(DriveClient(), context)
+        listing = _fetch_source_listing(warm_client(), context)
         _set_listing_cache(context.queue_key, listing)
     except Exception:
         return
@@ -6093,6 +6129,15 @@ def _build_folder_payload(
         for key, file_id in frames.items()
         if file_id
     }
+    # One composite-image URL per card (frame ids embedded so the route never has
+    # to re-hydrate from Drive). The client prefers this when present, blocking on
+    # one image instead of three; absent => it falls back to per-frame thumbs.
+    ordered_ids = [fid for fid in (frames.get(k) for k in _ordered_frame_keys(frames)) if fid]
+    contact_sheet_url = (
+        f"/api/contact_sheet/{folder['id']}?f={','.join(ordered_ids)}"
+        if (CONTACT_SHEETS_ENABLED and ordered_ids)
+        else None
+    )
     parents = [str(parent) for parent in folder.get("parents", []) if parent]
     parent_id = parents[0] if parents else context.input_folder_id
     source_label = _folder_source_label(folder, context, parent_id)
@@ -6109,6 +6154,7 @@ def _build_folder_payload(
         "content_signature": content_signature,
         "preview_urls": preview_urls,
         "thumb_urls": thumb_urls,
+        "contact_sheet_url": contact_sheet_url,
         "cache_ready": _thumbs_cache_ready(frames),
         "perception_file_id": folder.get("_perception_file_id"),
         "perception_file_name": folder.get("_perception_file_name"),
@@ -6252,7 +6298,7 @@ def _ensure_thumb_for_file(file_id: str, client: DriveClient | None = None) -> t
         return thumb_path, True, download_ms, encode_ms
 
     if not cache_path.exists():
-        active_client = client or DriveClient()
+        active_client = client or warm_client()
         download_started = time.perf_counter()
         active_client.download_file_to_path(file_id, cache_path)
         download_ms = (time.perf_counter() - download_started) * 1000
@@ -6260,17 +6306,130 @@ def _ensure_thumb_for_file(file_id: str, client: DriveClient | None = None) -> t
     from PIL import Image
 
     encode_started = time.perf_counter()
+    decode_ms = 0.0
+    resize_ms = 0.0
+    save_ms = 0.0
     with Image.open(cache_path) as img:
+        # draft() lets the JPEG decoder downscale during decode (DCT scaling),
+        # which is far cheaper than decoding full-res then resizing.
+        try:
+            img.draft("RGB", (THUMB_WIDTH, THUMB_WIDTH * 4))
+        except Exception:
+            pass
+        decode_started = time.perf_counter()
         rgb = img.convert("RGB")
+        decode_ms = (time.perf_counter() - decode_started) * 1000
+
+        resize_started = time.perf_counter()
         rgb.thumbnail((THUMB_WIDTH, THUMB_WIDTH * 4), Image.Resampling.LANCZOS)
-        rgb.save(thumb_path, "JPEG", quality=THUMB_QUALITY, optimize=True)
+        resize_ms = (time.perf_counter() - resize_started) * 1000
+
+        save_started = time.perf_counter()
+        # optimize=True runs a second entropy-coding pass (CPU, holds the GIL)
+        # for a few KB of savings — not worth it for label previews.
+        rgb.save(thumb_path, "JPEG", quality=THUMB_QUALITY)
+        save_ms = (time.perf_counter() - save_started) * 1000
     encode_ms = (time.perf_counter() - encode_started) * 1000
+
+    _log_timing(
+        "thumb_stage",
+        file_id=file_id,
+        download_ms=f"{download_ms:.1f}",
+        decode_ms=f"{decode_ms:.1f}",
+        resize_ms=f"{resize_ms:.1f}",
+        save_ms=f"{save_ms:.1f}",
+        encode_ms=f"{encode_ms:.1f}",
+    )
     return thumb_path, False, download_ms, encode_ms
+
+
+def _contact_sheet_path_for_folder(folder_id: str) -> Path:
+    return _ensure_cache_dir() / f"{folder_id}.sheet.jpg"
+
+
+def _ensure_contact_sheet_for_folder(
+    folder_id: str,
+    file_ids: list[str],
+    client: DriveClient | None = None,
+) -> tuple[Path, bool, float, float]:
+    """Build one horizontal composite JPEG from a folder's frame thumbnails.
+
+    Reuses _ensure_thumb_for_file per frame (so the per-frame thumbs are also
+    cached for the click-to-zoom fallback), then concatenates them side by side.
+    Returns (sheet_path, cache_hit, download_ms, encode_ms).
+    """
+    sheet_path = _contact_sheet_path_for_folder(folder_id)
+    if sheet_path.exists():
+        return sheet_path, True, 0.0, 0.0
+
+    active_client = client or warm_client()
+    download_ms = 0.0
+    thumb_paths: list[Path] = []
+    for file_id in file_ids:
+        if not file_id:
+            continue
+        thumb_path, _, frame_download_ms, _ = _ensure_thumb_for_file(file_id, active_client)
+        download_ms += frame_download_ms
+        thumb_paths.append(thumb_path)
+
+    if not thumb_paths:
+        raise DriveClientError(f"No frames to build contact sheet for {folder_id}")
+
+    from PIL import Image
+
+    encode_started = time.perf_counter()
+    images = []
+    try:
+        for path in thumb_paths:
+            images.append(Image.open(path).convert("RGB"))
+        gap = CONTACT_SHEET_GAP_PX
+        total_width = sum(im.width for im in images) + gap * (len(images) - 1)
+        max_height = max(im.height for im in images)
+        sheet = Image.new("RGB", (total_width, max_height), (255, 255, 255))
+        x = 0
+        for im in images:
+            sheet.paste(im, (x, 0))
+            x += im.width + gap
+        sheet.save(sheet_path, "JPEG", quality=THUMB_QUALITY)
+    finally:
+        for im in images:
+            try:
+                im.close()
+            except Exception:
+                pass
+    encode_ms = (time.perf_counter() - encode_started) * 1000
+
+    _log_timing(
+        "contact_sheet_stage",
+        folder_id=folder_id,
+        frames=len(thumb_paths),
+        download_ms=f"{download_ms:.1f}",
+        encode_ms=f"{encode_ms:.1f}",
+    )
+    return sheet_path, False, download_ms, encode_ms
+
+
+def _warm_contact_sheet(folder_id: str, file_ids: list[str]) -> None:
+    try:
+        sheet_path, _, _, _ = _ensure_contact_sheet_for_folder(folder_id, file_ids, warm_client())
+        try:
+            os.utime(sheet_path, None)
+        except OSError:
+            pass
+    except Exception:
+        return
+    finally:
+        with _preview_prewarm_lock:
+            _preview_prewarm_inflight.discard(_contact_sheet_inflight_key(folder_id))
+
+
+def _contact_sheet_inflight_key(folder_id: str) -> str:
+    return f"sheet:{folder_id}"
 
 
 def _warm_thumb(file_id: str) -> None:
     try:
-        thumb_path, _, _, _ = _ensure_thumb_for_file(file_id, DriveClient())
+        thumb_path, _, _, _ = _ensure_thumb_for_file(file_id, warm_client())
         try:
             os.utime(thumb_path, None)
         except OSError:
@@ -6303,17 +6462,32 @@ def _schedule_preview_prewarm(hydrated_folders: list[dict]) -> int:
     scheduled = 0
     for folder in warm_targets:
         frames = folder.get("frames", {})
-        for key in _ordered_frame_keys(frames):
-            file_id = frames.get(key)
-            if not file_id:
-                continue
+        ordered_ids = [fid for fid in (frames.get(k) for k in _ordered_frame_keys(frames)) if fid]
+
+        # When contact sheets are on, warm ONE composite per folder. Building the
+        # sheet also caches each per-frame thumb (for click-to-zoom), so this both
+        # replaces the 3 thumb tasks and keeps the fallback path warm.
+        if CONTACT_SHEETS_ENABLED and ordered_ids:
+            folder_id = folder.get("folder_id") or folder.get("id")
+            if folder_id and not _contact_sheet_path_for_folder(folder_id).exists():
+                sheet_key = _contact_sheet_inflight_key(folder_id)
+                with _preview_prewarm_lock:
+                    already = sheet_key in _preview_prewarm_inflight
+                    if not already:
+                        _preview_prewarm_inflight.add(sheet_key)
+                if not already:
+                    _thumb_warm_executor.submit(_warm_contact_sheet, folder_id, ordered_ids)
+                    scheduled += 1
+            continue
+
+        for file_id in ordered_ids:
             if _thumb_path_for_file(file_id).exists():
                 continue
             with _preview_prewarm_lock:
                 if file_id in _preview_prewarm_inflight:
                     continue
                 _preview_prewarm_inflight.add(file_id)
-            _preview_prewarm_executor.submit(_warm_thumb, file_id)
+            _thumb_warm_executor.submit(_warm_thumb, file_id)
             scheduled += 1
     return scheduled
 
@@ -6787,8 +6961,9 @@ def _hydrate_folder_with_fresh_client(
     context: QueueContext,
     folder: dict[str, str],
 ) -> dict | None:
-    # googleapiclient service objects are safer to keep thread-local.
-    client = DriveClient()
+    # googleapiclient service objects are safer to keep thread-local — reuse one
+    # per worker thread instead of rebuilding (and re-authing) per folder.
+    client = warm_client()
     return _hydrate_folder(client, context, folder)
 
 
@@ -7992,7 +8167,11 @@ def api_preview(file_id: str):
         size_kb=f"{size_bytes / 1024:.1f}",
         file_id=file_id,
     )
-    return send_file(cache_path, mimetype="image/jpeg", conditional=True, max_age=3600)
+    resp = send_file(cache_path, mimetype="image/jpeg", conditional=True, max_age=31536000)
+    # Content is addressed by Drive file_id and never changes — let the browser
+    # reuse it without revalidating (free reloads / revisits).
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 @app.route("/api/thumb/<file_id>")
@@ -8032,7 +8211,55 @@ def api_thumb(file_id: str):
         size_kb=f"{size_bytes / 1024:.1f}",
         file_id=file_id,
     )
-    return send_file(thumb_path, mimetype="image/jpeg", conditional=True, max_age=3600)
+    resp = send_file(thumb_path, mimetype="image/jpeg", conditional=True, max_age=31536000)
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
+
+
+@app.route("/api/contact_sheet/<folder_id>")
+def api_contact_sheet(folder_id: str):
+    """Serve one composite JPEG (frames side by side) for a folder.
+
+    Frame file ids are passed via ?f=id0,id5,id9 so we never re-hydrate from
+    Drive. Cached at {folder_id}.sheet.jpg; built on first hit if missing.
+    """
+    request_started = time.perf_counter()
+    _cleanup_cache_if_needed()
+
+    file_ids = [fid for fid in (request.args.get("f") or "").split(",") if fid]
+    try:
+        sheet_path, cache_hit, download_ms, encode_ms = _ensure_contact_sheet_for_folder(
+            folder_id, file_ids, get_client()
+        )
+    except DriveClientError as e:
+        abort(404, description=str(e))
+    except Exception as e:
+        abort(500, description=f"Contact sheet generation failed: {e}")
+
+    try:
+        os.utime(sheet_path, None)
+    except OSError:
+        pass
+
+    try:
+        size_bytes = sheet_path.stat().st_size
+    except OSError:
+        size_bytes = 0
+
+    total_ms = (time.perf_counter() - request_started) * 1000
+    _log_timing(
+        "api_contact_sheet",
+        total_ms=f"{total_ms:.1f}",
+        download_ms=f"{download_ms:.1f}",
+        encode_ms=f"{encode_ms:.1f}",
+        cache="hit" if cache_hit else "miss",
+        size_kb=f"{size_bytes / 1024:.1f}",
+        folder_id=folder_id,
+    )
+    resp = send_file(sheet_path, mimetype="image/jpeg", conditional=True, max_age=31536000)
+    # Composite is derived from immutable frame content — safe to cache hard.
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 @app.route("/api/label", methods=["POST"])

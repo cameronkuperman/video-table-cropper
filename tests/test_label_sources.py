@@ -1800,30 +1800,60 @@ def test_force_refresh_without_listing_cache_fetches_synchronously(monkeypatch):
         assert label_app._list_source_subfolders(object(), context, force_refresh=True) == fresh_listing
 
 
-def test_interactive_preview_prewarm_is_bounded(tmp_path, monkeypatch):
-    submitted: list[str] = []
-
-    class FakeExecutor:
-        def submit(self, _fn, file_id):
-            submitted.append(file_id)
-
-    monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(label_app, "_preview_prewarm_executor", FakeExecutor())
-    label_app._preview_prewarm_inflight.clear()
-    folders = [
+def _make_prewarm_folders(count):
+    return [
         {
+            "folder_id": f"folder-{idx}",
+            "id": f"folder-{idx}",
             "frames": {
                 "frame_0": f"folder-{idx}-0",
                 "frame_1": f"folder-{idx}-1",
                 "frame_2": f"folder-{idx}-2",
-            }
+            },
         }
-        for idx in range(label_app.PREWARM_FOLDER_COUNT + 25)
+        for idx in range(count)
     ]
 
-    scheduled = label_app._schedule_preview_prewarm(folders)
 
+def test_interactive_preview_prewarm_is_bounded(tmp_path, monkeypatch):
+    submitted: list[tuple] = []
+
+    class FakeExecutor:
+        def submit(self, _fn, *args):
+            submitted.append(args)
+
+    monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
+    # Hot-path warming now runs on its own dedicated pool.
+    monkeypatch.setattr(label_app, "_thumb_warm_executor", FakeExecutor())
+    label_app._preview_prewarm_inflight.clear()
+    folders = _make_prewarm_folders(label_app.PREWARM_FOLDER_COUNT + 25)
+
+    # Contact-sheet mode (default): one composite task per folder, bounded.
+    monkeypatch.setattr(label_app, "CONTACT_SHEETS_ENABLED", True)
+    scheduled = label_app._schedule_preview_prewarm(folders)
+    assert scheduled == label_app.PREWARM_FOLDER_COUNT
+    assert len(submitted) == scheduled
+    # Each submit carries (folder_id, ordered_file_ids).
+    assert all(len(args) == 2 for args in submitted)
+
+
+def test_interactive_preview_prewarm_bounded_legacy_thumbs(tmp_path, monkeypatch):
+    submitted: list[tuple] = []
+
+    class FakeExecutor:
+        def submit(self, _fn, *args):
+            submitted.append(args)
+
+    monkeypatch.setenv("LABEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(label_app, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(label_app, "_thumb_warm_executor", FakeExecutor())
+    monkeypatch.setattr(label_app, "CONTACT_SHEETS_ENABLED", False)
+    label_app._preview_prewarm_inflight.clear()
+    folders = _make_prewarm_folders(label_app.PREWARM_FOLDER_COUNT + 25)
+
+    # Legacy per-frame thumb mode: 3 thumb tasks per folder, still bounded.
+    scheduled = label_app._schedule_preview_prewarm(folders)
     assert scheduled == label_app.PREWARM_FOLDER_COUNT * 3
     assert len(submitted) == scheduled
 

@@ -880,9 +880,13 @@ function preloadFolder(folder) {
     }
 
     const startedAt = performance.now();
-    const urls = displayFrameKeys(folder)
-        .map(key => folder.thumb_urls?.[key] ?? folder.preview_urls?.[key])
-        .filter(Boolean);
+    // One composite image when available (blocks the card on a single request),
+    // otherwise fall back to the per-frame thumbnails.
+    const urls = folder.contact_sheet_url
+        ? [folder.contact_sheet_url]
+        : displayFrameKeys(folder)
+            .map(key => folder.thumb_urls?.[key] ?? folder.preview_urls?.[key])
+            .filter(Boolean);
 
     folder.preloadPromise = Promise.all(urls.map(preloadImage))
         .then(images => {
@@ -964,23 +968,43 @@ function renderFolderCard(folder) {
     let brokenFrameSkipped = false;
     const frameKeys = displayFrameKeys(folder);
     const sourceLabel = folder.source_label || folder.source || 'unknown';
-    const imgHtml = frameKeys.map((key, idx) => {
-        const url = folder.thumb_urls?.[key] ?? folder.preview_urls?.[key];
-        const fullUrl = folder.preview_urls?.[key] || '';
-        if (!url) {
+    let imgHtml;
+    let requiredCount;
+    if (folder.contact_sheet_url) {
+        // Single composite image => the card blocks on ONE load, not three.
+        // Per-frame full-res stays reachable via the zoom links below.
+        requiredCount = 1;
+        const zoomLinks = frameKeys.map((key, i) => {
+            const full = folder.preview_urls?.[key];
+            return full ? `<a href="${full}" target="_blank" rel="noopener">Frame ${i + 1}</a>` : '';
+        }).filter(Boolean).join(' · ');
+        imgHtml = `
+            <div class="image-slot contact-sheet" data-frame="sheet">
+                <div class="img-placeholder">loading</div>
+                <img src="${folder.contact_sheet_url}" alt="frames" loading="eager" decoding="async" data-frame-index="0" />
+            </div>
+            ${zoomLinks ? `<div class="frame-zoom-links">${zoomLinks}</div>` : ''}
+        `;
+    } else {
+        requiredCount = frameKeys.length;
+        imgHtml = frameKeys.map((key, idx) => {
+            const url = folder.thumb_urls?.[key] ?? folder.preview_urls?.[key];
+            const fullUrl = folder.preview_urls?.[key] || '';
+            if (!url) {
+                return `
+                    <div class="image-slot error" data-frame="${key}">
+                        <div class="img-placeholder">no image</div>
+                    </div>
+                `;
+            }
             return `
-                <div class="image-slot error" data-frame="${key}">
-                    <div class="img-placeholder">no image</div>
+                <div class="image-slot" data-frame="${key}">
+                    <div class="img-placeholder">loading</div>
+                    <img src="${url}" data-full-src="${fullUrl}" alt="${key}" loading="eager" decoding="async" data-frame-index="${idx}" />
                 </div>
             `;
-        }
-        return `
-            <div class="image-slot" data-frame="${key}">
-                <div class="img-placeholder">loading</div>
-                <img src="${url}" data-full-src="${fullUrl}" alt="${key}" loading="eager" decoding="async" data-frame-index="${idx}" />
-            </div>
-        `;
-    }).join('');
+        }).join('');
+    }
 
     cardEl.innerHTML = `
         <div class="folder-name">${escapeHtml(folder.folder_name)}</div>
@@ -999,7 +1023,6 @@ function renderFolderCard(folder) {
     const statusEl = document.getElementById('image-status');
     const buttons = Array.from(cardEl.querySelectorAll('.label-action'));
     const images = Array.from(cardEl.querySelectorAll('.image-slot img'));
-    const requiredCount = frameKeys.length;
     let loadedCount = 0;
     let failed = images.length !== requiredCount;
 

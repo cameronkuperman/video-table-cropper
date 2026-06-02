@@ -208,6 +208,33 @@
     display: none;
   }
 
+  /* One wide composite (frames side by side) instead of 3 square slots. */
+  .image-slot.contact-sheet {
+    flex: 1;
+    aspect-ratio: auto;
+    min-height: 0;
+  }
+
+  .image-slot.contact-sheet img {
+    width: 100%;
+    height: auto;
+    max-height: 360px;
+    object-fit: contain;
+  }
+
+  .frame-zoom-links {
+    display: flex;
+    gap: 12px;
+    margin: -10px 0 16px;
+    font-size: 0.8rem;
+    color: #888;
+  }
+
+  .frame-zoom-links a {
+    color: #5ac8fa;
+    text-decoration: none;
+  }
+
   .image-slot.error {
     border: 1px solid #8b2020;
   }
