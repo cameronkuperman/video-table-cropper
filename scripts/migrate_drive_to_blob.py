@@ -192,7 +192,13 @@ def _app_properties(item: dict[str, Any]) -> dict[str, str]:
     return {str(key): str(value) for key, value in raw.items() if value is not None}
 
 
-def build_manifest(drive: Any, drive_root_id: str, blob_root_prefix: str) -> Manifest:
+def build_manifest(
+    drive: Any,
+    drive_root_id: str,
+    blob_root_prefix: str,
+    *,
+    progress_every: int = 25,
+) -> Manifest:
     root = drive.get_file(drive_root_id, fields=FOLDER_FIELDS)
     queue: list[tuple[str, str, str]] = [(drive_root_id, "", _clean_path(blob_root_prefix))]
     items: list[MigrationItem] = [
@@ -208,9 +214,20 @@ def build_manifest(drive: Any, drive_root_id: str, blob_root_prefix: str) -> Man
         )
     ]
     seen_dest_paths: dict[str, list[str]] = {items[0].dest_path: [drive_root_id]}
+    scanned_folders = 0
+    print(f"Scanning Drive tree from root {drive_root_id}...", flush=True)
 
     while queue:
         folder_id, rel_path, dest_path = queue.pop(0)
+        scanned_folders += 1
+        if scanned_folders == 1 or (progress_every > 0 and scanned_folders % progress_every == 0):
+            print(
+                "  scanned "
+                f"{scanned_folders} folders, discovered {sum(1 for item in items if item.is_folder)} folders "
+                f"and {sum(1 for item in items if not item.is_folder)} files "
+                f"(queue={len(queue)})",
+                flush=True,
+            )
         children = sorted(
             drive.list_files(folder_id, fields=FILE_FIELDS),
             key=lambda child: (str(child.get("name") or ""), str(child.get("id") or "")),
@@ -240,6 +257,12 @@ def build_manifest(drive: Any, drive_root_id: str, blob_root_prefix: str) -> Man
             if is_folder:
                 queue.append((child_id, child_rel, child_dest))
 
+    print(
+        "Finished Drive scan: "
+        f"{sum(1 for item in items if item.is_folder)} folders, "
+        f"{sum(1 for item in items if not item.is_folder)} files.",
+        flush=True,
+    )
     duplicate_paths = {
         path: source_ids
         for path, source_ids in seen_dest_paths.items()
@@ -414,6 +437,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-folders", type=int, default=None, help="Migrate at most this many non-root folders from the selected manifest.")
     parser.add_argument("--limit-files", type=int, default=None, help="Migrate at most this many files from the selected manifest.")
     parser.add_argument("--assume-mbps", type=float, default=float(os.environ.get("MIGRATION_ASSUME_MBPS", "5") or "5"))
+    parser.add_argument("--scan-progress-every", type=int, default=25, help="Print Drive scan progress after this many folders; use 0 to disable periodic logs.")
     parser.add_argument("--dry-run", action="store_true", help="Scan/count/estimate only; do not write Azure Blob data.")
     parser.add_argument("--verify", action="store_true", help="Verify uploaded Blob sizes when Drive exposes source sizes.")
     parser.add_argument("--no-skip-existing", action="store_true", help="Reupload files even when matching Blob paths already exist.")
@@ -430,7 +454,12 @@ def main() -> None:
         raise SystemExit("AZURE_PROJECT_ROOT_PREFIX or --blob-root-prefix is required.")
 
     drive = DriveClient()
-    manifest = build_manifest(drive, args.drive_root_id, args.blob_root_prefix)
+    manifest = build_manifest(
+        drive,
+        args.drive_root_id,
+        args.blob_root_prefix,
+        progress_every=args.scan_progress_every,
+    )
     selected = select_items(
         manifest,
         source_path_prefixes=args.source_path_prefix,
