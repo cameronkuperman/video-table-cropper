@@ -6546,26 +6546,41 @@ def _ensure_contact_sheet_for_folder(
     folder_id: str,
     file_ids: list[str],
     client: DriveClient | None = None,
+    *,
+    parallel_frames: bool = False,
 ) -> tuple[Path, bool, float, float]:
     """Build one horizontal composite JPEG from a folder's frame thumbnails.
 
     Reuses _ensure_thumb_for_file per frame (so the per-frame thumbs are also
     cached for the click-to-zoom fallback), then concatenates them side by side.
+    With parallel_frames=True the per-frame downloads run concurrently — used on
+    the on-demand request path so a single cold card builds in ~one download's
+    time instead of three sequential ones. The background warm pool leaves it
+    False (it already parallelizes at the folder level).
     Returns (sheet_path, cache_hit, download_ms, encode_ms).
     """
     sheet_path = _contact_sheet_path_for_folder(folder_id)
     if sheet_path.exists():
         return sheet_path, True, 0.0, 0.0
 
-    active_client = client or warm_client()
+    valid_ids = [fid for fid in file_ids if fid]
     download_ms = 0.0
     thumb_paths: list[Path] = []
-    for file_id in file_ids:
-        if not file_id:
-            continue
-        thumb_path, _, frame_download_ms, _ = _ensure_thumb_for_file(file_id, active_client)
-        download_ms += frame_download_ms
-        thumb_paths.append(thumb_path)
+    if parallel_frames and len(valid_ids) > 1:
+        # Each task uses its own thread-local client (httplib2 isn't thread-safe).
+        def _fetch(fid: str):
+            return _ensure_thumb_for_file(fid, warm_client())
+
+        with ThreadPoolExecutor(max_workers=len(valid_ids)) as ex:
+            for thumb_path, _, frame_download_ms, _ in ex.map(_fetch, valid_ids):
+                download_ms = max(download_ms, frame_download_ms)
+                thumb_paths.append(thumb_path)
+    else:
+        active_client = client or warm_client()
+        for file_id in valid_ids:
+            thumb_path, _, frame_download_ms, _ = _ensure_thumb_for_file(file_id, active_client)
+            download_ms += frame_download_ms
+            thumb_paths.append(thumb_path)
 
     if not thumb_paths:
         raise DriveClientError(f"No frames to build contact sheet for {folder_id}")
@@ -8424,7 +8439,7 @@ def api_contact_sheet(folder_id: str):
     file_ids = [fid for fid in (request.args.get("f") or "").split(",") if fid]
     try:
         sheet_path, cache_hit, download_ms, encode_ms = _ensure_contact_sheet_for_folder(
-            folder_id, file_ids, get_client()
+            folder_id, file_ids, get_client(), parallel_frames=True
         )
     except DriveClientError as e:
         abort(404, description=str(e))
