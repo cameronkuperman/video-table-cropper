@@ -11,6 +11,7 @@ from PIL import Image
 
 import app as label_app
 import processor
+from scripts import reconcile_screenrecord_true_ten_raws as reconcile_true_ten
 from queue_metadata import extract_frame_ids_from_item, has_complete_frame_ids
 
 
@@ -1491,6 +1492,56 @@ def test_crop_cleanup_trash_soft_trashes_only_validated_fallback_folders(client,
     assert set(fake_drive.trashed) == {"json-clean-trash", "json-dirty-trash"}
     assert fake_drive.items["supabase-do-not-trash"]["trashed"] is False
     assert fake_drive.permanent_deleted == []
+
+
+def test_true_ten_reconcile_scopes_shared_labeled_artifacts_to_site(fake_drive):
+    context = label_app._resolve_queue_context(fake_drive, label_app.REOLINK_SOURCE, "reolink-matthews-01")
+    raw_metadata = {"table_id": "table_top_1"}
+    artifact_metadata = {
+        "raw_folder_id": "m-ready",
+        "raw_folder_name": "Reolink-CH-CH03_t0002",
+        "table_id": "table_top_1",
+    }
+    for folder_id, folder_name in (
+        ("wrong-mimosas-artifact", "mimosas-Reolink-CH-CH03_table_top_1_t0002"),
+        ("wrong-legacy-artifact", "Reolink-CH-CH03_table_top_1_t0002"),
+    ):
+        fake_drive._add_folder(folder_id, folder_name, "video-clean")
+        fake_drive._add_triplet_files(folder_id, folder_id)
+        fake_drive._add_file(
+            f"{folder_id}-metadata",
+            "metadata.json",
+            folder_id,
+            mime_type="application/json",
+            content=json.dumps(artifact_metadata).encode("utf-8"),
+        )
+
+    fake_drive._add_folder("right-matthews-artifact", "matthews-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("right-matthews-artifact", "right-matthews-artifact")
+    fake_drive._add_file(
+        "right-matthews-artifact-metadata",
+        "metadata.json",
+        "right-matthews-artifact",
+        mime_type="application/json",
+        content=json.dumps(artifact_metadata).encode("utf-8"),
+    )
+
+    artifact_index = reconcile_true_ten._scan_generated_artifacts(
+        fake_drive,
+        context,
+        read_metadata=True,
+    )
+    matches = reconcile_true_ten._matched_artifacts(
+        raw_folder={"id": "m-ready", "name": "Reolink-CH-CH03_t0002"},
+        metadata=raw_metadata,
+        table_id="table_top_1",
+        camera={},
+        label_source=label_app._resolve_label_source(context.source, context.site_key),
+        artifact_index=artifact_index,
+    )
+
+    assert {match["folder_id"] for match in matches} == {"right-matthews-artifact"}
+    assert artifact_index["skipped_wrong_context"] == 2
 
 
 def test_queue_ignores_stale_frame_metadata_from_another_folder(client, fake_drive):

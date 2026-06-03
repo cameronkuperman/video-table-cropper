@@ -31,6 +31,7 @@ CONFIRM_TEXT = "TRASH_TRUE_TEN_RAW"
 GENERATED_BUCKET = "generated"
 LABELED_BUCKETS = {"clean", "dirty", "occupied", "label_later", "discarded"}
 _THREAD_STATE = local()
+SHARED_ARTIFACTS_SCOPED_REPORT_KEY = "shared_artifacts_scoped"
 
 
 def _jsonl_path() -> Path:
@@ -62,6 +63,46 @@ def _artifact_table_keys(metadata: dict[str, Any]) -> set[str]:
     return {str(value).strip() for value in values if str(value or "").strip()}
 
 
+def _shared_labeled_artifact_matches_context(
+    *,
+    context: label_app.QueueContext,
+    label_source: label_app.LabelSource,
+    bucket: str,
+    folder: dict[str, Any],
+) -> bool:
+    if bucket not in LABELED_BUCKETS:
+        return True
+
+    folder_name = str(folder.get("name") or "")
+    app_properties = folder.get("appProperties") if isinstance(folder.get("appProperties"), dict) else {}
+
+    queue_key = str(app_properties.get("autolabel_queue_key") or "").strip()
+    if queue_key:
+        return queue_key == context.queue_key
+
+    site_key = str(app_properties.get("autolabel_site_key") or "").strip()
+    if site_key:
+        return site_key == str(context.site_key or "")
+
+    source = str(app_properties.get("autolabel_source") or "").strip()
+    if source and source != context.source:
+        return False
+
+    prefix = str(label_source.folder_prefix or "").strip()
+    if not prefix or not folder_name.startswith(f"{prefix}-"):
+        return False
+
+    is_reolink_name = (
+        "Reolink-" in folder_name
+        or label_app._folder_name_has_reolink_channel(folder_name)  # noqa: SLF001
+    )
+    if context.source == label_app.REOLINK_SOURCE:
+        return is_reolink_name
+    if context.source == label_app.VIDEO_SOURCE:
+        return not is_reolink_name
+    return True
+
+
 def _scan_generated_artifacts(
     client: DriveClient,
     context: label_app.QueueContext,
@@ -73,6 +114,8 @@ def _scan_generated_artifacts(
     by_raw_table: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     scanned = 0
     metadata_found = 0
+    skipped_wrong_context = 0
+    label_source = label_app._resolve_label_source(context.source, context.site_key)  # noqa: SLF001
 
     parents: list[tuple[str, str]] = []
     for folder_id in label_app._context_input_folder_ids(context):  # noqa: SLF001
@@ -93,6 +136,14 @@ def _scan_generated_artifacts(
             if not folder_id or not folder_name:
                 continue
             scanned += 1
+            if not _shared_labeled_artifact_matches_context(
+                context=context,
+                label_source=label_source,
+                bucket=bucket,
+                folder=folder,
+            ):
+                skipped_wrong_context += 1
+                continue
             record = {
                 "folder_id": folder_id,
                 "folder_name": folder_name,
@@ -121,6 +172,7 @@ def _scan_generated_artifacts(
         "by_raw_table": by_raw_table,
         "scanned": scanned,
         "metadata_found": metadata_found,
+        "skipped_wrong_context": skipped_wrong_context,
     }
 
 
@@ -255,8 +307,10 @@ def reconcile(args: argparse.Namespace) -> int:
             "min_generated_ratio": args.min_generated_ratio,
             "require_labeled": args.require_labeled,
             "metadata_index": args.metadata_index,
+            SHARED_ARTIFACTS_SCOPED_REPORT_KEY: True,
             "generated_artifacts_scanned": artifact_index["scanned"],
             "generated_artifacts_with_metadata": artifact_index["metadata_found"],
+            "generated_artifacts_skipped_wrong_context": artifact_index["skipped_wrong_context"],
         }
         out.write(json.dumps(header, sort_keys=True) + "\n")
 
@@ -368,11 +422,15 @@ def trash_from_report(args: argparse.Namespace) -> int:
     eligible_decisions = {"eligible_generated_threshold", "eligible_labeled_threshold"}
     records_to_trash: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    scoped_report = False
     with report_path.open("r", encoding="utf-8") as report:
         for line in report:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if record.get("type") == "summary_header":
+                scoped_report = record.get(SHARED_ARTIFACTS_SCOPED_REPORT_KEY) is True
                 continue
             if record.get("type") != "raw_folder":
                 continue
@@ -382,6 +440,11 @@ def trash_from_report(args: argparse.Namespace) -> int:
                 continue
             seen_ids.add(raw_folder_id)
             records_to_trash.append(record)
+
+    if not scoped_report:
+        raise SystemExit(
+            "Refusing to trash from an unscoped report. Re-run a dry-run with the current script first."
+        )
 
     trashed = 0
     errors = 0
