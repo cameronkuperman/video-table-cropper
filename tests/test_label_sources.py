@@ -2662,6 +2662,33 @@ def test_record_label_history_appends_without_full_rewrite(fake_drive, tmp_path,
     assert label_app._label_history_lookup(context, "folder-2", "name-2", "sig-2") is None
 
 
+def test_label_jobs_prune_drops_old_terminal_keeps_pending(monkeypatch):
+    from datetime import timedelta
+
+    now = label_app._utc_now()
+    old = label_app._utc_iso(now - timedelta(seconds=label_app.LABEL_JOB_TERMINAL_RETENTION_SECONDS + 60))
+    recent = label_app._utc_iso(now)
+    state = {
+        "jobs": {
+            "old-succeeded": {"status": "succeeded", "updated_at": old},
+            "old-canceled": {"status": "canceled", "updated_at": old},
+            "recent-succeeded": {"status": "succeeded", "updated_at": recent},
+            "pending": {"status": "pending", "updated_at": old},
+            "processing": {"status": "processing", "updated_at": old},
+            "retryable-failed": {"status": "failed", "attempts": 1, "updated_at": old},
+        }
+    }
+    label_app._prune_terminal_label_jobs(state)
+    jobs = state["jobs"]
+    # Old terminal jobs are dropped; everything still in-flight or recent is kept.
+    assert "old-succeeded" not in jobs
+    assert "old-canceled" not in jobs
+    assert "recent-succeeded" in jobs
+    assert "pending" in jobs
+    assert "processing" in jobs
+    assert "retryable-failed" in jobs
+
+
 def test_cache_dir_reuses_existing_repo_cache(monkeypatch, tmp_path):
     fake_repo = tmp_path / "repo"
     repo_cache = fake_repo / "label_cache"

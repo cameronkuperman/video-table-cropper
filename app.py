@@ -366,12 +366,20 @@ LABEL_JOB_RECOVERED_ERROR = "Recovered after label worker fix; retrying Drive pu
 LABEL_JOB_ERROR_LIMIT = max(1, int(os.environ.get("LABEL_JOB_ERROR_LIMIT", "25") or "25"))
 LABEL_JOB_MAX_ATTEMPTS = max(1, int(os.environ.get("LABEL_JOB_MAX_ATTEMPTS", "100") or "100"))
 LABEL_JOB_UNDO_SECONDS = max(0, int(os.environ.get("LABEL_JOB_UNDO_SECONDS", "30") or "30"))
+# Terminal jobs (succeeded/canceled/permanently-failed) are kept this long for the
+# undo window + verification, then pruned. Without this the jobs file grew without
+# bound, so every enqueue/claim rewrote a giant JSON under a lock and Drive moves
+# slowed to a crawl. Retention >= undo window.
+LABEL_JOB_TERMINAL_RETENTION_SECONDS = max(
+    LABEL_JOB_UNDO_SECONDS,
+    int(os.environ.get("LABEL_JOB_TERMINAL_RETENTION_SECONDS", "300") or "300"),
+)
 LABEL_JOB_MIN_INTERVAL_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_MIN_INTERVAL_SECONDS", "0.15") or "0.15"))
 # How many pending Drive folder-moves to push concurrently. The move worker used
 # to do one at a time (~1 per 1.5-3s of Drive latency), so a fast labeler built a
 # growing backlog. A modest pool drains it quickly; 429 backoff still protects us,
 # and it shares Drive quota with image warming so we keep it small.
-LABEL_JOB_DRAIN_CONCURRENCY = max(1, int(os.environ.get("LABEL_JOB_DRAIN_CONCURRENCY", "5") or "5"))
+LABEL_JOB_DRAIN_CONCURRENCY = max(1, int(os.environ.get("LABEL_JOB_DRAIN_CONCURRENCY", "3") or "3"))
 LABEL_JOB_JITTER_SECONDS = max(0.0, float(os.environ.get("LABEL_JOB_JITTER_SECONDS", "0.05") or "0.05"))
 LABEL_JOB_RATE_LIMIT_COOLDOWN_SECONDS = max(
     1.0,
@@ -3844,9 +3852,39 @@ def _load_label_jobs_unlocked() -> dict[str, Any]:
     }
 
 
+def _prune_terminal_label_jobs(state: dict[str, Any]) -> None:
+    """Drop finished jobs older than the retention window so the file stays small.
+
+    Keeps pending/processing and still-retryable failed jobs, plus any terminal
+    job updated within LABEL_JOB_TERMINAL_RETENTION_SECONDS (undo + verification).
+    """
+    jobs = state.get("jobs")
+    if not isinstance(jobs, dict) or not jobs:
+        return
+    cutoff = _utc_now() - timedelta(seconds=LABEL_JOB_TERMINAL_RETENTION_SECONDS)
+    drop: list[str] = []
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            drop.append(job_id)
+            continue
+        status = str(job.get("status") or "")
+        attempts = int(job.get("attempts") or 0)
+        is_terminal = status in {"succeeded", "canceled"} or (
+            status == "failed" and attempts >= LABEL_JOB_MAX_ATTEMPTS
+        )
+        if not is_terminal:
+            continue
+        updated = _parse_iso_datetime(job.get("updated_at"))
+        if updated is None or updated < cutoff:
+            drop.append(job_id)
+    for job_id in drop:
+        jobs.pop(job_id, None)
+
+
 def _save_label_jobs_unlocked(state: dict[str, Any]) -> None:
     path = _label_jobs_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    _prune_terminal_label_jobs(state)
     payload = {
         "schema_version": LABEL_JOBS_SCHEMA_VERSION,
         "jobs": state.get("jobs") or {},
