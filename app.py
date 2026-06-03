@@ -1462,6 +1462,7 @@ def _review_payload_for_folder(
             "frame_count": frame_count,
             "modified_time": folder.get("modifiedTime"),
             "metadata_file_id": payload.get("metadata_file_id") or (files_by_name.get("metadata.json") or {}).get("id"),
+            "metadata": metadata or {},
         }
     )
     return payload
@@ -1536,6 +1537,279 @@ def _review_list_folders(
             break
 
     return results, next_cursor, len(candidates)
+
+
+CLEAN_REFERENCE_SCAN_BATCH_SIZE = 120
+CLEAN_REFERENCE_MAX_SCAN_LIMIT = 5000
+CLEAN_REFERENCE_CONFIRM_TEXT = "IMPORT_CLEAN_REFERENCES"
+CLEAN_REFERENCE_FRAME_PREFERENCE = ("frame_2", "frame_9", "frame_5", "frame_1", "frame_0")
+
+
+def _clean_reference_selected_frame(payload: dict[str, Any]) -> dict[str, Any] | None:
+    frames = payload.get("frames")
+    if not isinstance(frames, dict) or not frames:
+        return None
+    ordered_keys = _ordered_frame_keys(frames)
+    preferred = [key for key in CLEAN_REFERENCE_FRAME_PREFERENCE if frames.get(key)]
+    fallback = [key for key in reversed(ordered_keys) if frames.get(key)]
+    for key in [*preferred, *fallback]:
+        file_id = str(frames.get(key) or "").strip()
+        if file_id:
+            return {
+                "frame_key": key,
+                "frame_file_id": file_id,
+                "preview_url": (payload.get("preview_urls") or {}).get(key),
+                "thumb_url": (payload.get("thumb_urls") or {}).get(key),
+            }
+    return None
+
+
+def _clean_reference_candidate_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    table_id = str(payload.get("supabase_table_id") or "").strip()
+    if not _is_valid_uuid(table_id):
+        return None
+    restaurant_id = str((payload.get("metadata") or {}).get("restaurant_id") or "").strip()
+    if not _is_valid_uuid(restaurant_id):
+        restaurant_id = str(payload.get("restaurant_id") or "").strip()
+    if not _is_valid_uuid(restaurant_id):
+        # Reolink generated artifacts write restaurant_id into metadata.json;
+        # without it, inserting a canonical backend reference would be unsafe.
+        return None
+    selected = _clean_reference_selected_frame(payload)
+    if selected is None:
+        return None
+    return {
+        **selected,
+        "folder_id": payload.get("folder_id"),
+        "folder_name": payload.get("folder_name"),
+        "restaurant_id": restaurant_id,
+        "table_id": table_id,
+        "table_camera_crops_id": payload.get("table_camera_crops_id"),
+        "camera_source_id": payload.get("camera_source_id"),
+        "crop_version": payload.get("crop_version"),
+        "channel_hint": payload.get("channel_hint"),
+        "table_hint": payload.get("table_hint") or table_id,
+        "modified_time": payload.get("modified_time"),
+        "current_label": payload.get("current_label"),
+        "source": payload.get("source"),
+        "site_key": payload.get("site_key"),
+        "review_source_type": payload.get("review_source_type"),
+        "crop_source_kind": payload.get("crop_source_kind"),
+        "metadata_file_id": payload.get("metadata_file_id"),
+        "frame_count": payload.get("frame_count"),
+        "artifact_identity": (payload.get("metadata") or {}).get("artifact_identity"),
+    }
+
+
+def _clean_reference_scan_candidates(
+    client: DriveClient,
+    context: QueueContext,
+    *,
+    filters: dict[str, str] | None = None,
+    max_scan: int = 1000,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return the newest usable clean labeled artifact per Supabase table."""
+    max_scan = max(1, min(CLEAN_REFERENCE_MAX_SCAN_LIMIT, int(max_scan or 1000)))
+    filters = filters or {
+        "q": "",
+        "channel": "",
+        "table": "",
+        "frame_count": "",
+        "folder_source_type": "",
+        "crop_source_kind": "",
+    }
+    by_table: dict[str, dict[str, Any]] = {}
+    cursor: int | None = 0
+    scanned = 0
+    candidate_total = 0
+    while cursor is not None and scanned < max_scan:
+        page_limit = min(CLEAN_REFERENCE_SCAN_BATCH_SIZE, max_scan - scanned)
+        page, next_cursor, candidate_total = _review_list_folders(
+            client,
+            context,
+            ["clean"],
+            filters,
+            limit=page_limit,
+            cursor=cursor,
+        )
+        scanned += len(page)
+        for payload in page:
+            candidate = _clean_reference_candidate_from_payload(payload)
+            if candidate is None:
+                continue
+            # _review_list_folders is newest-first, so keep the first candidate
+            # seen for each table unless a previous entry had no modified time.
+            existing = by_table.get(candidate["table_id"])
+            if existing is None or (
+                not existing.get("modified_time") and candidate.get("modified_time")
+            ):
+                by_table[candidate["table_id"]] = candidate
+        cursor = next_cursor
+    candidates = sorted(
+        by_table.values(),
+        key=lambda item: (str(item.get("table_hint") or ""), str(item.get("table_id") or "")),
+    )
+    return candidates, {
+        "scanned": scanned,
+        "candidate_total": candidate_total,
+        "max_scan": max_scan,
+        "truncated": cursor is not None,
+    }
+
+
+def _supabase_active_clean_references_by_table(
+    client: SupabaseCropClient,
+    *,
+    restaurant_id: str,
+    table_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    ids = [table_id for table_id in dict.fromkeys(table_ids) if _is_valid_uuid(table_id)]
+    if not client.enabled or not _is_valid_uuid(restaurant_id) or not ids:
+        return {}
+    rows = client.select(
+        "table_clean_references",
+        {
+            "select": "id,restaurant_id,table_id,camera_id,crop_version,status,source,byte_size,approved_at",
+            "restaurant_id": f"eq.{restaurant_id}",
+            "table_id": f"in.({','.join(ids)})",
+            "status": "eq.active",
+        },
+    )
+    return {str(row.get("table_id")): row for row in rows if row.get("table_id")}
+
+
+def _decorate_clean_reference_candidates(
+    candidates: list[dict[str, Any]],
+    supabase_client: SupabaseCropClient,
+) -> list[dict[str, Any]]:
+    by_restaurant: dict[str, list[str]] = defaultdict(list)
+    for candidate in candidates:
+        by_restaurant[str(candidate.get("restaurant_id") or "")].append(str(candidate.get("table_id") or ""))
+    active_by_table: dict[str, dict[str, Any]] = {}
+    for restaurant_id, table_ids in by_restaurant.items():
+        active_by_table.update(
+            _supabase_active_clean_references_by_table(
+                supabase_client,
+                restaurant_id=restaurant_id,
+                table_ids=table_ids,
+            )
+        )
+    decorated: list[dict[str, Any]] = []
+    for candidate in candidates:
+        active = active_by_table.get(str(candidate.get("table_id") or ""))
+        decorated.append(
+            {
+                **candidate,
+                "active_clean_reference": active,
+                "has_active_clean_reference": active is not None,
+            }
+        )
+    return decorated
+
+
+def _clean_reference_fixture_notes(candidate: dict[str, Any], explicit: str | None = None) -> str:
+    if explicit:
+        return explicit[:500]
+    bits = [
+        "Imported from Drive clean label",
+        f"folder={candidate.get('folder_name')}",
+        f"frame={candidate.get('frame_key')}",
+    ]
+    if candidate.get("artifact_identity"):
+        bits.append(f"artifact={candidate.get('artifact_identity')}")
+    return " | ".join(bit for bit in bits if bit and "None" not in bit)[:500]
+
+
+def _bytea_hex(data: bytes) -> str:
+    return "\\x" + data.hex()
+
+
+def _import_clean_reference_candidate(
+    *,
+    drive_client: DriveClient,
+    supabase_client: SupabaseCropClient,
+    candidate: dict[str, Any],
+    replace_existing: bool = False,
+    fixture_notes: str | None = None,
+) -> dict[str, Any]:
+    if not supabase_client.enabled:
+        raise RuntimeError("Supabase is not configured")
+    restaurant_id = str(candidate.get("restaurant_id") or "")
+    table_id = str(candidate.get("table_id") or "")
+    if not _is_valid_uuid(restaurant_id) or not _is_valid_uuid(table_id):
+        raise ValueError("candidate is missing restaurant_id or table_id")
+    existing = _supabase_active_clean_references_by_table(
+        supabase_client,
+        restaurant_id=restaurant_id,
+        table_ids=[table_id],
+    ).get(table_id)
+    if existing is not None and not replace_existing:
+        return {
+            "table_id": table_id,
+            "folder_id": candidate.get("folder_id"),
+            "status": "skipped_existing",
+            "active_clean_reference": existing,
+        }
+
+    frame_file_id = str(candidate.get("frame_file_id") or "")
+    if not frame_file_id:
+        raise ValueError("candidate is missing frame_file_id")
+    frame_meta = drive_client.get_file(frame_file_id, fields="id,name,mimeType,size")
+    image_bytes = drive_client.download_file_content(frame_file_id)
+    if not image_bytes:
+        raise ValueError("selected clean reference frame is empty")
+
+    if existing is not None:
+        supabase_client.update(
+            "table_clean_references",
+            {
+                "status": "inactive",
+                "deactivated_at": _utc_iso_now(),
+                "invalidated_reason": "replaced_by_drive_clean_import",
+            },
+            {
+                "restaurant_id": f"eq.{restaurant_id}",
+                "table_id": f"eq.{table_id}",
+                "status": "eq.active",
+            },
+        )
+
+    inserted = supabase_client.insert(
+        "table_clean_references",
+        {
+            "restaurant_id": restaurant_id,
+            "table_id": table_id,
+            "camera_id": candidate.get("camera_source_id") or candidate.get("channel_hint"),
+            "crop_version": str(candidate.get("crop_version")) if candidate.get("crop_version") is not None else None,
+            "source": "drive_labeled_clean",
+            "fixture_notes": _clean_reference_fixture_notes(candidate, fixture_notes),
+            "content_type": frame_meta.get("mimeType") or "image/jpeg",
+            "byte_size": len(image_bytes),
+            "data": _bytea_hex(image_bytes),
+            "source_delivery_row_id": None,
+        },
+    )
+    return {
+        "table_id": table_id,
+        "folder_id": candidate.get("folder_id"),
+        "frame_file_id": frame_file_id,
+        "status": "imported",
+        "byte_size": len(image_bytes),
+        "clean_reference": {
+            key: inserted.get(key)
+            for key in (
+                "id",
+                "restaurant_id",
+                "table_id",
+                "camera_id",
+                "crop_version",
+                "source",
+                "byte_size",
+                "approved_at",
+            )
+            if key in inserted
+        },
+    }
 
 
 def _cleanup_channel_hint_from_camera(camera: dict[str, Any]) -> str:
@@ -3278,6 +3552,52 @@ class SupabaseCropClient:
             response.raise_for_status()
             payload = response.json()
         return payload if isinstance(payload, list) else []
+
+    def update(self, table: str, payload: dict[str, Any], params: dict[str, str]) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        import httpx
+
+        endpoint = f"{self.url}/rest/v1/{table}"
+        headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Accept": "application/json",
+            "Accept-Profile": self.schema,
+            "Content-Type": "application/json",
+            "Content-Profile": self.schema,
+            "Prefer": "return=representation",
+        }
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            response = client.patch(endpoint, params=params, headers=headers, json=payload)
+            response.raise_for_status()
+            if not response.content:
+                return []
+            decoded = response.json()
+        return decoded if isinstance(decoded, list) else []
+
+    def insert(self, table: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.enabled:
+            raise RuntimeError("Supabase is not configured")
+        import httpx
+
+        endpoint = f"{self.url}/rest/v1/{table}"
+        headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Accept": "application/json",
+            "Accept-Profile": self.schema,
+            "Content-Type": "application/json",
+            "Content-Profile": self.schema,
+            "Prefer": "return=representation",
+        }
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            response = client.post(endpoint, headers=headers, json=payload)
+            response.raise_for_status()
+            decoded = response.json()
+        if isinstance(decoded, list) and decoded:
+            return decoded[0] if isinstance(decoded[0], dict) else {}
+        return decoded if isinstance(decoded, dict) else {}
 
 
 def _get_supabase_crop_client() -> SupabaseCropClient:
@@ -7666,6 +7986,11 @@ def labeled_review():
     )
 
 
+@app.route("/clean-references")
+def clean_reference_review():
+    return render_template("clean_references.html")
+
+
 @app.route("/crop-editor")
 def crop_editor():
     site_key = request.args.get("site", MATTHEWS_SITE_KEY)
@@ -7987,6 +8312,139 @@ def api_review_folders():
         return jsonify({"error": str(e)}), 400
     except (DriveClientError, RuntimeError) as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/clean-references/candidates")
+def api_clean_reference_candidates():
+    try:
+        client = get_client()
+        source, site_key = _request_source_args()
+        context = _resolve_queue_context(client, source, site_key)
+        max_scan = max(1, min(CLEAN_REFERENCE_MAX_SCAN_LIMIT, int(request.args.get("max_scan", "1000") or "1000")))
+        filters = {
+            "q": str(request.args.get("q") or "").strip(),
+            "channel": str(request.args.get("channel") or "").strip(),
+            "table": str(request.args.get("table") or "").strip(),
+            "frame_count": str(request.args.get("frame_count") or "").strip(),
+            "folder_source_type": str(request.args.get("folder_source_type") or "").strip(),
+            "crop_source_kind": str(request.args.get("crop_source_kind") or "supabase").strip(),
+        }
+        candidates, scan = _clean_reference_scan_candidates(
+            client,
+            context,
+            filters=filters,
+            max_scan=max_scan,
+        )
+        supabase_client = _get_supabase_crop_client()
+        return jsonify(
+            {
+                "source_context": context.to_payload(),
+                "supabase_configured": supabase_client.enabled,
+                "candidates": _decorate_clean_reference_candidates(candidates, supabase_client),
+                "counts": {
+                    "candidate_tables": len(candidates),
+                    **scan,
+                },
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/clean-references/import", methods=["POST"])
+def api_clean_reference_import():
+    try:
+        data = _request_json_payload()
+        if str(data.get("confirm") or "").strip() != CLEAN_REFERENCE_CONFIRM_TEXT:
+            return jsonify({"error": f"confirm must be {CLEAN_REFERENCE_CONFIRM_TEXT}"}), 400
+        source, site_key = _payload_source_args(data)
+        max_scan = max(1, min(CLEAN_REFERENCE_MAX_SCAN_LIMIT, int(data.get("max_scan") or 1000)))
+        max_import = max(1, min(500, int(data.get("max_import") or 100)))
+        replace_existing = bool(data.get("replace_existing"))
+        import_all_missing = bool(data.get("import_all_missing") or data.get("import_all"))
+        requested_folder_ids = {
+            str(item).strip()
+            for item in (data.get("folder_ids") or [])
+            if str(item).strip()
+        }
+        requested_table_ids = {
+            str(item).strip()
+            for item in (data.get("table_ids") or [])
+            if str(item).strip()
+        }
+        if not import_all_missing and not requested_folder_ids and not requested_table_ids:
+            return jsonify({"error": "Provide folder_ids, table_ids, or import_all_missing=true"}), 400
+
+        client = get_client()
+        context = _resolve_queue_context(client, source, site_key)
+        filters = {
+            "q": str(data.get("q") or "").strip(),
+            "channel": str(data.get("channel") or "").strip(),
+            "table": str(data.get("table") or "").strip(),
+            "frame_count": str(data.get("frame_count") or "").strip(),
+            "folder_source_type": str(data.get("folder_source_type") or "").strip(),
+            "crop_source_kind": str(data.get("crop_source_kind") or "supabase").strip(),
+        }
+        candidates, scan = _clean_reference_scan_candidates(
+            client,
+            context,
+            filters=filters,
+            max_scan=max_scan,
+        )
+        supabase_client = _get_supabase_crop_client()
+        decorated = _decorate_clean_reference_candidates(candidates, supabase_client)
+        selected: list[dict[str, Any]] = []
+        for candidate in decorated:
+            if requested_folder_ids and str(candidate.get("folder_id") or "") not in requested_folder_ids:
+                continue
+            if requested_table_ids and str(candidate.get("table_id") or "") not in requested_table_ids:
+                continue
+            if import_all_missing and candidate.get("has_active_clean_reference") and not replace_existing:
+                continue
+            selected.append(candidate)
+            if len(selected) >= max_import:
+                break
+
+        results: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for candidate in selected:
+            try:
+                results.append(
+                    _import_clean_reference_candidate(
+                        drive_client=client,
+                        supabase_client=supabase_client,
+                        candidate=candidate,
+                        replace_existing=replace_existing,
+                        fixture_notes=str(data.get("fixture_notes") or "").strip() or None,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - return per-table import failures
+                errors.append(
+                    {
+                        "folder_id": candidate.get("folder_id"),
+                        "table_id": candidate.get("table_id"),
+                        "error": str(exc),
+                    }
+                )
+
+        return jsonify(
+            {
+                "ok": not errors,
+                "source_context": context.to_payload(),
+                "imported": sum(1 for item in results if item.get("status") == "imported"),
+                "skipped_existing": sum(1 for item in results if item.get("status") == "skipped_existing"),
+                "selected": len(selected),
+                "results": results,
+                "errors": errors,
+                "scan": scan,
+            }
+        ), (207 if errors and results else 200 if not errors else 400)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (DriveClientError, RuntimeError, OSError, TypeError) as e:
+        return jsonify({"error": str(e), "code": "clean_reference_import_failed"}), 500
 
 
 @app.route("/api/cleanup/crops/inventory")

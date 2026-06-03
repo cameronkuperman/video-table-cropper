@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="csrf-token" content="{{ csrf_token }}" />
+<title>Clean References</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #101217;
+    color: #edf1f5;
+  }
+  button, input, select { font: inherit; }
+  button {
+    border: 0;
+    border-radius: 8px;
+    min-height: 38px;
+    padding: 8px 12px;
+    background: #2e6df6;
+    color: #fff;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  button.secondary { background: #252b34; color: #d7dee8; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  input, select {
+    width: 100%;
+    min-height: 38px;
+    border: 1px solid #303946;
+    border-radius: 8px;
+    background: #0b0e13;
+    color: #edf1f5;
+    padding: 8px 10px;
+  }
+  label {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    color: #9ca7b5;
+    font-size: 0.74rem;
+    text-transform: uppercase;
+  }
+  .shell { width: min(1380px, calc(100vw - 32px)); margin: 0 auto; padding: 22px 0 36px; }
+  header { display: flex; justify-content: space-between; gap: 14px; align-items: flex-end; margin-bottom: 16px; }
+  h1 { margin: 0 0 5px; font-size: 1.3rem; }
+  .muted { color: #98a3b1; font-size: 0.88rem; }
+  .toolbar {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(120px, 1fr));
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid #29313c;
+    border-radius: 8px;
+    background: #171b22;
+    margin-bottom: 12px;
+  }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+  .status { min-height: 28px; color: #a6b0bd; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 12px; }
+  .card { border: 1px solid #29313c; border-radius: 8px; background: #161a21; overflow: hidden; }
+  .card.selected { border-color: #6b95ff; }
+  .card.existing { border-color: #665b32; }
+  .head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; padding: 10px; border-bottom: 1px solid #262e39; }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; }
+  .preview { aspect-ratio: 4 / 3; background: #0b0e13; display: grid; place-items: center; }
+  .preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .meta { padding: 9px 10px 11px; color: #acb6c3; font-size: 0.82rem; line-height: 1.45; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+  .chip { border: 1px solid #323c49; border-radius: 999px; padding: 3px 7px; color: #b9c3d0; font-size: 0.72rem; }
+  .chip.warn { border-color: #7d6532; color: #e3c778; }
+  @media (max-width: 860px) {
+    header { align-items: flex-start; flex-direction: column; }
+    .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+</style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <h1>Clean References</h1>
+        <div class="muted">One approved clean frame per Supabase table, imported from Drive clean labels.</div>
+      </div>
+      <div class="actions">
+        <button class="secondary" id="refreshBtn">Refresh</button>
+        <button id="importSelectedBtn">Import Selected</button>
+        <button id="importMissingBtn">Import Missing</button>
+      </div>
+    </header>
+
+    <section class="toolbar">
+      <label>Source
+        <select id="source">
+          <option value="reolink">Reolink</option>
+          <option value="video">Video</option>
+        </select>
+      </label>
+      <label>Site
+        <select id="site">
+          <option value="restaurant-pi-1">Mimosas</option>
+          <option value="reolink-matthews-01">Matthews</option>
+        </select>
+      </label>
+      <label>Search
+        <input id="q" placeholder="folder text" />
+      </label>
+      <label>Channel
+        <input id="channel" placeholder="CH03 / IPC3" />
+      </label>
+      <label>Table
+        <input id="table" placeholder="table label or id" />
+      </label>
+      <label>Max Scan
+        <input id="maxScan" type="number" min="1" max="5000" value="1000" />
+      </label>
+    </section>
+
+    <div class="status" id="status">Idle</div>
+    <section class="grid" id="grid"></section>
+  </main>
+
+<script>
+const token = document.querySelector('meta[name="csrf-token"]')?.content || '';
+const grid = document.getElementById('grid');
+const statusEl = document.getElementById('status');
+let candidates = [];
+let selected = new Set();
+
+function params() {
+  const p = new URLSearchParams();
+  for (const id of ['source', 'site', 'q', 'channel', 'table']) {
+    const value = document.getElementById(id).value.trim();
+    if (value) p.set(id, value);
+  }
+  p.set('max_scan', document.getElementById('maxScan').value || '1000');
+  return p;
+}
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function render() {
+  grid.innerHTML = candidates.map(item => {
+    const checked = selected.has(item.folder_id) ? 'checked' : '';
+    const existing = item.has_active_clean_reference ? 'existing' : '';
+    const img = item.thumb_url || item.preview_url || '';
+    return `
+      <article class="card ${existing} ${checked ? 'selected' : ''}">
+        <div class="head">
+          <input type="checkbox" data-folder="${escapeHtml(item.folder_id)}" ${checked} />
+          <div>
+            <div class="name" title="${escapeHtml(item.folder_name)}">${escapeHtml(item.folder_name)}</div>
+            <div class="chips">
+              <span class="chip">${escapeHtml(item.table_hint || item.table_id)}</span>
+              <span class="chip">${escapeHtml(item.channel_hint || 'channel?')}</span>
+              <span class="chip">${escapeHtml(item.frame_key)}</span>
+              ${item.has_active_clean_reference ? '<span class="chip warn">active exists</span>' : ''}
+            </div>
+          </div>
+        </div>
+        <div class="preview">${img ? `<img src="${escapeHtml(img)}" alt="" />` : ''}</div>
+        <div class="meta">
+          table: ${escapeHtml(item.table_id)}<br />
+          crop: ${escapeHtml(item.table_camera_crops_id || '')}<br />
+          modified: ${escapeHtml(item.modified_time || '')}
+        </div>
+      </article>
+    `;
+  }).join('');
+}
+
+async function refresh() {
+  setStatus('Scanning Drive clean labels...');
+  selected.clear();
+  const res = await fetch(`/api/clean-references/candidates?${params().toString()}`);
+  const data = await res.json();
+  if (!res.ok) {
+    setStatus(data.error || 'Scan failed');
+    return;
+  }
+  candidates = data.candidates || [];
+  const counts = data.counts || {};
+  setStatus(`${candidates.length} table candidates · scanned ${counts.scanned || 0}/${counts.candidate_total || 0}${counts.truncated ? ' · truncated' : ''}`);
+  render();
+}
+
+async function runImport(mode) {
+  const body = {
+    source: document.getElementById('source').value,
+    site: document.getElementById('site').value,
+    max_scan: Number(document.getElementById('maxScan').value || 1000),
+    confirm: 'IMPORT_CLEAN_REFERENCES',
+  };
+  if (mode === 'selected') {
+    body.folder_ids = [...selected];
+    if (!body.folder_ids.length) {
+      setStatus('Select at least one candidate first.');
+      return;
+    }
+  } else {
+    body.import_all_missing = true;
+    body.max_import = 100;
+  }
+  setStatus('Importing clean references...');
+  const res = await fetch('/api/clean-references/import', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': token},
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  setStatus(`Imported ${data.imported || 0}, skipped ${data.skipped_existing || 0}, errors ${(data.errors || []).length}`);
+  await refresh();
+}
+
+grid.addEventListener('change', event => {
+  const box = event.target.closest('input[type="checkbox"][data-folder]');
+  if (!box) return;
+  if (box.checked) selected.add(box.dataset.folder);
+  else selected.delete(box.dataset.folder);
+  render();
+});
+document.getElementById('refreshBtn').addEventListener('click', refresh);
+document.getElementById('importSelectedBtn').addEventListener('click', () => runImport('selected'));
+document.getElementById('importMissingBtn').addEventListener('click', () => runImport('missing'));
+for (const id of ['source', 'site']) document.getElementById(id).addEventListener('change', refresh);
+refresh();
+</script>
+</body>
+</html>
