@@ -1,4 +1,5 @@
 const reviewMode = document.querySelector('meta[name="review-mode"]')?.content || 'labeled';
+const labelsOnly = document.querySelector('meta[name="labels-only"]')?.content === '1';
 const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
 
 const state = {
@@ -112,10 +113,21 @@ function frameEntries(folder) {
         .slice(0, 3);
 }
 
+function representativeFrameEntry(folder) {
+    const frames = folder.frames || {};
+    const entries = Object.keys(frames)
+        .filter(key => /^frame_\d+$/.test(key) && frames[key])
+        .sort((a, b) => Number(a.slice(6)) - Number(b.slice(6)))
+        .map(key => [key, frames[key]]);
+    return entries.length ? entries[entries.length - 1] : null;
+}
+
 function renderFolder(folder) {
-    const frames = frameEntries(folder);
+    const frames = labelsOnly
+        ? [representativeFrameEntry(folder)].filter(Boolean)
+        : frameEntries(folder);
     const frameHtml = frames.map(([key, fileId]) => `
-        <a class="frame" href="/api/preview/${encodeURIComponent(fileId)}" target="_blank" title="${escapeHtml(key)}">
+        <a class="frame ${labelsOnly ? 'primary' : ''}" href="/api/preview/${encodeURIComponent(fileId)}" target="_blank" title="${escapeHtml(key)}">
           <img loading="lazy" src="/api/thumb/${encodeURIComponent(fileId)}" alt="${escapeHtml(key)}" />
         </a>
     `).join('');
@@ -133,10 +145,23 @@ function renderFolder(folder) {
     ].filter(Boolean).map(([label, fileId]) => `
         <a class="chip" href="https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view" target="_blank">${label}</a>
     `).join('');
+    const quickLabels = labelsOnly
+        ? ['clean', 'dirty', 'occupied'].map(label => {
+            const isCurrent = folder.current_label === label || folder.bucket === label;
+            return `
+              <button
+                class="secondary ${isCurrent ? 'active' : ''}"
+                data-action="quick-label"
+                data-label="${label}"
+                ${isCurrent ? 'disabled' : ''}
+              >${escapeHtml(label)}</button>
+            `;
+        }).join('')
+        : '';
     return `
       <article class="card" data-folder-id="${escapeHtml(folder.folder_id)}">
         <div class="card-head">
-          <input type="checkbox" aria-label="Select folder" />
+          ${labelsOnly ? '<span aria-hidden="true"></span>' : '<input type="checkbox" aria-label="Select folder" />'}
           <div>
             <div class="folder-name" title="${escapeHtml(folder.folder_name)}">${escapeHtml(folder.folder_name)}</div>
             <div class="chips">${chips}</div>
@@ -144,11 +169,12 @@ function renderFolder(folder) {
             <div class="muted" style="margin-top:6px;">${escapeHtml(folder.folder_id)}</div>
           </div>
         </div>
-        <div class="frames">${frameHtml}</div>
+        <div class="frames ${labelsOnly ? 'single' : ''}">${frameHtml}</div>
+        ${labelsOnly ? `<div class="quick-labels">${quickLabels}</div>` : ''}
         <div class="card-actions">
           <button class="secondary" data-action="compare">Compare</button>
           <button class="secondary" data-action="relabel-one">Relabel</button>
-          <button class="danger" data-action="trash-one">Trash</button>
+          ${labelsOnly ? '' : '<button class="danger" data-action="trash-one">Trash</button>'}
         </div>
         <div class="compare"></div>
       </article>
@@ -224,6 +250,10 @@ async function mutateSelected(action, folderIds, extra = {}) {
 
 async function relabel(folderIds) {
     const targetLabel = el.targetLabel.value;
+    await relabelTo(folderIds, targetLabel);
+}
+
+async function relabelTo(folderIds, targetLabel) {
     el.status.textContent = `Moving ${folderIds.length} folder(s) to ${targetLabel}...`;
     try {
         await mutateSelected('relabel', folderIds, { target_label: targetLabel });
@@ -296,7 +326,7 @@ function setupBuckets() {
         : ['clean', 'dirty', 'occupied', 'label_later', 'discarded'];
     const defaults = reviewMode === 'legacy'
         ? new Set(['unlabeled', 'screenrecord_3frame_unlabeled', 'clean', 'dirty', 'occupied'])
-        : new Set(['clean', 'dirty', 'occupied']);
+        : new Set(['clean', 'dirty', 'occupied', 'label_later', 'discarded']);
     el.bucket.innerHTML = buckets.map(bucket => `
       <option value="${bucket}" ${defaults.has(bucket) ? 'selected' : ''}>${bucket}</option>
     `).join('');
@@ -319,6 +349,14 @@ async function setupSources() {
 }
 
 function bindEvents() {
+    if (labelsOnly) {
+        el.selectVisible.style.display = 'none';
+        el.clearSelection.style.display = 'none';
+        el.targetLabel.style.display = 'none';
+        el.relabelSelected.style.display = 'none';
+        el.trashSelected.style.display = 'none';
+        el.selectionStatus.style.display = 'none';
+    }
     el.source.addEventListener('change', () => {
         el.site.disabled = el.source.value !== 'reolink';
     });
@@ -356,6 +394,8 @@ function bindEvents() {
         const folderId = card.dataset.folderId;
         if (button.dataset.action === 'compare') {
             compareFolder(card);
+        } else if (button.dataset.action === 'quick-label') {
+            relabelTo([folderId], button.dataset.label);
         } else if (button.dataset.action === 'relabel-one') {
             relabel([folderId]);
         } else if (button.dataset.action === 'trash-one') {
@@ -367,7 +407,9 @@ function bindEvents() {
 async function init() {
     el.subtitle.textContent = reviewMode === 'legacy'
         ? 'On-demand cleanup for old fallback crops, bad angles, and duplicate training artifacts.'
-        : 'On-demand browser for already-labeled folders with relabel and soft-trash controls.';
+        : labelsOnly
+            ? 'Audit labeled folders by preview and correct clean, dirty, or occupied in place.'
+            : 'On-demand browser for already-labeled folders with relabel and soft-trash controls.';
     setupBuckets();
     bindEvents();
     try {

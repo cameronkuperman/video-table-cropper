@@ -27,6 +27,7 @@ let activeDisplayName = 'Video';
 let recentLabelUndos = [];
 let recentLabelUndoTimer = null;
 let recentLabelUndoSequence = 0;
+let labelOperationVersion = 0;
 let canceledLabelOperationKeys = new Set();
 let preprocessStatus = null;
 let preprocessStatusRequest = null;
@@ -597,6 +598,11 @@ function pendingLabelKey(operation) {
     ].join('|');
 }
 
+function nextLabelOperationVersion() {
+    labelOperationVersion = (labelOperationVersion + 1) % 1000;
+    return (Date.now() * 1000) + labelOperationVersion;
+}
+
 function enqueuePendingLabel(operation) {
     const pending = readPendingLabels();
     const key = pendingLabelKey(operation);
@@ -626,6 +632,7 @@ function operationPayload(operation) {
         frames: operation.frames,
         frame_signature: operation.frame_signature,
         content_signature: operation.content_signature,
+        operation_version: operation.operation_version,
     };
 }
 
@@ -645,7 +652,7 @@ async function sendLabelOperation(operation, { keepalive = true } = {}) {
     if (res.status === 409 && data.code === 'already_labeled') {
         removePendingLabel(operation);
         updateBufferStatus();
-        return data;
+        throw new Error('Already labeled; no Drive move was made. Use /labels to audit or correct the saved label.');
     }
     throw new Error(data.error || `Move failed (${res.status})`);
 }
@@ -666,6 +673,10 @@ async function cancelLabelOperation(operation) {
 function drainPendingLabels({ keepalive = false, limit = Infinity } = {}) {
     const pending = readPendingLabels().slice(0, limit);
     for (const operation of pending) {
+        if (!operation.operation_version) {
+            removePendingLabel(operation);
+            continue;
+        }
         const nextOperation = {
             ...operation,
             attempts: Number(operation.attempts || 0) + 1,
@@ -1411,15 +1422,20 @@ async function relabelRecent(nextLabel) {
     const nextOperation = {
         ...undoState.operation,
         label: nextLabel,
+        operation_version: nextLabelOperationVersion(),
     };
     enqueuePendingLabel(nextOperation);
     try {
         const data = await sendLabelOperation(nextOperation, { keepalive: true });
+        if (data.stale_operation) {
+            return;
+        }
         removePendingLabel(undoState.operation);
         replaceOptimisticLabel(previousLabel, nextLabel);
         removeRecentLabelUndo(undoState.operation);
         showRecentLabelUndo(undoState.folder, nextOperation, data);
     } catch (e) {
+        removePendingLabel(nextOperation);
         showError(`Could not change label: ${e.message}`);
     }
 }
@@ -1514,6 +1530,7 @@ async function labelCurrent(label) {
         frame_signature: frameSignature(folder),
         content_signature: contentSignature(folder),
         undo_sequence: ++recentLabelUndoSequence,
+        operation_version: nextLabelOperationVersion(),
     };
     enqueuePendingLabel(operation);
     folders.splice(currentIndex, 1);
@@ -1539,6 +1556,9 @@ async function labelCurrent(label) {
                     });
                 return;
             }
+            if (data.stale_operation) {
+                return;
+            }
             showRecentLabelUndo(folder, operation, data);
             logTiming('labelCurrent', {
                 ms: (performance.now() - startedAt).toFixed(1),
@@ -1554,7 +1574,11 @@ async function labelCurrent(label) {
                 canceledLabelOperationKeys.delete(operationKey);
                 return;
             }
-            showError(`Move queued for retry: ${folder.folder_name}: ${e.message}`);
+            if (String(e.message || '').startsWith('Already labeled;')) {
+                showError(e.message);
+            } else {
+                showError(`Move queued for retry: ${folder.folder_name}: ${e.message}`);
+            }
         });
 }
 

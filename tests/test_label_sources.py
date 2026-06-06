@@ -1222,6 +1222,34 @@ def test_review_relabel_moves_between_labeled_buckets(client, fake_drive):
     assert ("review-relabel", "video-dirty", "video-clean") in fake_drive.moves
 
 
+def test_label_audit_relabel_corrects_folder_after_label_history_exists(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    original_payload = _label_payload(folder, "dirty")
+
+    assert client.post("/api/label", json=original_payload).status_code == 200
+    assert _drain_label_jobs(fake_drive) == 1
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-dirty"]
+
+    rejected_queue_correction = client.post("/api/label", json={**original_payload, "label": "clean"})
+    assert rejected_queue_correction.status_code == 409
+    assert rejected_queue_correction.get_json()["code"] == "already_labeled"
+
+    audit_response = client.post(
+        "/api/review/relabel",
+        json={
+            "source": "video",
+            "site_key": None,
+            "folder_ids": [folder["folder_id"]],
+            "target_label": "clean",
+        },
+    )
+
+    assert audit_response.status_code == 200
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-clean"]
+    assert fake_drive.items[folder["folder_id"]]["appProperties"]["autolabel_final_label"] == "clean"
+
+
 def test_review_relabel_rejects_folder_from_other_site(client, fake_drive):
     fake_drive._add_folder("review-wrong-site", "matthews-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
     fake_drive._add_triplet_files("review-wrong-site", "review-wrong-site")
@@ -1264,7 +1292,25 @@ def test_review_trash_soft_trashes_selected_folders(client, fake_drive):
 def test_review_pages_render(client):
     assert client.get("/cleanup/legacy").status_code == 200
     assert client.get("/cleanup/crops").status_code == 200
-    assert client.get("/review/labeled").status_code == 200
+    review_response = client.get("/review/labeled")
+    labels_response = client.get("/labels")
+    assert review_response.status_code == 200
+    assert labels_response.status_code == 200
+    assert b'<meta name="labels-only" content="0" />' in review_response.data
+    assert b'<meta name="labels-only" content="1" />' in labels_response.data
+
+
+def test_labels_api_alias_lists_labeled_folders(client, fake_drive):
+    fake_drive._add_folder("labels-alias-clean", "mimosas-Reolink-CH-CH03_table_top_1_t0002", "video-clean")
+    fake_drive._add_triplet_files("labels-alias-clean", "labels-alias-clean")
+
+    response = client.get("/api/labels?source=reolink&site=restaurant-pi-1&bucket=clean&limit=20")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert [folder["folder_id"] for folder in payload["folders"]] == ["labels-alias-clean"]
+    assert payload["folders"][0]["folder_name"] == "mimosas-Reolink-CH-CH03_table_top_1_t0002"
+    assert payload["folders"][0]["current_label"] == "clean"
 
 
 def test_crop_cleanup_inventory_shows_supabase_and_fallback_groups(client, fake_drive, monkeypatch):
@@ -2267,6 +2313,32 @@ def test_cancel_after_drive_move_restores_folder_to_unlabeled(client, fake_drive
     assert repeat_response.get_json()["folders"][0]["folder_id"] == folder["folder_id"]
 
 
+def test_cancel_rejects_parent_from_wrong_source_context(client, fake_drive):
+    queue_response = client.get("/api/queue?source=reolink&site=reolink-matthews-01&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    payload = _label_payload(folder, "clean")
+
+    assert client.post("/api/label", json=payload).status_code == 200
+    assert _drain_label_jobs(fake_drive) == 1
+    shared_clean_id = fake_drive.find_file_by_name(
+        "project-root",
+        "clean",
+        mime_type=label_app.FOLDER_MIME,
+    )["id"]
+    assert fake_drive.items[folder["folder_id"]]["parents"] == [shared_clean_id]
+
+    wrong_context_payload = {
+        **payload,
+        "source": "video",
+        "site_key": None,
+    }
+    cancel_response = client.post("/api/label/cancel", json=wrong_context_payload)
+
+    assert cancel_response.status_code == 400
+    assert cancel_response.get_json()["error"] == "parent_id does not match the active queue"
+    assert fake_drive.items[folder["folder_id"]]["parents"] == [shared_clean_id]
+
+
 def test_cancel_succeeds_when_moved_folder_is_already_back_in_input(client, fake_drive):
     queue_response = client.get("/api/queue?source=video&limit=10")
     folder = queue_response.get_json()["folders"][0]
@@ -2319,6 +2391,56 @@ def test_relabel_pending_job_replaces_label_without_duplicate_move(client, fake_
     assert len(fake_drive.moves) == 1
     folder_item = fake_drive.items[folder["folder_id"]]
     assert folder_item["appProperties"]["autolabel_final_label"] == "clean"
+
+
+def test_stale_relabel_request_cannot_overwrite_newer_pending_job(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    dirty_payload = {
+        **_label_payload(folder, "dirty"),
+        "operation_version": 1,
+    }
+    clean_payload = {
+        **_label_payload(folder, "clean"),
+        "operation_version": 2,
+    }
+
+    assert client.post("/api/label", json=clean_payload).status_code == 200
+    stale_response = client.post("/api/label", json=dirty_payload)
+
+    assert stale_response.status_code == 200
+    assert stale_response.get_json()["stale_operation"] is True
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs["jobs"]["video:video-triplet"]["label"] == "clean"
+    history = label_app._read_persisted_label_history()
+    record = history["queues"]["video"]["labeled"]["id:video-triplet"]
+    assert record["label"] == "clean"
+    assert _drain_label_jobs(fake_drive) == 1
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-clean"]
+
+
+def test_canceled_processing_job_does_not_finish_as_succeeded(client, fake_drive):
+    queue_response = client.get("/api/queue?source=video&limit=10")
+    folder = queue_response.get_json()["folders"][0]
+    payload = _label_payload(folder, "clean")
+
+    assert client.post("/api/label", json=payload).status_code == 200
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    claimed_job = dict(jobs["jobs"]["video:video-triplet"])
+    jobs["jobs"]["video:video-triplet"]["status"] = "processing"
+    label_app._label_jobs_path().write_text(json.dumps(jobs), encoding="utf-8")
+
+    cancel_response = client.post("/api/label/cancel", json=payload)
+    assert cancel_response.status_code == 200
+    label_app._push_label_job_to_drive(fake_drive, claimed_job)
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-clean"]
+
+    assert label_app._restore_if_claimed_label_job_canceled(fake_drive, claimed_job) is True
+    label_app._finish_label_job("video:video-triplet", status="succeeded")
+
+    assert fake_drive.items[folder["folder_id"]]["parents"] == ["video-unlabeled"]
+    jobs_after = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs_after["jobs"]["video:video-triplet"]["status"] == "canceled"
 
 
 def test_stale_processing_job_recovers_and_pushes_once(client, fake_drive):
@@ -2609,7 +2731,7 @@ def test_missing_drive_folder_failure_stays_failed(client, fake_drive):
     assert job_after["attempts"] == label_app.LABEL_JOB_MAX_ATTEMPTS
 
 
-def test_labeled_content_signature_never_returns_to_queue(client, fake_drive, monkeypatch):
+def test_weak_content_signature_match_does_not_hide_different_folder(client, fake_drive, monkeypatch):
     monkeypatch.setattr(label_app, "_content_signature_from_frames", lambda frames: "same-thumb-content")
     queue_response = client.get("/api/queue?source=video&limit=10&refresh=1")
     folder = queue_response.get_json()["folders"][0]
@@ -2618,7 +2740,10 @@ def test_labeled_content_signature_never_returns_to_queue(client, fake_drive, mo
     label_response = client.post("/api/label", json=payload)
     assert label_response.status_code == 200
 
+    scheduled_cleanup: list[str] = []
+    monkeypatch.setattr(label_app, "_schedule_hidden_folder_cleanup", lambda context, folder_id: scheduled_cleanup.append(folder_id) or True)
     fake_drive._add_folder("video-triplet-visual-rerun", "different_name_same_pixels", "video-unlabeled")
+    fake_drive._add_triplet_files("video-triplet-visual-rerun", "new")
     fake_drive.update_file_metadata(
         "video-triplet-visual-rerun",
         {
@@ -2631,9 +2756,66 @@ def test_labeled_content_signature_never_returns_to_queue(client, fake_drive, mo
             )
         },
     )
+    label_app._invalidate_listing_cache("video")
+    label_app._hydrated_folder_cache.clear()
 
     repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
-    assert repeat_response.get_json()["folders"] == []
+    repeat_payload = repeat_response.get_json()
+    assert [item["folder_id"] for item in repeat_payload["folders"]] == ["video-triplet-visual-rerun"]
+    assert scheduled_cleanup == []
+
+
+def test_weak_name_match_does_not_hide_or_discard_different_folder(client, fake_drive, monkeypatch):
+    queue_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    scheduled_cleanup: list[str] = []
+    monkeypatch.setattr(label_app, "_schedule_hidden_folder_cleanup", lambda context, folder_id: scheduled_cleanup.append(folder_id) or True)
+    fake_drive._add_folder("video-triplet-same-name", folder["folder_name"], "video-unlabeled")
+    fake_drive._add_triplet_files("video-triplet-same-name", "same-name")
+    label_app._invalidate_listing_cache("video")
+    label_app._hydrated_folder_cache.clear()
+
+    repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    repeat_payload = repeat_response.get_json()
+
+    assert repeat_response.status_code == 200
+    assert [item["folder_id"] for item in repeat_payload["folders"]] == ["video-triplet-same-name"]
+    assert scheduled_cleanup == []
+    assert fake_drive.items["video-triplet-same-name"]["parents"] == ["video-unlabeled"]
+
+
+def test_weak_content_signature_match_does_not_block_labeling_new_folder(client, fake_drive, monkeypatch):
+    monkeypatch.setattr(label_app, "_content_signature_from_frames", lambda frames: "same-thumb-content")
+    queue_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    folder = queue_response.get_json()["folders"][0]
+    assert client.post("/api/label", json=_label_payload(folder, "clean")).status_code == 200
+
+    fake_drive._add_folder("video-triplet-visual-rerun", "different_name_same_pixels", "video-unlabeled")
+    fake_drive._add_triplet_files("video-triplet-visual-rerun", "new")
+    fake_drive.update_file_metadata(
+        "video-triplet-visual-rerun",
+        {
+            "appProperties": label_app.build_folder_app_properties(
+                {
+                    "frame_0": "new-frame0",
+                    "frame_1": "new-frame1",
+                    "frame_2": "new-frame2",
+                }
+            )
+        },
+    )
+    label_app._invalidate_listing_cache("video")
+    label_app._hydrated_folder_cache.clear()
+    repeat_response = client.get("/api/queue?source=video&limit=10&refresh=1")
+    new_folder = repeat_response.get_json()["folders"][0]
+
+    label_response = client.post("/api/label", json=_label_payload(new_folder, "dirty"))
+
+    assert label_response.status_code == 200
+    jobs = json.loads(label_app._label_jobs_path().read_text(encoding="utf-8"))
+    assert jobs["jobs"]["video:video-triplet-visual-rerun"]["label"] == "dirty"
 
 
 def test_labeled_frame_signature_never_returns_to_queue_across_sessions(client, fake_drive, tmp_path, monkeypatch):

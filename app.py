@@ -1309,8 +1309,6 @@ def _folder_name_has_reolink_channel(folder_name: str) -> bool:
 def _review_folder_matches_context(context: QueueContext, folder_name: str, app_properties: dict[str, Any], bucket: str) -> bool:
     if bucket not in LABEL_DESTINATIONS:
         return True
-    if not _folder_matches_review_source(folder_name, context, bucket):
-        return False
 
     queue_key = str(app_properties.get("autolabel_queue_key") or "").strip()
     if queue_key:
@@ -1322,6 +1320,16 @@ def _review_folder_matches_context(context: QueueContext, folder_name: str, app_
 
     site_key = str(app_properties.get("autolabel_site_key") or "").strip()
     if site_key and site_key != (context.site_key or ""):
+        return False
+
+    if source == VIDEO_SOURCE and context.source == VIDEO_SOURCE:
+        return True
+    if source == REOLINK_SOURCE and context.source == REOLINK_SOURCE and site_key:
+        return True
+    if site_key and context.site_key:
+        return True
+
+    if not _folder_matches_review_source(folder_name, context, bucket):
         return False
 
     is_reolink_name = "Reolink-" in folder_name or _folder_name_has_reolink_channel(folder_name)
@@ -4079,10 +4087,31 @@ def _label_history_lookup_in_records(
     frame_signature: str,
     content_signature: str = "",
 ) -> dict[str, Any] | None:
-    for key in _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature):
+    match = _label_history_match_in_records(
+        labeled_records,
+        context,
+        folder_id,
+        folder_name,
+        frame_signature,
+        content_signature,
+    )
+    return match[0] if match else None
+
+
+def _label_history_match_in_records(
+    labeled_records: dict[str, Any],
+    context: QueueContext,
+    folder_id: str,
+    folder_name: str,
+    frame_signature: str,
+    content_signature: str = "",
+) -> tuple[dict[str, Any], str] | None:
+    keys = _label_history_keys(context, folder_id, folder_name, frame_signature, content_signature)
+    keys.sort(key=lambda key: 0 if key.startswith(("id:", "frames:")) else 1)
+    for key in keys:
         record = labeled_records.get(key)
         if isinstance(record, dict):
-            return record
+            return record, key
     return None
 
 
@@ -4102,6 +4131,15 @@ def _label_history_lookup(
         frame_signature,
         content_signature,
     )
+
+
+def _label_history_match_is_strong(match: tuple[dict[str, Any], str] | None, folder_id: str) -> bool:
+    if not match:
+        return False
+    record, key = match
+    if key.startswith(("id:", "frames:")):
+        return True
+    return bool(folder_id and str(record.get("folder_id") or "") == folder_id)
 
 
 def _record_label_history(
@@ -4218,6 +4256,13 @@ def _label_job_key(context: QueueContext, folder_id: str) -> str:
     return f"{context.queue_key}:{folder_id}"
 
 
+def _label_operation_version(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -4259,6 +4304,7 @@ def _enqueue_label_job(
     frame_signature: str,
     content_signature: str,
     label: str,
+    operation_version: int = 0,
 ) -> dict[str, Any]:
     now = _utc_iso()
     not_before = _utc_iso(_label_job_due_at(label))
@@ -4282,6 +4328,7 @@ def _enqueue_label_job(
                 "frame_signature": frame_signature,
                 "content_signature": content_signature,
                 "label": label,
+                "operation_version": operation_version,
                 "source": context.source,
                 "site_key": context.site_key,
                 "queue_key": context.queue_key,
@@ -4743,6 +4790,8 @@ def _finish_label_job(job_id: str, *, status: str, error: str | None = None) -> 
             job = (state.get("jobs") or {}).get(job_id)
             if not isinstance(job, dict):
                 return
+            if job.get("status") == "canceled" and status == "succeeded":
+                return
             attempts = int(job.get("attempts") or 0)
             job["status"] = status
             job["updated_at"] = now
@@ -4797,6 +4846,25 @@ def _push_label_job_to_drive(client: DriveClient, job: dict[str, Any]) -> None:
     _remove_folder_from_listing_cache(context.queue_key, folder_id)
 
 
+def _restore_if_claimed_label_job_canceled(client: DriveClient, job: dict[str, Any]) -> bool:
+    job_id = str(job.get("id") or "")
+    live_job = _get_label_job(job_id)
+    if not isinstance(live_job, dict) or live_job.get("status") != "canceled":
+        return False
+
+    context, folder_id, _label, _destination_id = _label_job_destination_context(client, job)
+    _cancel_label_job(
+        context,
+        client=client,
+        folder_id=folder_id,
+        parent_id=str(job.get("parent_id") or ""),
+        folder_name=str(job.get("folder_name") or ""),
+        frame_signature=str(job.get("frame_signature") or ""),
+        content_signature=str(job.get("content_signature") or ""),
+    )
+    return True
+
+
 def _drain_label_jobs_once(client: DriveClient | None = None, *, force_due: bool = False) -> int:
     active_client = client
     if not force_due:
@@ -4815,6 +4883,8 @@ def _drain_label_jobs_once(client: DriveClient | None = None, *, force_due: bool
             active_client = DriveClient()
         _mark_label_job_attempt()
         _push_label_job_to_drive(active_client, job)
+        if _restore_if_claimed_label_job_canceled(active_client, job):
+            return 0
     except Exception as exc:
         if _looks_like_drive_rate_limit_error(exc):
             _record_label_job_rate_limit(exc)
@@ -4827,10 +4897,13 @@ def _drain_label_jobs_once(client: DriveClient | None = None, *, force_due: bool
 
 def _process_claimed_label_job(job: dict[str, Any]) -> int:
     job_id = str(job.get("id") or "")
+    active_client = warm_client()
     try:
         # Thread-local client: httplib2 services are not thread-safe to share.
         _mark_label_job_attempt()
-        _push_label_job_to_drive(warm_client(), job)
+        _push_label_job_to_drive(active_client, job)
+        if _restore_if_claimed_label_job_canceled(active_client, job):
+            return 0
     except Exception as exc:
         if _looks_like_drive_rate_limit_error(exc):
             _record_label_job_rate_limit(exc)
@@ -6537,7 +6610,8 @@ def _filter_label_history_hidden_subfolders(
     for folder in subfolders:
         folder_id = str(folder.get("id") or "")
         folder_name = str(folder.get("name") or "")
-        if _label_history_lookup_in_records(labeled_records, context, folder_id, folder_name, ""):
+        match = _label_history_match_in_records(labeled_records, context, folder_id, folder_name, "")
+        if _label_history_match_is_strong(match, folder_id):
             hidden += 1
             _remove_folder_from_listing_cache(context.queue_key, folder_id)
             with _hydrated_folder_cache_lock:
@@ -7223,14 +7297,15 @@ def _warm_cache_folder_parallel(context: QueueContext, folder: dict[str, str]) -
             return
         _increment_cache_warm_state(folders_hydrated=1)
         frames = payload.get("frames", {})
-        history_record = _label_history_lookup(
+        history_match = _label_history_match_in_records(
+            _label_history_records_for_queue(context.queue_key),
             context,
             str(payload.get("folder_id") or ""),
             str(payload.get("folder_name") or ""),
             str(payload.get("frame_signature") or ""),
             str(payload.get("content_signature") or ""),
         )
-        if history_record:
+        if _label_history_match_is_strong(history_match, str(payload.get("folder_id") or "")):
             _set_cached_hydrated_folder(context.queue_key, folder["id"], None)
             _remove_folder_from_listing_cache(context.queue_key, str(payload.get("folder_id") or ""))
             _schedule_hidden_folder_cleanup(context, str(payload.get("folder_id") or ""))
@@ -7252,14 +7327,15 @@ def _warm_cache_folder_parallel(context: QueueContext, folder: dict[str, str]) -
                 pass
         payload["content_signature"] = _content_signature_from_frames(frames)
         payload["cache_ready"] = _folder_cache_ready(payload)
-        history_record = _label_history_lookup(
+        history_match = _label_history_match_in_records(
+            _label_history_records_for_queue(context.queue_key),
             context,
             str(payload.get("folder_id") or ""),
             str(payload.get("folder_name") or ""),
             str(payload.get("frame_signature") or ""),
             str(payload.get("content_signature") or ""),
         )
-        if history_record:
+        if _label_history_match_is_strong(history_match, str(payload.get("folder_id") or "")):
             _set_cached_hydrated_folder(context.queue_key, folder["id"], None)
             _remove_folder_from_listing_cache(context.queue_key, str(payload.get("folder_id") or ""))
             _schedule_hidden_folder_cleanup(context, str(payload.get("folder_id") or ""))
@@ -7677,7 +7753,7 @@ def _collect_ready_folders(
             if signature and signature in seen_signatures:
                 duplicate_signatures += 1
                 continue
-            history_record = _label_history_lookup_in_records(
+            history_match = _label_history_match_in_records(
                 labeled_records,
                 context,
                 str(payload.get("folder_id") or ""),
@@ -7685,7 +7761,7 @@ def _collect_ready_folders(
                 signature,
                 str(payload.get("content_signature") or ""),
             )
-            if history_record:
+            if _label_history_match_is_strong(history_match, str(payload.get("folder_id") or "")):
                 hidden_labeled += 1
                 _remove_folder_from_listing_cache(context.queue_key, str(payload.get("folder_id") or ""))
                 with _hydrated_folder_cache_lock:
@@ -7978,11 +8054,14 @@ def crop_cleanup():
 
 
 @app.route("/review/labeled")
+@app.route("/labels")
 def labeled_review():
+    labels_only = request.path == "/labels"
     return render_template(
         "review.html",
         review_mode="labeled",
-        page_title="Labeled Review",
+        page_title="Label Audit" if labels_only else "Labeled Review",
+        labels_only=labels_only,
     )
 
 
@@ -8272,6 +8351,7 @@ def api_folder_frames(folder_id: str):
 
 
 @app.route("/api/review/folders")
+@app.route("/api/labels")
 def api_review_folders():
     try:
         client = get_client()
@@ -8983,6 +9063,7 @@ def api_label():
         folder_id = str(data.get("folder_id", "")).strip()
         parent_id = str(data.get("parent_id", "")).strip()
         label = str(data.get("label", "")).strip().lower()
+        operation_version = _label_operation_version(data.get("operation_version"))
         source, site_key = _payload_source_args(data)
 
         if not folder_id or not parent_id:
@@ -9007,13 +9088,39 @@ def api_label():
         if not content_signature and has_complete_frame_ids(frames):
             content_signature = _content_signature_from_frames(frames)
 
-        existing_history = _label_history_lookup(context, folder_id, folder_name, frame_signature, content_signature)
+        existing_history_match = _label_history_match_in_records(
+            _label_history_records_for_queue(context.queue_key),
+            context,
+            folder_id,
+            folder_name,
+            frame_signature,
+            content_signature,
+        )
+        existing_history = (
+            existing_history_match[0]
+            if _label_history_match_is_strong(existing_history_match, folder_id)
+            else None
+        )
         existing_job = _get_label_job(_label_job_key(context, folder_id))
         can_replace_pending = (
             isinstance(existing_job, dict)
             and existing_job.get("status") == "pending"
             and not _label_job_is_due(existing_job)
         )
+        if can_replace_pending and operation_version < _label_operation_version(existing_job.get("operation_version")):
+            return jsonify(
+                {
+                    "ok": True,
+                    "queued": True,
+                    "job_id": existing_job.get("id"),
+                    "not_before": existing_job.get("not_before"),
+                    "undo_expires_at": existing_job.get("undo_expires_at"),
+                    "queued_label": existing_job.get("label"),
+                    "drive_move_status": "queued",
+                    "stale_operation": True,
+                    "source_context": context.to_payload(),
+                }
+            )
         if existing_history and not can_replace_pending:
             _remove_folder_from_listing_cache(context.queue_key, folder_id)
             return jsonify({"error": "already_labeled", "code": "already_labeled"}), 409
@@ -9035,6 +9142,7 @@ def api_label():
             frame_signature=frame_signature,
             content_signature=content_signature,
             label=label,
+            operation_version=operation_version,
         )
         with _hydrated_folder_cache_lock:
             _hydrated_folder_cache.pop(_hydrated_cache_key(context.queue_key, folder_id), None)
@@ -9100,12 +9208,14 @@ def api_label_cancel():
         folder_id = str(data.get("folder_id", "")).strip()
         parent_id = str(data.get("parent_id", "")).strip()
         source, site_key = _payload_source_args(data)
-        if not folder_id:
-            return jsonify({"error": "folder_id required"}), 400
+        if not folder_id or not parent_id:
+            return jsonify({"error": "folder_id and parent_id required"}), 400
 
         client = get_client()
         context = _resolve_queue_context(client, source, site_key)
         queue_key = context.queue_key
+        if parent_id not in _context_input_folder_ids(context):
+            return jsonify({"error": "parent_id does not match the active queue"}), 400
         raw_frames = data.get("frames") if isinstance(data.get("frames"), dict) else {}
         frames = _frames_from_client_payload(raw_frames)
         frame_signature = str(data.get("frame_signature") or "").strip()
