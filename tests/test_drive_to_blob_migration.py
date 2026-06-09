@@ -14,6 +14,7 @@ class FakeDrive:
         self.children = {}
         self.content = {}
         self.downloads = 0
+        self.listed_folder_ids = []
 
     def add_folder(self, item_id, name, parent_id=None, app_properties=None):
         item = {
@@ -47,7 +48,15 @@ class FakeDrive:
         return dict(self.items[file_id])
 
     def list_files(self, folder_id, fields="id,name,mimeType,parents"):
+        self.listed_folder_ids.append(folder_id)
         return [dict(self.items[item_id]) for item_id in self.children.get(folder_id, [])]
+
+    def find_file_by_name(self, folder_id, file_name, mime_type=None):
+        for item_id in self.children.get(folder_id, []):
+            item = self.items[item_id]
+            if item["name"] == file_name and (mime_type is None or item["mimeType"] == mime_type):
+                return dict(item)
+        return None
 
     def download_file_content(self, file_id):
         self.downloads += 1
@@ -164,6 +173,82 @@ def test_deep_source_prefix_includes_ancestor_folders():
         "unlabeled",
         "unlabeled/mimosas_table_1_t0001",
     }
+
+
+def test_scoped_manifest_scans_only_requested_prefix():
+    drive = _sample_drive()
+    drive.add_folder("clean", "clean", "root")
+    drive.add_file("clean-frame", "frame_0.jpg", "clean", b"clean-frame")
+
+    manifest = migration.build_scoped_manifest(
+        drive,
+        "root",
+        "project-root",
+        ["unlabeled"],
+        progress_every=0,
+    )
+
+    assert {item.rel_path for item in manifest.folders} == {
+        "",
+        "unlabeled",
+        "unlabeled/mimosas_table_1_t0001",
+    }
+    assert "project-root/clean/frame_0.jpg" not in {item.dest_path for item in manifest.files}
+
+
+def test_fast_migration_does_not_prescan_unrelated_folders(tmp_path):
+    drive = _sample_drive()
+    drive.add_folder("clean", "clean", "root")
+    drive.add_file("clean-frame", "frame_0.jpg", "clean", b"clean-frame")
+    blob = FakeBlob()
+    progress = migration.MigrationProgress(tmp_path / "progress.json", "root", "project-root")
+
+    migration.migrate_prefix_without_scan(
+        drive,
+        blob,
+        "root",
+        "project-root",
+        "unlabeled",
+        progress,
+        limit_folders=1,
+        limit_files=None,
+        verify=True,
+        skip_existing=True,
+    )
+
+    folder_id = "project-root/unlabeled/mimosas_table_1_t0001"
+    assert "clean" not in drive.listed_folder_ids
+    assert blob.files[f"{folder_id}/frame_0.jpg"] == b"frame-zero"
+    assert blob.metadata[folder_id]["appProperties"]["autolabel_frame_0_id"] == f"{folder_id}/frame_0.jpg"
+
+
+def test_autolabeler_skeleton_matches_expected_blob_paths():
+    blob = FakeBlob()
+
+    created = migration.ensure_autolabeler_skeleton(blob, "project-root")
+
+    expected = {
+        "project-root/unlabeled",
+        "project-root/clean",
+        "project-root/dirty",
+        "project-root/occupied",
+        "project-root/label_later",
+        "project-root/discarded",
+        "project-root/raw_videos",
+        "project-root/temp_processing",
+        "project-root/processed_raw",
+        "project-root/restaurant-pi-1",
+        "project-root/restaurant-pi-1/unassociated",
+        "project-root/restaurant-pi-1/unassociated_zips",
+        "project-root/restaurant-pi-1/unlabeled",
+        "project-root/restaurant-pi-1/processed_raw",
+        "project-root/restaurant-pi-1/3frame/unlabeled",
+        "project-root/reolink-matthews-01/crop_configs",
+        "project-root/10frametrue/restaurant-pi-1",
+        "project-root/10frametrue/reolink-matthews-01",
+    }
+    assert expected.issubset(blob.folders)
+    assert expected.issubset(set(created))
 
 
 def test_duplicate_destination_paths_are_reported():
